@@ -167,6 +167,11 @@ def overview_max_chars() -> int:
     return get_int("overview_max_chars", 240, min_val=1)
 
 
+def history_max_entries() -> int:
+    """Maximum prior create/patch outcomes included in a proposal prompt."""
+    return get_int("history_max_entries", 20, min_val=1)
+
+
 def journal_dir() -> Path:
     default = hermes_home() / "plugins" / "refine"
     return Path(get_str("journal_dir", str(default)))

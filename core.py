@@ -656,6 +656,7 @@ def _refine_once(
         error_patterns=error_patterns,
         user_corrections=[item.get("snippet", "") for item in corrections],
         unused_skills=_unused_skills_safe(),
+        refinement_history=journal.recent_refinements(config.history_max_entries()),
         purpose="refine",
         run_context=proposal_context,
         skill_content_loader=journal.read_skill_content,

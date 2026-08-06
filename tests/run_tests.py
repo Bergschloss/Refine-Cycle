@@ -812,6 +812,157 @@ class RefineTests(unittest.TestCase):
                 core.list_skill_names(), ["versioned-skill", "bare-skill"]
             )
 
+    def test_recent_refinements_filters_orders_and_caps_records(self):
+        def record(name, outcome, action="create"):
+            return journal.log(
+                trigger="test",
+                reason=f"Reason for {name}",
+                session_id="session",
+                proposal={
+                    "action": action,
+                    "kind": "skill",
+                    "name": name,
+                    "expected_outcome": f"Expected {name}",
+                },
+                outcome=outcome,
+            )
+
+        record("applied", "applied")
+        record("pending", "pending_approval")
+        record("error", "error", action="patch")
+        record("rejected", "rejected")
+        record("rolled-back", "rolled_back")
+        record("ordinary-noop", "no_op", action="no_op")
+        record("incomplete", "llm_incomplete")
+
+        refinements = journal.recent_refinements(20)
+        self.assertEqual(
+            [item["proposal"]["name"] for item in refinements],
+            ["applied", "pending", "error", "rejected", "rolled-back"],
+        )
+        self.assertEqual(
+            [item["proposal"]["name"] for item in journal.recent_refinements(2)],
+            ["rejected", "rolled-back"],
+        )
+
+    def test_refinement_history_prompt_is_bounded_sanitized_and_keeps_unused_block(self):
+        self.assertEqual(config.history_max_entries(), 20)
+        secret = "history-secret-123!"
+        journal.log(
+            trigger="test",
+            reason="Oldest history record",
+            session_id="session",
+            proposal={
+                "action": "create", "kind": "skill", "name": "oldest",
+                "expected_outcome": "Oldest expected outcome",
+            },
+            outcome="applied",
+        )
+        journal.log(
+            trigger="test",
+            reason=f'token="{secret}" must not reach the model',
+            session_id="session",
+            proposal={
+                "action": "patch", "kind": "memory", "name": "applied-memory",
+                "expected_outcome": "The applied memory outcome is visible",
+                "version": 2,
+            },
+            outcome="applied",
+        )
+        journal.log(
+            trigger="test",
+            reason="The later edit was reverted",
+            session_id="session",
+            proposal={
+                "action": "create", "kind": "skill", "name": "rolled-back",
+                "expected_outcome": "The later expected outcome is visible",
+            },
+            outcome="rolled_back",
+        )
+        journal.log(
+            trigger="test",
+            reason="not a lesson",
+            session_id="session",
+            proposal={"action": "no_op", "kind": "", "name": "ignored-noop"},
+            outcome="no_op",
+        )
+        FakeHost.entry_config().update({
+            "history_max_entries": 2,
+            "overview_max_chars": 160,
+        })
+        history = journal.recent_refinements(config.history_max_entries())
+        model = MockLlm({"action": "no_op", "reason": "none"})
+        llm.propose(
+            model,
+            "evidence",
+            [],
+            [],
+            unused_skills=["old-unused-skill"],
+            refinement_history=history,
+        )
+        prompt = model.calls[0]["input"][0].text
+        history_block = prompt.split("=== PREVIOUS REFINEMENTS ===\n", 1)[1].split(
+            "\n=== RECENT TRAJECTORY ===", 1
+        )[0]
+        self.assertNotIn("oldest", history_block)
+        self.assertNotIn("ignored-noop", history_block)
+        self.assertLess(
+            history_block.index("applied-memory"), history_block.index("rolled-back")
+        )
+        self.assertIn("expects: The applied memory outcome is visible", history_block)
+        self.assertIn("applied", history_block)
+        self.assertIn("rolled_back", history_block)
+        self.assertIn("v2", history_block)
+        self.assertNotIn(secret, prompt)
+        self.assertIn("[REDACTED]", prompt)
+        self.assertTrue(all(len(line) <= 160 for line in history_block.splitlines()))
+        long_name_block = llm._render_refinement_history(
+            [{
+                "outcome": "error",
+                "reason": "failed",
+                "proposal": {
+                    "action": "patch",
+                    "kind": "memory",
+                    "name": "memory-" + ("x" * 300),
+                    "expected_outcome": "The expected outcome remains visible.",
+                },
+            }],
+            max_entries=1,
+            max_chars=240,
+        )
+        self.assertIn("expects: The expected outcome remains visible.", long_name_block)
+        self.assertLessEqual(len(long_name_block), 240)
+        self.assertIn("=== PREVIOUS UNUSED SKILLS ===", prompt)
+        self.assertIn("old-unused-skill", prompt)
+
+    def test_empty_refinement_history_omits_its_prompt_block(self):
+        self.assertEqual(journal.recent_refinements(20), [])
+        model = MockLlm({"action": "no_op", "reason": "none"})
+        result = llm.propose(
+            model, "evidence", [], [], refinement_history=journal.recent_refinements(20)
+        )
+        self.assertEqual(result["action"], "no_op")
+        self.assertNotIn("=== PREVIOUS REFINEMENTS ===", model.calls[0]["input"][0].text)
+
+    def test_core_passes_bounded_refinement_history_to_propose(self):
+        for name in ("older", "newer"):
+            journal.log(
+                trigger="test",
+                reason=name,
+                session_id="session",
+                proposal={"action": "create", "kind": "skill", "name": name},
+                outcome="applied",
+            )
+        FakeHost.entry_config()["history_max_entries"] = 1
+        with patch.object(
+            core._llm,
+            "propose",
+            return_value={"action": "no_op", "reason": "none"},
+        ) as propose:
+            core.refine_run(MockLlm())
+        history = propose.call_args.kwargs["refinement_history"]
+        self.assertEqual([item["proposal"]["name"] for item in history], ["newer"])
+
     def test_skill_patch_gets_current_complete_content(self):
         name = "existing-skill"
         current = skill_content(name, "# Existing\n\nImportant old guidance.")

@@ -412,6 +412,30 @@ def entries() -> List[Dict[str, Any]]:
     return _load_entries()
 
 
+def recent_refinements(limit: int) -> List[Dict[str, Any]]:
+    """Return capped create/patch outcomes in chronological order for model feedback."""
+    try:
+        capped_limit = max(0, int(limit))
+    except (TypeError, ValueError):
+        return []
+    if not capped_limit:
+        return []
+    included_outcomes = {
+        "applied", "pending_approval", "error", "rejected", "rolled_back"
+    }
+    refinements: List[Dict[str, Any]] = []
+    for entry in entries():
+        proposal = entry.get("proposal", {})
+        if not isinstance(proposal, dict):
+            continue
+        if (
+            proposal.get("action") in ("create", "patch")
+            and entry.get("outcome") in included_outcomes
+        ):
+            refinements.append(entry)
+    return refinements[-capped_limit:]
+
+
 def last_attempt_ts(trigger: Optional[str] = None) -> Optional[float]:
     """Return the most recent durable attempt timestamp, optionally by trigger."""
     latest: Optional[float] = None
