@@ -190,12 +190,18 @@ def add_prompt_note(note: Dict[str, str]) -> Dict[str, Any]:
         return {"success": True, "note_id": safe_note["id"]}
 
 
-def clear_session_prompt_notes(session_id: str) -> Optional[int]:
-    """Remove all notes scoped to one ended/reset session; None means no mutation occurred."""
+def clear_session_prompt_notes(
+    session_id: str, *, timeout: float = 30.0
+) -> Optional[int]:
+    """Remove all notes scoped to one ended/reset session; None means no mutation occurred.
+
+    Host callbacks pass a short ``timeout`` so a running refine pass cannot stall
+    the user's session-end or session-reset path behind the mutation lock.
+    """
     safe_session_id = normalize_prompt_note_session_id(session_id)
     if not safe_session_id:
         return None
-    with mutation_lock():
+    with mutation_lock(timeout=timeout):
         notes = _load_prompt_notes()
         if notes is None:
             return None
@@ -262,8 +268,18 @@ def _try_clear_stale_lock(path: Path) -> None:
 
 @contextmanager
 def _acquire_mutation_lock(*, wait: bool, timeout: float = 0.0) -> Iterator[bool]:
-    """Acquire the re-entrant thread/process lock, optionally without waiting."""
-    if not _THREAD_LOCK.acquire(blocking=wait):
+    """Acquire the re-entrant thread/process lock, optionally without waiting.
+
+    ``timeout`` bounds the whole acquisition, in-process contention included.
+    Bounding only the lock file would let a caller on a host callback thread wait
+    forever behind another thread of the same process.
+    """
+    deadline = time.monotonic() + timeout
+    if wait:
+        acquired_thread = _THREAD_LOCK.acquire(timeout=timeout if timeout > 0 else -1)
+    else:
+        acquired_thread = _THREAD_LOCK.acquire(blocking=False)
+    if not acquired_thread:
         yield False
         return
     try:
@@ -279,7 +295,6 @@ def _acquire_mutation_lock(*, wait: bool, timeout: float = 0.0) -> Iterator[bool
         lock_path = ensure_dirs() / _LOCK_FILE_NAME
         token = uuid.uuid4().hex
         payload = json.dumps({"pid": os.getpid(), "created": time.time(), "token": token})
-        deadline = time.monotonic() + timeout
         while True:
             try:
                 fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -330,7 +345,7 @@ def _acquire_mutation_lock(*, wait: bool, timeout: float = 0.0) -> Iterator[bool
 def mutation_lock(timeout: float = 30.0) -> Iterator[None]:
     """Serialize refine mutations across threads and processes."""
     with _acquire_mutation_lock(wait=True, timeout=timeout) as acquired:
-        if not acquired:  # Defensive: blocking acquisition always either succeeds or raises.
+        if not acquired:  # Another thread of this process still owns the lock.
             raise TimeoutError("Timed out waiting for refine mutation lock")
         yield
 

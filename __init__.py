@@ -23,6 +23,15 @@ _AUTO_PENDING_SESSION_ENDS: set[str] = set()
 _AUTO_PENDING_LOCK = threading.Lock()
 _REGISTERED_LLM: Optional[PluginLlm] = None
 
+# Assistant-message count observed when each session last started an attempt.
+# One host turn can append several assistant messages, so the trigger compares a
+# delta instead of an exact multiple; an exact multiple is silently skipped
+# whenever a tool-using turn steps over it.
+_AUTO_TURN_MARKS: dict[str, int] = {}
+_AUTO_TURN_MARKS_LOCK = threading.Lock()
+_AUTO_TURN_MARKS_MAX = 64
+_HOST_PATH_LOCK_TIMEOUT = 2.0
+
 
 def _defer_session_end(session_id: str) -> None:
     """Coalesce session-end fallbacks without creating blocked worker threads."""
@@ -52,7 +61,11 @@ def _get_llm(ctx) -> PluginLlm:
 
 
 def _assistant_turn_count(conversation_history: Any) -> int:
-    """Count assistant turns from host callback history without assuming its shape."""
+    """Count assistant messages in host callback history without assuming its shape.
+
+    One host turn can contribute several assistant messages, so this is a
+    monotonic progress measure, not a count of user-visible turns.
+    """
     if not isinstance(conversation_history, (list, tuple)):
         return 0
     count = 0
@@ -70,32 +83,40 @@ def _cooldown_elapsed() -> bool:
     return time.time() - last_attempt >= config.auto_cooldown_minutes() * 60
 
 
-def _auto_refine_allowed(assistant_turns: int, *, require_turn_interval: bool) -> bool:
-    """Return whether an automatic attempt may start without mutating state."""
-    if not config.auto_enabled() or not _cooldown_elapsed():
-        return False
-    if not require_turn_interval:
-        return True
+def _turn_interval_reached(session_id: str, assistant_turns: int) -> bool:
+    """Compare assistant messages added since this session's last attempt."""
     interval = config.auto_turn_interval()
-    return (
-        interval > 0
-        and assistant_turns >= interval
-        and assistant_turns % interval == 0
-    )
+    if interval <= 0:
+        return False
+    with _AUTO_TURN_MARKS_LOCK:
+        return assistant_turns - _AUTO_TURN_MARKS.get(session_id, 0) >= interval
 
 
-def _run_auto_refine(
-    session_id: str,
-    assistant_turns: int,
-    *,
-    require_turn_interval: bool,
-    cleanup_session_notes: bool = False,
-) -> None:
+def _mark_turn_attempt(session_id: str, assistant_turns: int) -> None:
+    """Record the attempt point, keeping the per-session marks bounded."""
+    with _AUTO_TURN_MARKS_LOCK:
+        if (
+            session_id not in _AUTO_TURN_MARKS
+            and len(_AUTO_TURN_MARKS) >= _AUTO_TURN_MARKS_MAX
+        ):
+            _AUTO_TURN_MARKS.pop(next(iter(_AUTO_TURN_MARKS)), None)
+        _AUTO_TURN_MARKS[session_id] = assistant_turns
+
+
+def _forget_turn_marks(session_id: str) -> None:
+    with _AUTO_TURN_MARKS_LOCK:
+        _AUTO_TURN_MARKS.pop(session_id, None)
+
+
+def _auto_refine_allowed() -> bool:
+    """Return whether an automatic attempt may start without mutating state."""
+    return config.auto_enabled() and _cooldown_elapsed()
+
+
+def _run_auto_refine(session_id: str, *, cleanup_session_notes: bool = False) -> None:
     """Run one guarded automatic pass after its worker thread has started."""
     try:
-        if not _auto_refine_allowed(
-            assistant_turns, require_turn_interval=require_turn_interval
-        ):
+        if not _auto_refine_allowed():
             if cleanup_session_notes:
                 _clear_session_prompt_notes(session_id)
             return
@@ -113,19 +134,22 @@ def _run_auto_refine(
     finally:
         _finish_auto_worker()
 
-def _start_auto_refine(
-    session_id: str, assistant_turns: int, *, require_turn_interval: bool = True
-) -> None:
+
+def _start_auto_refine(session_id: str, assistant_turns: int) -> None:
     """Start at most one non-queued automatic attempt when its gates permit it."""
-    if not _auto_refine_allowed(
-        assistant_turns, require_turn_interval=require_turn_interval
-    ) or not _AUTO_THREAD_GUARD.acquire(blocking=False):
+    if (
+        not _auto_refine_allowed()
+        or not _turn_interval_reached(session_id, assistant_turns)
+        or not _AUTO_THREAD_GUARD.acquire(blocking=False)
+    ):
         return
+    # Charge the attempt to this turn point before the worker starts, so a
+    # skipped or failed attempt cannot retry on every following turn.
+    _mark_turn_attempt(session_id, assistant_turns)
     try:
         threading.Thread(
             target=_run_auto_refine,
-            args=(session_id, assistant_turns),
-            kwargs={"require_turn_interval": require_turn_interval},
+            args=(session_id,),
             daemon=True,
             name="refine-auto",
         ).start()
@@ -140,9 +164,10 @@ def _on_pre_llm_call(**kwargs) -> Optional[dict]:
         if not config.prompt_notes_enabled():
             return None
         session_id = journal.normalize_prompt_note_session_id(kwargs.get("session_id", ""))
-        with journal.try_mutation_lock() as acquired:
-            if not acquired:
-                return None
+        # Prefer reading under the lock, but never drop notes for a whole turn
+        # just because a refine pass owns it: the store is only ever replaced
+        # atomically, so a lock-free read still sees one complete generation.
+        with journal.try_mutation_lock():
             notes = journal.load_prompt_notes()
         if not notes:
             return None
@@ -171,17 +196,23 @@ def _on_pre_llm_call(**kwargs) -> Optional[dict]:
     return None
 
 
-def _clear_session_prompt_notes(session_id: str) -> None:
-    """Clear plugin-owned session notes before releasing the session worker."""
+def _clear_session_prompt_notes(
+    session_id: str, *, timeout: Optional[float] = None
+) -> None:
+    """Clear plugin-owned session notes without stalling a host callback."""
     try:
-        journal.clear_session_prompt_notes(session_id)
+        if timeout is None:
+            journal.clear_session_prompt_notes(session_id)
+        else:
+            journal.clear_session_prompt_notes(session_id, timeout=timeout)
     except Exception:
         logger.debug("refine session prompt-note cleanup failed", exc_info=True)
 
 
 def _on_session_reset(session_id: str = "", **kwargs) -> None:
     """Expire only notes owned by the session Hermes reset."""
-    _clear_session_prompt_notes(session_id)
+    _forget_turn_marks(session_id)
+    _clear_session_prompt_notes(session_id, timeout=_HOST_PATH_LOCK_TIMEOUT)
 
 
 def _on_post_llm_call(
@@ -271,8 +302,9 @@ def _on_session_end(
     **kwargs,
 ) -> None:
     """Run the session-end fallback without blocking or dropping it behind a turn run."""
+    _forget_turn_marks(session_id)
     if not config.auto_enabled() or interrupted:
-        _clear_session_prompt_notes(session_id)
+        _clear_session_prompt_notes(session_id, timeout=_HOST_PATH_LOCK_TIMEOUT)
         return
     if not _AUTO_THREAD_GUARD.acquire(blocking=False):
         _defer_session_end(session_id)
@@ -287,12 +319,7 @@ def _on_session_end(
                 logger.debug("refine auto: not enough messages (%d)", len(messages))
                 return
             handed_off = True
-            _run_auto_refine(
-                session_id,
-                _assistant_turn_count(messages),
-                require_turn_interval=False,
-                cleanup_session_notes=True,
-            )
+            _run_auto_refine(session_id, cleanup_session_notes=True)
         except Exception:
             logger.exception("refine auto session-end hook failed")
         finally:
