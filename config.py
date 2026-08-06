@@ -43,7 +43,7 @@ def _load_raw_config() -> Optional[Dict[str, Any]]:
 
 def _get_refine_entry() -> Dict[str, Any]:
     raw = _load_raw_config()
-    if not raw:
+    if not isinstance(raw, dict) or not raw:
         return {}
     plugins_cfg = raw.get("plugins", {})
     if not isinstance(plugins_cfg, dict):
@@ -84,8 +84,29 @@ def get_str(key: str, default: str = "") -> str:
     return default
 
 
+def config_available() -> bool:
+    """Whether the Hermes config was both readable and shaped like a config.
+
+    A file that parses into a non-mapping (a bare list, a string) is as
+    unusable as one that fails to parse, so it must not be reported as
+    available: every accessor below would raise on it.
+    """
+    return isinstance(_load_raw_config(), dict)
+
+
 # Convenience accessors
 def auto_enabled() -> bool:
+    """Automatic refinement is on by default, but never on an unreadable config.
+
+    The default is ``True`` so refinement works right after install. That default
+    may only apply when the config was actually readable: defaulting to ``True``
+    while the file cannot be parsed would silently override an explicit
+    ``auto_enabled: false`` the user did set, and resume model-bound trajectory
+    analysis they had turned off. An unreadable config therefore fails closed,
+    and ``/refine status`` reports that as the reason.
+    """
+    if not config_available():
+        return False
     return get_bool("auto_enabled", True)
 
 
@@ -175,6 +196,29 @@ def overview_max_chars() -> int:
 def history_max_entries() -> int:
     """Maximum prior create/patch outcomes included in a proposal prompt."""
     return get_int("history_max_entries", 20, min_val=1)
+
+
+def _llm_entry() -> Dict[str, Any]:
+    block = _get_refine_entry().get("llm")
+    return block if isinstance(block, dict) else {}
+
+
+def llm_provider() -> str:
+    """Provider to request for refine's own calls; empty means host default."""
+    value = _llm_entry().get("provider")
+    return value.strip() if isinstance(value, str) else ""
+
+
+def llm_model() -> str:
+    """Model to request for refine's own calls; empty means host default.
+
+    Hermes resolves the model inside ``call_llm`` and exposes no session model
+    to plugins, so this is the only way to steer which model refine uses. The
+    host still gates it: without ``allow_model_override`` (and
+    ``allow_provider_override``) the request is refused rather than applied.
+    """
+    value = _llm_entry().get("model")
+    return value.strip() if isinstance(value, str) else ""
 
 
 def journal_dir() -> Path:

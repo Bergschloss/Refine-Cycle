@@ -10,8 +10,8 @@ it runs and has conflict-aware recovery metadata.
 
 This is a port of the `/refine` concept from
 [Prime Intellect's Prime Agent](https://www.primeintellect.ai/blog/prime-agent)
-(Continual Harness) built on the Hermes plugin system — no core changes and
-pure opt-in plugin behavior.
+(Continual Harness) built on the Hermes plugin system — no core changes, and the
+plugin only loads when it is explicitly enabled.
 
 ---
 
@@ -84,12 +84,18 @@ on Linux and macOS, and `%LOCALAPPDATA%\hermes\plugins\refine\` on Windows.
 Under a Hermes profile it follows that profile; the plugin resolves the location
 through `hermes_constants.get_hermes_home()`.
 
-> **Data safety:** the default `journal_dir` resolves to the plugin install
-> directory itself. If you already have runtime data (`refine_journal.jsonl`,
-> `backups/`, `skill_stats.json`, `prompt_notes.json`) there, move them to a
-> separate path **before** running `hermes plugins install --force`, which
-> deletes the target directory. Set `plugins.entries.refine.journal_dir` to
-> point at the new location. `/refine status` warns when this collision exists.
+> **Data safety — set `journal_dir` before you install.** The default
+> `journal_dir` resolves to the plugin install directory itself, so runtime data
+> (`refine_journal.jsonl`, `backups/`, `skill_stats.json`, `prompt_notes.json`)
+> lands in the directory `hermes plugins install --force` deletes. Point
+> `plugins.entries.refine.journal_dir` at a separate path, and move any existing
+> data there **before** a forced reinstall. `/refine status` and a startup log
+> line both warn while the collision exists.
+>
+> The default is deliberately left alone rather than silently moved: changing it
+> would strand the journal, backups, and ledger of every existing install, and
+> rollback depends on those records. Point the setting at a new path and move the
+> files yourself, once.
 
 1. Add to Hermes `config.yaml`:
 
@@ -116,9 +122,29 @@ hermes gateway restart
 ```
 hermes plugins list
 # refine  0.1.0  Self-improvement loop ...  user  enabled
-/refine status
-# auto: on, blockers: none — auto-refine is active
 ```
+
+Then check that automatic refinement can actually run:
+
+```
+/refine status
+# auto: on
+# turn interval: 25
+# min messages: 15
+# cooldown: 20 min
+# edits today: 0/3
+# journal: /home/you/.hermes/refine-data (does not exist yet, will be created on first write)
+# blockers: none — automatic refinement is active
+```
+
+`blockers` lists every reason a pass would not start; `warnings` lists what does
+not stop it but will cost you later, such as runtime data sitting in the plugin
+directory, or a journal directory that could not be inspected at all.
+
+Status is read-only: it creates no directory — not even the journal directory it
+reports on — writes no journal record, spends no budget, and calls no model. It
+does not reconcile pending approvals, so an unresolved staged edit still counts
+toward the budget it reports.
 
 ---
 
@@ -288,6 +314,33 @@ as negative examples.
 The agent gets a `refine_run` tool (toolset `refine`) and may trigger the same
 serialized flow with an optional reason.
 
+### Which model refine uses
+
+**Refine cannot follow the model you switch to inside a chat session.** Hermes
+resolves provider and model inside its own `call_llm`, and the plugin surface
+(`ctx.llm`, which is itself a `PluginLlm(plugin_id="refine")`) carries no
+session runtime. A mid-session `/model` switch is therefore invisible to this
+plugin, and no arrangement of plugin-side code changes that.
+
+What does work is pinning refine's own target explicitly:
+
+```yaml
+plugins:
+  entries:
+    refine:
+      llm:
+        allow_provider_override: true   # required for `provider` below
+        allow_model_override: true      # required for `model` below
+        provider: opencode-go
+        model: deepseek-v4-flash
+```
+
+Both `allow_*` flags are fail-closed in Hermes: with them off, a pinned value is
+refused rather than applied. Leave `provider`/`model` unset to accept whatever
+the host resolves by default. Every path — the `/refine` command, the
+`refine_run` tool, and both automatic triggers — shares the one host-provided
+client and honors this setting identically.
+
 ---
 
 ## Configuration
@@ -296,7 +349,7 @@ All keys live under `plugins.entries.refine`:
 
 | Key | Type | Default | Description |
 |---|---|---:|---|
-| `auto_enabled` | bool | `false` | Enable automatic turn and session-end attempts. |
+| `auto_enabled` | bool | `true` | Enable automatic turn and session-end attempts. Forced off when the Hermes config cannot be read. |
 | `auto_min_messages` | int | `15` | Minimum messages for session-end auto-analysis. |
 | `auto_turn_interval` | int | `25` | Assistant messages added since this session's last automatic attempt; `0` disables only the turn trigger. |
 | `auto_cooldown_minutes` | int | `20` | Minimum durable journal-derived gap between automatic attempts. |
@@ -349,6 +402,12 @@ llm:
   reasoning and no final text is reported as `llm_incomplete`; pin a
   non-reasoning model for refine with `plugins.entries.refine.llm` (`model` /
   `provider`) under the existing trust policy when that mitigation is needed.
+- **No access to the session's active model:** `ctx.llm` is a
+  `PluginLlm(plugin_id=...)` facade, and Hermes resolves provider and model
+  inside `call_llm` without passing any session runtime to plugins. A model
+  switched mid-session cannot reach refine, so the pinned `llm.model` /
+  `llm.provider` keys above are the only way to steer it. Closing this would
+  need Hermes to expose the resolved session provider/model to the plugin call.
 - **No host approval for the prompt-note store:** it is a plugin-owned atomic
   file, not a host memory or skill write. Host-managed skill and memory changes
   still respect staged approvals and reconciliation.
@@ -430,7 +489,7 @@ cd <HERMES_HOME>/plugins/refine
 python -m tests.run_tests
 ```
 
-The stdlib-only suite (98 tests) installs a fake Hermes host before importing the plugin.
+The stdlib-only suite (138 tests) installs a fake Hermes host before importing the plugin.
 Every database, journal, backup, skill, memory file, ledger, and lock lives
 under a fresh `TemporaryDirectory`; running the suite cannot touch live Hermes
 or profile state. It covers proposal completion, host action mapping,
@@ -488,8 +547,9 @@ skill content becomes `no_op`; it is never redacted, truncated, or used to
 generate a destructive replacement.
 
 Credentials are redacted first, but remaining content is ordinary conversation
-or skill content. Keep `auto_enabled: false` if model-bound session analysis
-must be manually initiated.
+or skill content. Automatic analysis is on by default; set
+`auto_enabled: false` if model-bound session analysis must be manually
+initiated.
 
 ---
 

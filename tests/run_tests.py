@@ -382,6 +382,9 @@ class RefineTests(unittest.TestCase):
         # Turn marks are process-lifetime state keyed by session id; clear them so
         # one test's attempt point cannot suppress the next test's trigger.
         plugin_init._AUTO_TURN_MARKS.clear()
+        # Both are process-lifetime globals: left set, they leak across tests.
+        plugin_init._REGISTER_WARNED = False
+        plugin_init._REGISTERED_LLM = None
 
     def tearDown(self):
         self.temp.cleanup()
@@ -3248,34 +3251,142 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
     # ── Autostart / status tests ──────────────────────────────────────────────
 
     def test_status_reports_blockers_when_auto_disabled(self):
-        with patch.object(config, "auto_enabled", return_value=False):
-            status = core.refine_status()
+        FakeHost.entry_config()["auto_enabled"] = False
+        status = core.refine_status()
         self.assertFalse(status["auto_enabled"])
-        self.assertTrue(any("вимкнений" in b for b in status["blockers"]))
+        self.assertIn("auto_disabled", status["blocker_codes"])
 
     def test_status_reports_no_blockers_when_ready(self):
         status = core.refine_status()
         self.assertTrue(status["auto_enabled"])
-        # Fresh journal, no cooldown, budget free → no blockers
-        self.assertEqual(status["blockers"], [])
+        self.assertEqual(status["blocker_codes"], [])
 
-    def test_status_reports_budget_exhausted(self):
-        # Temporarily lower budget to 1 and exhaust it
+    def test_unreadable_config_keeps_auto_off_and_says_so(self):
+        # An unreadable config must not resurrect analysis the user turned off.
+        FakeHost.entry_config()["auto_enabled"] = False
+        with patch.object(config, "_load_raw_config", return_value=None):
+            self.assertFalse(config.auto_enabled())
+            status = core.refine_status()
+        self.assertFalse(status["config_readable"])
+        self.assertIn("config_unreadable", status["blocker_codes"])
+        self.assertNotIn("auto_disabled", status["blocker_codes"])
+
+    def test_status_reports_budget_exhausted_specifically(self):
         FakeHost.entry_config()["max_edits_per_day"] = 1
-        result = self.run_proposal(skill_proposal("status-budget-test"))
-        self.assertTrue(result["success"])
+        self.assertTrue(self.run_proposal(skill_proposal("status-budget"))["success"])
         status = core.refine_status()
         self.assertEqual(status["edits_today"], 1)
-        self.assertGreater(len(status["blockers"]), 0)
+        self.assertIn("budget_exhausted", status["blocker_codes"])
+
+    def test_disabled_turn_trigger_is_a_warning_not_a_blocker(self):
+        # The session-end fallback still runs at interval 0, so calling it a
+        # blocker would tell the user refinement stopped when it has not.
+        FakeHost.entry_config()["auto_turn_interval"] = 0
+        status = core.refine_status()
+        self.assertFalse(status["turn_trigger_enabled"])
+        self.assertNotIn("turn_trigger_disabled", status["blocker_codes"])
+        self.assertIn("turn_trigger_disabled", status["warning_codes"])
 
     def test_status_does_not_create_journal_entries(self):
         before = len(journal.entries())
         core.refine_status()
         self.assertEqual(len(journal.entries()), before)
 
-    def test_status_does_not_call_model(self):
-        with patch.object(core, "refine_run", side_effect=AssertionError("model called")):
-            core.refine_status()  # should not raise
+    def test_status_does_not_create_the_journal_directory(self):
+        missing = self.root / "never-created" / "refine-data"
+        FakeHost.entry_config()["journal_dir"] = str(missing)
+        status = core.refine_status()
+        self.assertFalse(missing.exists())
+        self.assertFalse(status["journal_present"])
+        self.assertEqual(status["journal_dir_state"], "missing_creatable")
+
+    def test_status_reports_unusable_journal_dir_instead_of_raising(self):
+        blocked = self.root / "journal-is-a-file"
+        blocked.write_text("not a directory", encoding="utf-8")
+        FakeHost.entry_config()["journal_dir"] = str(blocked)
+        status = core.refine_status()
+        self.assertEqual(status["journal_dir_state"], "not_a_directory")
+        self.assertIn("journal_dir_unusable", status["blocker_codes"])
+
+    def test_status_never_reaches_an_llm_or_a_run(self):
+        with patch.object(core, "refine_run", side_effect=AssertionError("run called")), \
+             patch.object(core._llm, "propose", side_effect=AssertionError("propose called")), \
+             patch.object(core._llm, "review_fallback", side_effect=AssertionError("reviewer called")), \
+             patch.object(plugin_init, "PluginLlm", side_effect=AssertionError("client built")):
+            core.refine_status()
+            self.assertIn("auto:", plugin_init._handle_refine_command("status"))
+
+    def test_reading_prompt_notes_does_not_create_the_journal_dir(self):
+        # This hook runs every turn, so a reader here would erase the evidence
+        # /refine status is supposed to report.
+        missing = self.root / "mistyped" / "refine-data"
+        FakeHost.entry_config()["journal_dir"] = str(missing)
+        self.assertIsNone(plugin_init._on_pre_llm_call(session_id="session"))
+        self.assertFalse(missing.exists())
+        self.assertEqual(ledger.load_stats(), {})
+        self.assertFalse(missing.exists())
+        self.assertEqual(core.refine_status()["journal_dir_state"], "missing_creatable")
+        self.assertFalse(missing.exists())
+
+    def test_non_mapping_config_is_unavailable_rather_than_raising(self):
+        with patch.object(config, "_load_raw_config", return_value=["not", "a", "mapping"]):
+            self.assertFalse(config.config_available())
+            self.assertFalse(config.auto_enabled())
+            status = core.refine_status()
+            self.assertIsNone(plugin_init._on_post_llm_call(session_id="s"))
+        self.assertIn("config_unreadable", status["blocker_codes"])
+
+    def test_unreadable_journal_is_reported_not_silently_zero(self):
+        journal.log(
+            trigger="manual", reason="seed", session_id="session",
+            proposal={"action": "no_op", "reason": "seed"}, outcome="no_op",
+        )
+        with patch.object(Path, "read_text", side_effect=OSError("unreadable")):
+            status = core.refine_status()
+        self.assertFalse(status["journal_readable"])
+        self.assertIn("journal_unreadable", status["blocker_codes"])
+
+    def test_uninspectable_journal_dir_is_not_silently_clean(self):
+        with patch.object(core, "_journal_dir_state", return_value="unknown"):
+            status = core.refine_status()
+        self.assertIn("journal_dir_unknown", status["warning_codes"])
+
+    def test_cooldown_blocker_matches_the_reported_value(self):
+        journal.log(
+            trigger="auto", reason="recent", session_id="session",
+            proposal={"action": "no_op", "reason": "recent"}, outcome="no_op",
+        )
+        status = core.refine_status()
+        self.assertIn("cooldown_active", status["blocker_codes"])
+        shown = str(status["cooldown_remaining_minutes"])
+        message = next(
+            b["message"] for b in status["blockers"] if b["code"] == "cooldown_active"
+        )
+        self.assertIn(shown, message)
+
+    def test_status_shows_a_usable_journal_path(self):
+        status = core.refine_status()
+        self.assertEqual(status["journal_dir"], str(config.journal_dir()))
+        self.assertIn(status["journal_dir_state_text"], plugin_init._handle_refine_command("status"))
+
+    def test_pinned_provider_and_model_reach_the_host_call(self):
+        FakeHost.entry_config()["llm"] = {"provider": "opencode-go", "model": "deepseek-v4"}
+        model = MockLlm({
+            "action": "no_op", "reason": "nothing", "evidence": [],
+            "kind": "", "name": "", "content": "",
+        })
+        llm.propose(model, "evidence", [], [])
+        self.assertEqual(model.calls[0]["provider"], "opencode-go")
+        self.assertEqual(model.calls[0]["model"], "deepseek-v4")
+
+    def test_unpinned_model_leaves_the_host_default(self):
+        model = MockLlm({
+            "action": "no_op", "reason": "nothing", "evidence": [],
+            "kind": "", "name": "", "content": "",
+        })
+        llm.propose(model, "evidence", [], [])
+        self.assertNotIn("provider", model.calls[0])
+        self.assertNotIn("model", model.calls[0])
 
     def test_status_command_returns_text_not_dict(self):
         result = plugin_init._handle_refine_command("status")
@@ -3291,39 +3402,61 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
         self.assertEqual(run.call_args.kwargs["reason"], "status of gmail failures")
 
     def test_journal_dir_collision_warning(self):
-        # Place a plugin.yaml in journal_dir to simulate collision
         jdir = Path(config.journal_dir())
         jdir.mkdir(parents=True, exist_ok=True)
         (jdir / "plugin.yaml").write_text("name: refine\n", encoding="utf-8")
         status = core.refine_status()
         self.assertTrue(status["journal_dir_is_plugin_source"])
-        self.assertTrue(len(status["warnings"]) > 0)
+        self.assertIn("journal_dir_is_plugin_source", status["warning_codes"])
 
-    def test_register_warns_on_collision(self):
+    def test_register_warns_on_collision_exactly_once(self):
         jdir = Path(config.journal_dir())
         jdir.mkdir(parents=True, exist_ok=True)
         (jdir / "plugin.yaml").write_text("name: refine\n", encoding="utf-8")
-        plugin_init._REGISTER_WARNED = False
-        # The logger name when imported directly is __init__
+        with self.assertLogs(level="WARNING") as cm:
+            plugin_init._warn_on_register()
+            plugin_init._warn_on_register()
+        collision = [msg for msg in cm.output if "journal_dir" in msg]
+        self.assertEqual(len(collision), 1)
+
+    def test_register_does_not_warn_without_collision(self):
+        with self.assertRaises(AssertionError):
+            with self.assertLogs(level="WARNING"):
+                plugin_init._warn_on_register()
+        # A later genuine collision must still be reported.
+        jdir = Path(config.journal_dir())
+        jdir.mkdir(parents=True, exist_ok=True)
+        (jdir / "plugin.yaml").write_text("name: refine\n", encoding="utf-8")
         with self.assertLogs(level="WARNING") as cm:
             plugin_init._warn_on_register()
         self.assertTrue(any("journal_dir" in msg for msg in cm.output))
-        # Second call does not warn again due to the flag
-        self.assertTrue(plugin_init._REGISTER_WARNED)
-
-    def test_register_does_not_warn_without_collision(self):
-        plugin_init._REGISTER_WARNED = False
-        # No plugin.yaml in journal_dir — should not log a warning at our level
-        try:
-            with self.assertLogs(level="WARNING"):
-                plugin_init._warn_on_register()
-            self.fail("Should not have logged a warning without collision")
-        except AssertionError as exc:
-            if "no logs" not in str(exc).lower():
-                raise
 
     def test_auto_enabled_defaults_to_true(self):
         self.assertTrue(config.auto_enabled())
+
+    def test_manual_command_and_tool_use_the_session_client(self):
+        # One host-provided facade for every path, instead of a new client per
+        # invocation. A falsy-but-present client must still be honored.
+        class FalsyClient:
+            def __bool__(self):
+                return False
+
+        session_client = FalsyClient()
+        plugin_init._REGISTERED_LLM = session_client
+        with patch.object(plugin_init.core, "refine_run", return_value={
+            "success": True, "message": "done", "outcome": "no_op",
+        }) as run:
+            plugin_init._handle_refine_command("look at gmail failures")
+            plugin_init._handle_refine_run({"reason": "same"})
+        self.assertEqual(len(run.call_args_list), 2)
+        for call in run.call_args_list:
+            self.assertIs(call.kwargs["llm"], session_client)
+
+    def test_session_client_falls_back_when_host_gave_none(self):
+        plugin_init._REGISTERED_LLM = None
+        sentinel = object()
+        with patch.object(plugin_init, "PluginLlm", return_value=sentinel):
+            self.assertIs(plugin_init._session_llm(), sentinel)
 
 
 if __name__ == "__main__":

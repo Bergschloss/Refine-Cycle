@@ -28,8 +28,13 @@ def stats_path() -> Path:
     return path / _STATS_FILE_NAME
 
 
+def stats_read_path() -> Path:
+    """Ledger location for readers, without creating anything."""
+    return journal_dir() / _STATS_FILE_NAME
+
+
 def load_stats() -> Dict[str, Any]:
-    path = stats_path()
+    path = stats_read_path()
     if not path.is_file():
         return {}
     try:
