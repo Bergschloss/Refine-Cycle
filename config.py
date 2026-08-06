@@ -93,6 +93,16 @@ def auto_min_messages() -> int:
     return get_int("auto_min_messages", 15, min_val=5)
 
 
+def auto_turn_interval() -> int:
+    """Assistant turns between automatic refine attempts; zero disables it."""
+    return get_int("auto_turn_interval", 25, min_val=0)
+
+
+def auto_cooldown_minutes() -> int:
+    """Minimum elapsed time between durable automatic-attempt records."""
+    return get_int("auto_cooldown_minutes", 20)
+
+
 def max_edits_per_run() -> int:
     return get_int("max_edits_per_run", 1, min_val=1)
 
