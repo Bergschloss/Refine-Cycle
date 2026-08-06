@@ -129,12 +129,15 @@ the manual reason.
 
 ### Automatic refinement
 
-`post_llm_call` counts assistant turns and starts at most one background
-refinement attempt at a configured interval. The hook itself does not mutate or
-queue work. It skips an attempt when another pass owns the lock, and derives its
-cooldown from durable journal records, so the cooldown is visible across
-processes. `on_session_end` remains a background fallback based on the minimum
-message count.
+`post_llm_call` counts the assistant messages in the history Hermes supplies and
+starts at most one background refinement attempt once that count has grown by
+`auto_turn_interval` since this session's previous attempt. It compares a delta
+rather than an exact multiple, because a single tool-using turn appends several
+assistant messages and would otherwise step straight over the boundary. The hook
+itself does not mutate or queue work. It skips an attempt when another pass owns
+the lock, and derives its cooldown from durable journal records, so the cooldown
+is visible across processes. `on_session_end` remains a background fallback based
+on the minimum message count.
 
 ```yaml
 plugins:
@@ -176,6 +179,9 @@ writes the base system prompt. Injection is bounded by
 whole oldest notes, never partial text. Empty, unavailable, unsafe, or
 out-of-scope note stores inject nothing and do not raise on the user path.
 
+Injection prefers the mutation lock but does not depend on it: the store is only
+ever replaced atomically, so a running refine pass never costs a turn its notes.
+
 New prompt notes use `prompt_notes_default_scope`:
 
 - `global` (the default) is injected in every session.
@@ -183,6 +189,11 @@ New prompt notes use `prompt_notes_default_scope`:
   injects only when the hook receives that same identifier. Session notes are
   removed from the plugin-owned store after `on_session_end` or
   `on_session_reset` for that session.
+
+Cleanup runs on the host's callback thread, so it waits only briefly for the
+mutation lock instead of the full lock timeout. If a refine pass still owns the
+lock, the note is left in place — it can no longer be injected, because its
+session is gone — and it is removed at the next end or reset for that id.
 
 The prompt-note store is plugin-owned, so there is **no host approval gate** for
 these notes. Creation, target-state proof, audit rows, and conflict-aware
@@ -231,7 +242,7 @@ All keys live under `plugins.entries.refine`:
 |---|---|---:|---|
 | `auto_enabled` | bool | `false` | Enable automatic turn and session-end attempts. |
 | `auto_min_messages` | int | `15` | Minimum messages for session-end auto-analysis. |
-| `auto_turn_interval` | int | `25` | Assistant turns between automatic attempts; `0` disables only the turn trigger. |
+| `auto_turn_interval` | int | `25` | Assistant messages added since this session's last automatic attempt; `0` disables only the turn trigger. |
 | `auto_cooldown_minutes` | int | `20` | Minimum durable journal-derived gap between automatic attempts. |
 | `max_edits_per_run` | int | `1` | Maximum applied or reserved edits per run. |
 | `max_edits_per_day` | int | `3` | Maximum applied, pending, or prepared edits per UTC day. |
@@ -374,7 +385,9 @@ must be manually initiated.
 - **Bounded ephemeral prompt context** is labelled, sanitized, whole-note
   bounded, scoped, and never changes the base system prompt.
 - **Serialized budget** counts applied, pending-approval, and unresolved
-  prepared records after acquiring the process-safe mutation lock.
+  prepared records after acquiring the process-safe mutation lock. Lock
+  acquisition is bounded for both in-process and cross-process contention, so a
+  contended run reports a timeout instead of hanging its caller.
 - **Durable append journal** writes one locked, fsynced JSON line per state
   transition without rewriting history. A corrupt trailing line is skipped and
   isolated before the next valid record; backup, ledger, and note-store writes

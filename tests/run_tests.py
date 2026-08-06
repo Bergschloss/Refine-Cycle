@@ -348,6 +348,9 @@ class RefineTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         FakeHost.reset(self.root)
+        # Turn marks are process-lifetime state keyed by session id; clear them so
+        # one test's attempt point cannot suppress the next test's trigger.
+        plugin_init._AUTO_TURN_MARKS.clear()
 
     def tearDown(self):
         self.temp.cleanup()
@@ -1029,6 +1032,39 @@ class RefineTests(unittest.TestCase):
             plugin_init._on_post_llm_call("session", history * 2)
         self.assertEqual(refine.call_count, 1)
 
+    def test_turn_trigger_fires_when_a_turn_adds_several_assistant_messages(self):
+        FakeHost.entry_config().update({"auto_enabled": True, "auto_turn_interval": 3})
+        called = threading.Event()
+
+        def run(**kwargs):
+            called.set()
+            return {"success": True}
+
+        with patch.object(plugin_init.core, "refine_run", side_effect=run) as refine:
+            # One tool-using host turn appends several assistant messages, so the
+            # count steps over the interval instead of landing on a multiple.
+            plugin_init._on_post_llm_call("session", [{"role": "assistant"}] * 2)
+            self.assertFalse(called.wait(0.05))
+            plugin_init._on_post_llm_call("session", [{"role": "assistant"}] * 4)
+            self.assertTrue(called.wait(1))
+            deadline = time.monotonic() + 1
+            while plugin_init._AUTO_THREAD_GUARD.locked() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertFalse(plugin_init._AUTO_THREAD_GUARD.locked())
+            # The attempt is charged to turn 4, so the next one waits for turn 7.
+            plugin_init._on_post_llm_call("session", [{"role": "assistant"}] * 6)
+            time.sleep(0.05)
+            self.assertEqual(refine.call_count, 1)
+            plugin_init._on_post_llm_call("session", [{"role": "assistant"}] * 9)
+            deadline = time.monotonic() + 1
+            while refine.call_count < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(refine.call_count, 2)
+            deadline = time.monotonic() + 1
+            while plugin_init._AUTO_THREAD_GUARD.locked() and time.monotonic() < deadline:
+                time.sleep(0.01)
+        self.assertFalse(plugin_init._AUTO_THREAD_GUARD.locked())
+
     def test_auto_cooldown_reads_preexisting_durable_journal_record(self):
         FakeHost.entry_config().update({"auto_enabled": True, "auto_turn_interval": 1})
         journal.log(
@@ -1200,9 +1236,14 @@ class RefineTests(unittest.TestCase):
         with patch.object(plugin_init.journal, "try_mutation_lock", observing_try_lock), patch.object(
             plugin_init.core, "refine_run"
         ) as refine, journal.mutation_lock():
-            history = [{"role": "assistant"}]
-            plugin_init._on_post_llm_call("session", history)
-            plugin_init._on_post_llm_call("session", history)
+            # Both calls must clear the turn gate so each really attempts the
+            # lock; a second attempt has to be skipped, never blocked or queued.
+            plugin_init._on_post_llm_call("session", [{"role": "assistant"}])
+            self.assertTrue(attempted.wait(1))
+            self.assertTrue(finished.wait(1))
+            attempted.clear()
+            finished.clear()
+            plugin_init._on_post_llm_call("session", [{"role": "assistant"}] * 2)
             self.assertTrue(attempted.wait(1))
             self.assertTrue(finished.wait(1))
         refine.assert_not_called()
@@ -1515,8 +1556,8 @@ class RefineTests(unittest.TestCase):
         cleared = threading.Event()
         original_clear = journal.clear_session_prompt_notes
 
-        def observe_clear(session_id):
-            result = original_clear(session_id)
+        def observe_clear(session_id, **kwargs):
+            result = original_clear(session_id, **kwargs)
             cleared.set()
             return result
 
@@ -1539,6 +1580,61 @@ class RefineTests(unittest.TestCase):
         self.assertNotIn(
             "reset request", plugin_init._on_pre_llm_call(session_id="session")["context"]
         )
+
+    def test_prompt_notes_still_inject_while_a_refine_pass_owns_the_lock(self):
+        policy = "When retrying a locked request, verify the endpoint."
+        self.assertTrue(self.run_proposal(prompt_proposal(policy))["success"])
+        held = threading.Event()
+        release = threading.Event()
+
+        def hold():
+            with journal.mutation_lock():
+                held.set()
+                release.wait(10)
+
+        holder = threading.Thread(target=hold, daemon=True)
+        holder.start()
+        try:
+            self.assertTrue(held.wait(2))
+            injected = plugin_init._on_pre_llm_call(session_id="session")
+        finally:
+            release.set()
+            holder.join(10)
+        self.assertEqual(injected, {"context": f"Refine notes:\n- {policy}"})
+
+    def test_host_callbacks_do_not_wait_out_the_full_lock_timeout(self):
+        FakeHost.entry_config()["prompt_notes_default_scope"] = "session"
+        policy = "When retrying a blocked request, verify its response."
+        self.assertTrue(
+            self.run_proposal(prompt_proposal(policy), session_id="session")["success"]
+        )
+        held = threading.Event()
+        release = threading.Event()
+
+        def hold():
+            with journal.mutation_lock():
+                held.set()
+                release.wait(30)
+
+        holder = threading.Thread(target=hold, daemon=True)
+        holder.start()
+        try:
+            self.assertTrue(held.wait(2))
+            # In-process contention must honour the timeout, not block forever.
+            with self.assertRaises(TimeoutError):
+                with journal.mutation_lock(timeout=0.2):
+                    pass
+            started = time.monotonic()
+            plugin_init._on_session_reset(session_id="session")
+            elapsed = time.monotonic() - started
+        finally:
+            release.set()
+            holder.join(30)
+        self.assertLess(elapsed, plugin_init._HOST_PATH_LOCK_TIMEOUT + 2)
+        # The note survives a skipped cleanup and is removed on the next reset.
+        self.assertIn(policy, plugin_init._on_pre_llm_call(session_id="session")["context"])
+        plugin_init._on_session_reset(session_id="session")
+        self.assertIsNone(plugin_init._on_pre_llm_call(session_id="session"))
 
     def test_session_scoped_prompt_note_rejects_missing_or_unsafe_identity(self):
         proposal = prompt_proposal("When retrying a scoped request, verify its target.")
