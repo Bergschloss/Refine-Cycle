@@ -556,6 +556,7 @@ def _finalize_edit(
     initial_expected_outcome = normalize_expected_outcome(
         parsed.get("expected_outcome")
     )
+    _planning_baseline = None  # Set only for skill patch from loader content
 
     if action == "patch" and kind == "skill":
         loader = skill_content_loader or _default_skill_loader
@@ -576,6 +577,13 @@ def _finalize_edit(
                 "action": "no_op",
                 "reason": "Current SKILL.md contains sensitive content; patch aborted before model call",
             }
+        # Capture planning baseline digest from the content the model will see.
+        # This value is NEVER read from model output — only from this loader read.
+        try:
+            from .journal import content_digest as _baseline_digest
+        except ImportError:
+            from journal import content_digest as _baseline_digest  # type: ignore
+        _planning_baseline = {"exists": True, "sha256": _baseline_digest(current)}
         patch_prompt = (
             instructions
             + "\n\n=== SELECTED PATCH TARGET ===\n"
@@ -614,7 +622,7 @@ def _finalize_edit(
                 retry.get("expected_outcome")
             )
 
-    return sanitize({
+    result = sanitize({
         "action": action,
         "kind": kind,
         "name": name,
@@ -625,6 +633,9 @@ def _finalize_edit(
         "evidence": initial_evidence,
         "pattern_fingerprint": initial_fingerprint,
     })
+    if _planning_baseline is not None:
+        result["refine_baseline"] = _planning_baseline
+    return result
 
 
 def _finalize_edits(
@@ -707,7 +718,7 @@ def _finalize_edits(
                 f"Proposed transaction contained no usable edit ({dropped} discarded)"
             ),
         }
-    if len(edits) == 1:
+    if len(edits) == 1 and not dropped:
         return sanitize(edits[0])
     return sanitize({
         "action": "multi",

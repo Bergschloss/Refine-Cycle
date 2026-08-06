@@ -2907,6 +2907,97 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
             result = journal.skill_baseline("any-skill")
         self.assertIsNone(result)
 
+    # ── Phase 2: planning baseline capture tests ───────────────────────────────
+
+    def test_skill_patch_proposal_carries_planning_baseline(self):
+        name = "baseline-patch"
+        current = skill_content(name, "# Existing\n\nKeep this.")
+        replacement = skill_content(name, "# Existing\n\nKeep this.\n\nNew fix.")
+        FakeHost.add_skill(name, current)
+        initial = {
+            "action": "patch", "kind": "skill", "name": name,
+            "content": "stub", "reason": "failure", "evidence": [],
+        }
+        model = MockLlm(initial, dict(initial, content=replacement))
+        result = llm.propose(
+            model, "evidence", [name], [], skill_content_loader=journal.read_skill_content
+        )
+        self.assertIn("refine_baseline", result)
+        import hashlib
+        expected_sha = hashlib.sha256(current.encode("utf-8", "replace")).hexdigest()
+        self.assertEqual(result["refine_baseline"]["sha256"], expected_sha)
+        self.assertTrue(result["refine_baseline"]["exists"])
+
+    def test_model_cannot_inject_fake_baseline(self):
+        name = "tamper-baseline"
+        current = skill_content(name, "# Real content")
+        replacement = skill_content(name, "# Real content\n\nFixed.")
+        FakeHost.add_skill(name, current)
+        fake_baseline = {"exists": True, "sha256": "0" * 64}
+        initial = {
+            "action": "patch", "kind": "skill", "name": name,
+            "content": "stub", "reason": "failure", "evidence": [],
+            "refine_baseline": fake_baseline,
+        }
+        retry_with_fake = dict(initial, content=replacement, refine_baseline=fake_baseline)
+        model = MockLlm(initial, retry_with_fake)
+        result = llm.propose(
+            model, "evidence", [name], [], skill_content_loader=journal.read_skill_content
+        )
+        import hashlib
+        expected_sha = hashlib.sha256(current.encode("utf-8", "replace")).hexdigest()
+        self.assertEqual(result["refine_baseline"]["sha256"], expected_sha)
+        self.assertNotEqual(result["refine_baseline"]["sha256"], "0" * 64)
+
+    def test_create_and_memory_have_no_baseline(self):
+        result_create = llm._finalize_edit(
+            MockLlm(), "short", "instructions",
+            {"action": "create", "kind": "skill", "name": "new-skill",
+             "content": skill_content("new-skill"), "reason": "r", "evidence": []},
+            skill_content_loader=journal.read_skill_content,
+        )
+        self.assertNotIn("refine_baseline", result_create)
+        result_memory = llm._finalize_edit(
+            MockLlm(), "short", "instructions",
+            {"action": "create", "kind": "memory", "name": "lesson",
+             "content": "Remember this", "reason": "r", "evidence": []},
+            skill_content_loader=journal.read_skill_content,
+        )
+        self.assertNotIn("refine_baseline", result_memory)
+
+    def test_multi_proposal_each_patch_has_own_baseline(self):
+        name_a = "multi-base-a"
+        name_b = "multi-base-b"
+        body_a = skill_content(name_a, "# A content")
+        body_b = skill_content(name_b, "# B content")
+        FakeHost.add_skill(name_a, body_a)
+        FakeHost.add_skill(name_b, body_b)
+        replacement_a = skill_content(name_a, "# A content\n\nFix A.")
+        replacement_b = skill_content(name_b, "# B content\n\nFix B.")
+        edits = [
+            {"action": "patch", "kind": "skill", "name": name_a, "content": replacement_a},
+            {"action": "patch", "kind": "skill", "name": name_b, "content": replacement_b},
+        ]
+        multi = {
+            "action": "multi", "kind": "", "name": "", "content": "",
+            "summary": "Fix both", "reason": "failure", "evidence": [],
+            "edits": edits,
+        }
+        # _finalize_edit for each patch sub-calls the model to get the full replacement
+        patch_reply_a = {"action": "patch", "kind": "skill", "name": name_a, "content": replacement_a, "reason": "failure", "evidence": []}
+        patch_reply_b = {"action": "patch", "kind": "skill", "name": name_b, "content": replacement_b, "reason": "failure", "evidence": []}
+        model = MockLlm(multi, patch_reply_a, patch_reply_b)
+        result = llm.propose(
+            model, "evidence", [name_a, name_b], [],
+            skill_content_loader=journal.read_skill_content
+        )
+        self.assertEqual(result["action"], "multi")
+        import hashlib
+        sha_a = hashlib.sha256(body_a.encode("utf-8", "replace")).hexdigest()
+        sha_b = hashlib.sha256(body_b.encode("utf-8", "replace")).hexdigest()
+        self.assertEqual(result["edits"][0]["refine_baseline"]["sha256"], sha_a)
+        self.assertEqual(result["edits"][1]["refine_baseline"]["sha256"], sha_b)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
