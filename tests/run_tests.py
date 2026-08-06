@@ -435,6 +435,29 @@ class RefineTests(unittest.TestCase):
         )
         self.assertEqual(len(found), 11)
 
+    def test_proposal_and_reviewer_budgets_are_derived_and_distinct(self):
+        self.assertGreaterEqual(
+            llm.PROPOSAL_MAX_TOKENS * llm._CHARS_PER_TOKEN,
+            llm.MAX_CONTENT_CHARS,
+        )
+        self.assertLess(llm.REVIEWER_MAX_TOKENS, llm.PROPOSAL_MAX_TOKENS // 4)
+
+        proposal_model = MockLlm({"action": "no_op", "reason": "none"})
+        llm.propose(proposal_model, "evidence", [], [])
+        self.assertEqual(
+            proposal_model.calls[0]["max_tokens"], llm.PROPOSAL_MAX_TOKENS
+        )
+
+        reviewer_model = MockLlm({
+            "shouldRefine": False,
+            "rationale": "No durable lesson.",
+            "instructions": "",
+        })
+        llm.review_fallback(reviewer_model, "evidence")
+        self.assertEqual(
+            reviewer_model.calls[0]["max_tokens"], llm.REVIEWER_MAX_TOKENS
+        )
+
     def test_skill_patch_gets_current_complete_content(self):
         name = "existing-skill"
         current = skill_content(name, "# Existing\n\nImportant old guidance.")

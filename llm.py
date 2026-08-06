@@ -18,7 +18,18 @@ except ImportError:
     from sanitization import sanitize, scrub_text  # type: ignore
 
 logger = logging.getLogger(__name__)
+
+# A complete skill can be this large. Keep the output budget derived from the
+# same source of truth: JSON-escaped Markdown tokenizes worse than prose, and
+# under-budgeting silently truncates the proposals this limit permits.
 MAX_CONTENT_CHARS = 15000
+_CHARS_PER_TOKEN = 3
+_PROPOSAL_ENVELOPE_TOKENS = 1024
+PROPOSAL_MAX_TOKENS = (
+    MAX_CONTENT_CHARS // _CHARS_PER_TOKEN + _PROPOSAL_ENVELOPE_TOKENS
+)
+# Reviewer fallback must remain materially cheaper than a full proposal pass.
+REVIEWER_MAX_TOKENS = 300
 
 REFINE_PROPOSAL_SCHEMA: Dict[str, Any] = {
     "type": "object",
@@ -111,7 +122,7 @@ def _propose_structured(
         schema_name="refine_proposal",
         purpose="refine",
         temperature=0.0,
-        max_tokens=4096,
+        max_tokens=PROPOSAL_MAX_TOKENS,
     )
     system_prompt = scrub_text(REFINE_SYSTEM_PROMPT)
     try:
@@ -167,7 +178,7 @@ def review_fallback(llm: PluginLlm, evidence_text: str) -> Dict[str, Any]:
             schema_name="refine_reviewer",
             purpose="refine",
             temperature=0.0,
-            max_tokens=300,
+            max_tokens=REVIEWER_MAX_TOKENS,
         )
         parsed = _ensure_dict(_salvage_parsed(result))
     except Exception as exc:
