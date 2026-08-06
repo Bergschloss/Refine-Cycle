@@ -182,12 +182,16 @@ def propose(
         "Return a single JSON object with your proposal."
     )
 
+    # Short imperative instruction goes to ``instructions=``; the full context
+    # is passed as the input block. Passing the same text in both places would
+    # double the tokens on every call.
+    short_instructions = "Propose one minimal skill or memory edit."
     input_blocks: List[PluginLlmInput] = [
         PluginLlmTextInput(text=instructions),
     ]
 
     try:
-        parsed = _propose_structured(llm, instructions, input_blocks)
+        parsed = _propose_structured(llm, short_instructions, input_blocks)
 
         if not isinstance(parsed, dict):
             # Provider returned non-object (e.g. raw text) — try to salvage JSON.
@@ -214,7 +218,9 @@ def propose(
                 + "\n\nIMPORTANT: action='create' REQUIRES a non-empty 'content' "
                 + "field containing the full SKILL.md or memory text. Include it."
             )
-            retry = _propose_structured(llm, retry_instructions, input_blocks)
+            retry = _propose_structured(
+                llm, short_instructions, [PluginLlmTextInput(text=retry_instructions)]
+            )
             if isinstance(retry, dict) and str(retry.get("content") or "").strip():
                 parsed = retry
 

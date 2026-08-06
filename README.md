@@ -54,6 +54,8 @@ fallback to `json_mode` (then raw-text JSON salvage) for providers that reject
 
 ## Installation
 
+> **Note:** this is a plugin for [Hermes Agent](https://hermes-agent.nousresearch.com/docs) — it requires a working Hermes installation (≥ 0.17.0) and does not run standalone.
+
 The plugin lives in `~/.hermes/plugins/refine/`.
 
 1. Add to `~/.hermes/config.yaml`:
@@ -186,6 +188,9 @@ refine/
 
 - **Agent-created skills only** (default). Built-in / pinned / hub-installed are
   never touched.
+- **Credential scrubbing** — trajectory fragments are scrubbed
+  (PATs, API keys, JWTs, private keys, `token=`/`password=` values → `[REDACTED]`)
+  before they are sent to the LLM **and** before they are written to the journal.
 - **No delete** — refine can only create or patch.
 - **Daily budget** — max 3 applied edits per day (UTC), max 1 per run.
 - **Backup before edit, rollback by ID.**

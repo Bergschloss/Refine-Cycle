@@ -174,17 +174,21 @@ def backup_skill(name: str) -> Optional[Path]:
 def backup_memory(target: str) -> Optional[str]:
     """Extract current memory/user entry text as a backup string.
 
-    Returns the full current content, or None if no entries.
+    Returns the full current content, or "" when the store is empty (still a
+    valid backup — "memory was empty"), or None on read failure.
     """
     from tools.memory_tool import MemoryStore
 
-    store = MemoryStore()
-    store.load_from_disk()
-    entries = store._entries_for(target)  # noqa: SLF001 — internal but safe
-    if not entries:
+    try:
+        store = MemoryStore()
+        store.load_from_disk()
+        entries = store._entries_for(target)  # noqa: SLF001 — internal but safe
+        if not entries:
+            return ""
+        return "\n\n---\n\n".join(entries)
+    except Exception as exc:
+        logger.warning("Cannot back up memory: %s", exc)
         return None
-    content = "\n\n---\n\n".join(entries)
-    return content
 
 
 def rollback_skill(entry_id: str) -> Dict[str, Any]:
@@ -233,7 +237,10 @@ def rollback_memory(entry_id: str) -> Dict[str, Any]:
         return {"success": False, "error": f"Memory backup file not found: {backup_path}"}
 
     proposal = entry.get("proposal", {})
-    target = proposal.get("target", "memory")
+    # The proposal schema only knows "skill"|"memory"; "user" memory entries
+    # are not produced by refine, but keep the mapping defensive anyway.
+    kind = proposal.get("kind", "memory")
+    target = "user" if kind == "user" else "memory"
     old_content = Path(backup_path).read_text(encoding="utf-8")
 
     try:

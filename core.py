@@ -6,6 +6,7 @@ and works standalone (testable without a live session).
 
 import json
 import logging
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -19,6 +20,44 @@ except ImportError:
     import config, journal, llm as _llm  # noqa: F811 — standalone test
 
 logger = logging.getLogger(__name__)
+
+# ── secret scrubbing ─────────────────────────────────────────────────────────
+# Trajectory fragments (tool outputs, user messages) may contain credentials.
+# Scrub them before anything leaves the machine: LLM calls AND the journal.
+
+_SECRET_PATTERNS = [
+    (re.compile(r"github_pat_[A-Za-z0-9_]+"), "[REDACTED]"),
+    (re.compile(r"ghp_[A-Za-z0-9]{20,}"), "[REDACTED]"),
+    (re.compile(r"gho_[A-Za-z0-9]{20,}"), "[REDACTED]"),
+    (re.compile(r"sk-[A-Za-z0-9]{20,}"), "[REDACTED]"),
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "[REDACTED]"),
+    (re.compile(r"AIza[A-Za-z0-9_\-]{20,}"), "[REDACTED]"),
+    (re.compile(r"xox[baprs]-[A-Za-z0-9\-]{10,}"), "[REDACTED]"),
+    (re.compile(r"ntn_[A-Za-z0-9]{20,}"), "[REDACTED]"),
+    (re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"), "[REDACTED]"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S), "[REDACTED]"),
+    (re.compile(r"(?i)(authorization|bearer|api[_-]?key|password|passwd|secret|token)\s*[:=]\s*[\"']?[A-Za-z0-9_\-\.\/\+]{8,}"), r"\1=[REDACTED]"),
+]
+
+
+def scrub_text(text: str) -> str:
+    """Replace known credential patterns with [REDACTED]."""
+    if not text:
+        return text
+    for pattern, repl in _SECRET_PATTERNS:
+        text = pattern.sub(repl, text)
+    return text
+
+
+def scrub_proposal(proposal: Dict[str, Any]) -> Dict[str, Any]:
+    """Scrub all string fields of a proposal dict before journaling."""
+    out = dict(proposal)
+    for key, val in list(out.items()):
+        if isinstance(val, str):
+            out[key] = scrub_text(val)
+        elif isinstance(val, list):
+            out[key] = [scrub_text(v) if isinstance(v, str) else v for v in val]
+    return out
 
 # ── trajectory collector ────────────────────────────────────────────────────
 
@@ -139,11 +178,20 @@ def _is_error_content(content: str) -> bool:
 
 
 def _is_correction(content: str) -> bool:
-    """Heuristic: is the user correcting the agent?"""
+    """Heuristic: is the user clearly correcting the agent?
+
+    Deliberately narrow — generic words like "no", "не", "use", "try" match
+    almost every message and produce noise. Only explicit correction phrasings
+    (plus a minimum length) count as a signal.
+    """
+    if len(content) < 15:
+        return False
     lower = content.lower()
     correction_phrases = [
-        "не ", "no ", "wrong", "неправильно", "fix ", "don't", "do not",
-        "use ", "instead", "замість", "correct", "try ", "спробуй",
+        "wrong", "неправильно", "не так", "not right", "fix it", "fix the",
+        "don't", "do not", "замість", "instead", "correct", "спробуй інакше",
+        "try again", "stop", "не треба", "не роби", "не використовуй",
+        "use the", "use this", "that's not", "that is not", "перероби",
     ]
     return any(ph in lower for ph in correction_phrases)
 
@@ -205,14 +253,23 @@ def _validate_proposal(proposal: Dict[str, Any]) -> Optional[str]:
     if action == "patch" and len(content) > 15000:
         return f"Content too large ({len(content)} chars)"
 
-    # Agent-created only guard
+    # Agent-created only guard — applies to BOTH create and patch, so a
+    # proposal can't create/overwrite a bundled or hub-installed skill name.
     if kind == "skill" and config.only_agent_created():
         try:
             from tools.skill_usage import is_agent_created
-            if action == "patch" and not is_agent_created(name):
-                return f"Skill '{name}' is not agent-created (denied by only_agent_created)"
+            if not is_agent_created(name):
+                return (
+                    f"Skill '{name}' is bundled/hub-installed "
+                    "(denied by only_agent_created)"
+                )
         except ImportError:
             return "Cannot import skill_usage module"
+
+    # Create must target a NEW skill name — never overwrite an existing one
+    # (bundled, user, or agent-created). Existing skills are patched, not created.
+    if kind == "skill" and action == "create" and name in list_skill_names():
+        return f"Skill '{name}' already exists — use patch, not create"
 
     # Don't delete anything
     if action == "delete":
@@ -278,24 +335,14 @@ def _apply_memory(proposal: Dict[str, Any]) -> Dict[str, Any]:
 # ── main entry ──────────────────────────────────────────────────────────────
 
 
-def refine_run(
+def _refine_once(
     llm: PluginLlm,
     *,
     reason: str = "",
     session_id: Optional[str] = None,
     auto: bool = False,
 ) -> Dict[str, Any]:
-    """Run one refine pass.
-
-    Args:
-        llm: PluginLlm instance (from ctx.llm or standalone).
-        reason: Optional user-provided reason (for manual /refine).
-        session_id: Optional session to analyze (auto-detected from state.db if None).
-        auto: True when triggered by on_session_end hook.
-
-    Returns:
-        A dict suitable for serialization to show the user or log.
-    """
+    """Run a single refine pass (one proposal → one edit)."""
     trigger = "auto" if auto else "manual"
     t_start = time.time()
 
@@ -328,7 +375,7 @@ def refine_run(
         role_tag = f"[{m['role']}]"
         if m.get("tool_name"):
             role_tag += f"({m['tool_name']})"
-        ev_lines.append(f"{role_tag} {m['content'][:400]}")
+        ev_lines.append(f"{role_tag} {scrub_text(m['content'][:400])}")
     evidence_text = "\n".join(ev_lines)
 
     # 5. LLM proposal
@@ -339,6 +386,9 @@ def refine_run(
         existing_memories=memories,
         purpose="refine",
     )
+
+    # Scrub before journaling/returning — credentials must never persist.
+    proposal = scrub_proposal(proposal)
 
     # 6. If no_op, log and return
     if proposal.get("action") == "no_op":
@@ -453,6 +503,54 @@ def refine_run(
             "messages": len(evidence.get("messages", [])),
             "errors": evidence.get("error_count", 0),
         },
+    }
+
+
+def refine_run(
+    llm: PluginLlm,
+    *,
+    reason: str = "",
+    session_id: Optional[str] = None,
+    auto: bool = False,
+) -> Dict[str, Any]:
+    """Run up to ``max_edits_per_run`` refine passes.
+
+    Each pass proposes one edit; passes stop early on no_op/rejection/failure
+    or when the daily edit budget is exhausted. A single pass is returned
+    unchanged (backwards compatible); multiple passes are aggregated.
+    """
+    t_start = time.time()
+    runs: List[Dict[str, Any]] = []
+    max_runs = max(1, config.max_edits_per_run())
+
+    for _ in range(max_runs):
+        if journal.daily_limit_reached():
+            break
+        result = _refine_once(llm, reason=reason, session_id=session_id, auto=auto)
+        runs.append(result)
+        action = result.get("proposal", {}).get("action")
+        applied = bool(result.get("result", {}).get("success"))
+        if not result.get("success") or action in (None, "no_op") or not applied:
+            break
+
+    if not runs:
+        return {
+            "success": False,
+            "message": f"Daily edit limit reached ({config.max_edits_per_day()}).",
+        }
+
+    if len(runs) == 1:
+        return runs[0]
+
+    applied_count = sum(1 for r in runs if r.get("result", {}).get("success"))
+    last = runs[-1]
+    return {
+        "success": any(r.get("success") for r in runs),
+        "message": f"{len(runs)} pass(es), {applied_count} edit(s) applied ({time.time() - t_start:.1f}s)",
+        "journal_id": last.get("journal_id", runs[0].get("journal_id", "")),
+        "proposal": last.get("proposal", runs[0].get("proposal", {})),
+        "results": runs,
+        "evidence": runs[0].get("evidence", {}),
     }
 
 
