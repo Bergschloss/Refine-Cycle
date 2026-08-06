@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 # same source of truth: JSON-escaped Markdown tokenizes worse than prose, and
 # under-budgeting silently truncates the proposals this limit permits.
 MAX_CONTENT_CHARS = 15000
+MAX_EXPECTED_OUTCOME_CHARS = 300
 _CHARS_PER_TOKEN = 3
 _PROPOSAL_ENVELOPE_TOKENS = 1024
 PROPOSAL_MAX_TOKENS = (
@@ -43,6 +44,10 @@ REFINE_PROPOSAL_SCHEMA: Dict[str, Any] = {
         },
         "category": {"type": "string"},
         "reason": {"type": "string"},
+        "expected_outcome": {
+            "type": "string",
+            "description": "One-sentence falsifiable prediction of what this edit should improve.",
+        },
         "evidence": {"type": "array", "items": {"type": "string"}},
         "pattern_fingerprint": {
             "type": "string",
@@ -66,7 +71,9 @@ REFINE_SYSTEM_PROMPT = (
     "exact format 'When <specific condition>, <one action>.' It must be a narrow behavioral "
     "policy, never a procedure, broad/global instruction, memory, skill, or replacement system prompt.\n"
     "7. Return no_op when no worthwhile edit exists.\n"
-    "8. Use exactly: action, kind, name, content, category, reason, evidence, and optional "
+    "8. expected_outcome is optional; when present, make it one falsifiable sentence about "
+    "what the edit should improve and how to check it. It must not restate reason.\n"
+    "9. Use exactly: action, kind, name, content, category, reason, expected_outcome, evidence, and optional "
     "pattern_fingerprint. Never combine action and kind.\n"
 )
 
@@ -304,6 +311,13 @@ def review_fallback(llm: PluginLlm, evidence_text: str) -> Dict[str, Any]:
     }
 
 
+def normalize_expected_outcome(value: Any) -> str:
+    """Return a compact, sanitized prediction or an empty optional value."""
+    if not isinstance(value, str):
+        return ""
+    return scrub_text(value).strip()[:MAX_EXPECTED_OUTCOME_CHARS]
+
+
 def _normalize_fields(parsed: Dict[str, Any]) -> Tuple[str, str, str, str, str]:
     action = str(parsed.get("action", "no_op")).strip().lower()
     for verb in ("create", "patch"):
@@ -436,6 +450,9 @@ def propose(
                 "content": "",
                 "category": "",
                 "reason": str(parsed.get("reason", "No actionable improvement found")),
+                "expected_outcome": normalize_expected_outcome(
+                    parsed.get("expected_outcome")
+                ),
                 "evidence": _ensure_list(parsed.get("evidence")),
                 "pattern_fingerprint": "",
             })
@@ -449,6 +466,9 @@ def propose(
         initial_evidence = _ensure_list(parsed.get("evidence"))
         initial_fingerprint = _valid_fingerprint(parsed.get("pattern_fingerprint"))
         initial_reason = str(parsed.get("reason", ""))
+        initial_expected_outcome = normalize_expected_outcome(
+            parsed.get("expected_outcome")
+        )
 
         if action == "patch" and kind == "skill":
             loader = skill_content_loader or _default_skill_loader
@@ -502,6 +522,10 @@ def propose(
             if "evidence" in retry:
                 initial_evidence = _ensure_list(retry.get("evidence"))
             initial_reason = str(retry.get("reason", initial_reason))
+            if "expected_outcome" in retry:
+                initial_expected_outcome = normalize_expected_outcome(
+                    retry.get("expected_outcome")
+                )
 
         result = {
             "action": action,
@@ -510,6 +534,7 @@ def propose(
             "content": content,
             "category": category,
             "reason": initial_reason,
+            "expected_outcome": initial_expected_outcome,
             "evidence": initial_evidence,
             "pattern_fingerprint": initial_fingerprint,
         }

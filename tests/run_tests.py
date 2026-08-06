@@ -547,11 +547,76 @@ class RefineTests(unittest.TestCase):
         self.assertEqual(
             journal.get_entry(reviewer_result["journal_id"])["outcome"], "no_op"
         )
+        self.assertEqual(
+            journal.get_entry(reviewer_result["journal_id"])["proposal"]["expected_outcome"],
+            "",
+        )
 
         empty_without_output = llm.propose(
             MockLlm(MockResult(None, text="", output_tokens=0)), "evidence", [], []
         )
         self.assertEqual(empty_without_output["failure"], "malformed")
+
+    def test_expected_outcome_is_normalized_persisted_and_audited(self):
+        expected_outcome = "A repeat Gmail send no longer returns insufficient scope."
+        no_op = llm.propose(MockLlm({
+            "action": "no_op", "reason": "nothing to add",
+            "expected_outcome": expected_outcome,
+        }), "evidence", [], [])
+        self.assertEqual(no_op["expected_outcome"], expected_outcome)
+
+        proposal = skill_proposal("expected-outcome")
+        proposal["expected_outcome"] = expected_outcome
+        result = self.run_proposal(proposal)
+        entry = journal.get_entry(result["journal_id"])
+        self.assertEqual(entry["proposal"]["expected_outcome"], expected_outcome)
+        self.assertEqual(
+            ledger.load_stats()["expected-outcome"]["expected_outcome"],
+            expected_outcome,
+        )
+        audit = core.refine_audit()
+        self.assertEqual(audit["rows"][0]["expected_outcome"], expected_outcome)
+        self.assertIn(f"expects: {expected_outcome}", audit["report"])
+
+    def test_missing_expected_outcome_is_accepted_and_displays_dash(self):
+        result = self.run_proposal(skill_proposal("no-expected-outcome"))
+        entry = journal.get_entry(result["journal_id"])
+        self.assertEqual(entry["proposal"]["expected_outcome"], "")
+        self.assertEqual(
+            ledger.load_stats()["no-expected-outcome"]["expected_outcome"], ""
+        )
+        audit = core.refine_audit()
+        self.assertEqual(audit["rows"][0]["expected_outcome"], "")
+        self.assertIn("expects: —", audit["report"])
+
+        now = time.time()
+        FakeHost.make_db([
+            ("session", "user", "Routine context only", "", now - 3, 1),
+            ("session", "assistant", "Routine response", "", now - 2, 1),
+            ("session", "assistant", "Still routine", "", now - 1, 1),
+        ])
+        FakeHost.entry_config().update({
+            "min_signal_required": True,
+            "reviewer_fallback_enabled": False,
+        })
+        early_no_op = core.refine_run(MockLlm())
+        self.assertEqual(
+            journal.get_entry(early_no_op["journal_id"])["proposal"]["expected_outcome"],
+            "",
+        )
+
+    def test_expected_outcome_is_capped_and_scrubbed_in_journal_and_report(self):
+        secret = "expected-outcome-secret-123!"
+        proposal = skill_proposal("scrubbed-expected-outcome")
+        proposal["expected_outcome"] = f'api_key="{secret}" ' + ("x" * 400)
+        result = self.run_proposal(proposal)
+        entry = journal.get_entry(result["journal_id"])
+        stored = entry["proposal"]["expected_outcome"]
+        self.assertLessEqual(len(stored), llm.MAX_EXPECTED_OUTCOME_CHARS)
+        self.assertNotIn(secret, stored)
+        audit = core.refine_audit()
+        self.assertNotIn(secret, audit["report"])
+        self.assertIn("[REDACTED]", audit["report"])
 
     def test_skill_patch_gets_current_complete_content(self):
         name = "existing-skill"
@@ -561,13 +626,30 @@ class RefineTests(unittest.TestCase):
         initial = {
             "action": "patch", "kind": "skill", "name": name,
             "content": "New fix only", "reason": "failure", "evidence": [],
+            "expected_outcome": "The recurring failure stops.",
         }
-        model = MockLlm(initial, dict(initial, content=replacement))
+        preserved_retry = dict(initial, content=replacement)
+        preserved_retry.pop("expected_outcome")
+        model = MockLlm(initial, preserved_retry)
         result = llm.propose(
             model, "evidence", [name], [], skill_content_loader=journal.read_skill_content
         )
         self.assertEqual(result["content"], replacement)
+        self.assertEqual(result["expected_outcome"], "The recurring failure stops.")
         self.assertIn(current, model.calls[1]["input"][0].text)
+
+        updated_model = MockLlm(initial, dict(
+            initial,
+            content=replacement,
+            expected_outcome="The specific request succeeds without retry.",
+        ))
+        updated = llm.propose(
+            updated_model, "evidence", [name], [], skill_content_loader=journal.read_skill_content
+        )
+        self.assertEqual(
+            updated["expected_outcome"],
+            "The specific request succeeds without retry.",
+        )
 
     def test_patch_maps_to_edit_and_invalid_content_never_applies(self):
         name = "patch-map"

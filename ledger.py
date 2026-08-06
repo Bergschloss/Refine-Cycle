@@ -12,9 +12,11 @@ from typing import Any, Dict, List, Optional, Tuple
 try:
     from . import journal
     from .config import journal_dir, state_db_path
+    from .sanitization import scrub_text
 except ImportError:
     import journal  # type: ignore
     from config import journal_dir, state_db_path  # noqa: F811
+    from sanitization import scrub_text  # type: ignore
 
 logger = logging.getLogger(__name__)
 _STATS_FILE_NAME = "skill_stats.json"
@@ -79,6 +81,11 @@ def record_edit(
             "kind": proposal.get("kind", "skill"),
             "action": proposal.get("action", ""),
             "pattern_fingerprint": proposal.get("pattern_fingerprint", ""),
+            "expected_outcome": (
+                scrub_text(proposal["expected_outcome"]).strip()
+                if isinstance(proposal.get("expected_outcome"), str)
+                else ""
+            ),
             "outcome": outcome,
             "pending_id": pending_id,
         }
@@ -229,6 +236,11 @@ def audit(current_patterns: Optional[List[Dict[str, Any]]] = None) -> List[Dict[
             "verdict": verdict,
             "journal_id": meta.get("journal_id", ""),
             "outcome": outcome,
+            "expected_outcome": (
+                scrub_text(meta["expected_outcome"]).strip()
+                if isinstance(meta.get("expected_outcome"), str)
+                else ""
+            ),
         })
     return rows
 
@@ -253,6 +265,8 @@ def format_audit(rows: List[Dict[str, Any]]) -> str:
             f"  {row['name'][:28]:<28} {str(row['age_days']) + 'd':>5}  "
             f"{uses:>7}  {recurred:>8}  {row['verdict']}"
         )
+        expected_outcome = str(row.get("expected_outcome", "") or "—")
+        lines.append(f"      expects: {expected_outcome[:57]}")
 
     candidates = [row for row in rows if row["verdict"] in ("unused", "did not help")]
     if candidates:
