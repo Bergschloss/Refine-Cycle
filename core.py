@@ -423,6 +423,14 @@ def _journal_nonmutation(**kwargs: Any) -> Optional[str]:
         return None
 
 
+def _reviewer_cooldown_elapsed() -> bool:
+    """Keep reviewer calls independently rate-limited across processes."""
+    last_review = journal.last_attempt_ts(trigger="reviewer")
+    if last_review is None:
+        return True
+    return time.time() - last_review >= config.reviewer_cooldown_minutes() * 60
+
+
 def _refine_once(
     llm: PluginLlm,
     *,
@@ -441,7 +449,10 @@ def _refine_once(
             f"Applied/pending/prepared today: {journal.count_today_applied()}.",
         }
 
-    evidence = collect_evidence(session_id=session_id)
+    evidence_limit = 60
+    if config.min_signal_required() and config.reviewer_fallback_enabled():
+        evidence_limit = max(evidence_limit, config.reviewer_min_messages())
+    evidence = collect_evidence(session_id=session_id, limit=evidence_limit)
     session = evidence.get("session_id", "")
     if len(evidence.get("messages", [])) < 3:
         return {
@@ -455,52 +466,96 @@ def _refine_once(
     )
     evidence["error_patterns"] = error_patterns
     corrections = evidence.get("user_corrections", [])
-    if config.min_signal_required() and not patterns.has_signal(
-        error_patterns, corrections, min_count=config.min_pattern_count()
-    ):
-        proposal = {
-            "action": "no_op",
-            "reason": f"No repeated failure (min {config.min_pattern_count()}x) and no explicit correction.",
-        }
-        entry_id = _journal_nonmutation(
-            trigger=trigger,
-            reason=safe_reason or proposal["reason"],
-            session_id=session,
-            proposal=proposal,
-            outcome="no_op",
-        )
-        if not entry_id:
-            return {
-                "success": False,
-                "message": "No edit was needed, but the journal write failed.",
-                "evidence": evidence,
-            }
-        return {
-            "success": True,
-            "message": f"No actionable improvement found. {proposal['reason']}",
-            "journal_id": entry_id,
-            "llm_called": False,
-            "evidence": evidence,
-            "reversible": False,
-        }
-
     lines: List[str] = []
     for message in evidence.get("messages", []):
         tag = f"[{message['role']}]"
         if message.get("tool_name"):
             tag += f"({message['tool_name']})"
         lines.append(f"{tag} {message['content'][:400]}")
+    evidence_text = "\n".join(lines)
+    proposal_context = safe_reason
+    if config.min_signal_required() and not patterns.has_signal(
+        error_patterns, corrections, min_count=config.min_pattern_count()
+    ):
+        should_review = (
+            config.reviewer_fallback_enabled()
+            and len(evidence.get("messages", [])) >= config.reviewer_min_messages()
+            and _reviewer_cooldown_elapsed()
+        )
+        if should_review:
+            reviewer = _llm.review_fallback(llm, evidence_text)
+            rationale = scrub_text(str(reviewer.get("rationale", "")))
+            decision = "approved" if reviewer.get("should_refine") else "declined"
+            reviewer_reason = f"Reviewer {decision}: {rationale}"
+            reviewer_entry_id = _journal_nonmutation(
+                trigger="reviewer",
+                reason=reviewer_reason,
+                session_id=session,
+                proposal={"action": "no_op", "reason": reviewer_reason},
+                outcome="no_op",
+            )
+            if not reviewer_entry_id:
+                return {
+                    "success": False,
+                    "message": "Reviewer decision could not be journaled.",
+                    "llm_called": True,
+                    "reviewer": decision,
+                    "evidence": evidence,
+                    "reversible": False,
+                }
+            if not reviewer.get("should_refine"):
+                proposal = {"action": "no_op", "reason": reviewer_reason}
+                return {
+                    "success": True,
+                    "message": f"No actionable improvement found. {reviewer_reason}",
+                    "journal_id": reviewer_entry_id,
+                    "proposal": proposal,
+                    "llm_called": True,
+                    "reviewer": "declined",
+                    "evidence": evidence,
+                    "reversible": False,
+                }
+            reviewer_instructions = scrub_text(str(reviewer.get("instructions", "")))
+            proposal_context = "\n".join(
+                part for part in (safe_reason, f"Reviewer-approved instructions: {reviewer_instructions}") if part
+            )
+        else:
+            proposal = {
+                "action": "no_op",
+                "reason": f"No repeated failure (min {config.min_pattern_count()}x) and no explicit correction.",
+            }
+            entry_id = _journal_nonmutation(
+                trigger=trigger,
+                reason=safe_reason or proposal["reason"],
+                session_id=session,
+                proposal=proposal,
+                outcome="no_op",
+            )
+            if not entry_id:
+                return {
+                    "success": False,
+                    "message": "No edit was needed, but the journal write failed.",
+                    "evidence": evidence,
+                }
+            return {
+                "success": True,
+                "message": f"No actionable improvement found. {proposal['reason']}",
+                "journal_id": entry_id,
+                "llm_called": False,
+                "evidence": evidence,
+                "reversible": False,
+            }
 
     proposal = _llm.propose(
         llm=llm,
-        evidence_text="\n".join(lines),
+        evidence_text=evidence_text,
         existing_skills=list_skill_names(),
         existing_memories=list_memory_snippets(),
         error_patterns=error_patterns,
         user_corrections=[item.get("snippet", "") for item in corrections],
         unused_skills=_unused_skills_safe(),
         purpose="refine",
-        run_context=safe_reason,
+        run_context=proposal_context,
         skill_content_loader=journal.read_skill_content,
     )
     proposal = sanitize(proposal)
