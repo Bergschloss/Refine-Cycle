@@ -618,6 +618,70 @@ class RefineTests(unittest.TestCase):
         self.assertNotIn(secret, audit["report"])
         self.assertIn("[REDACTED]", audit["report"])
 
+    def test_ledger_versions_edits_without_bumping_on_reconciliation(self):
+        name = "versioned-skill"
+        created = self.run_proposal(skill_proposal(name))
+        created_stats = ledger.load_stats()[name]
+        self.assertEqual(created_stats["version"], 1)
+        self.assertGreaterEqual(created_stats["updated_ts"], created_stats["created_ts"])
+
+        patched = self.run_proposal({
+            "action": "patch", "kind": "skill", "name": name,
+            "content": skill_content(name, "# Guidance\n\nUpdated guidance."),
+            "reason": "A repeated failure needs a narrower instruction.",
+            "evidence": [],
+        })
+        patched_stats = ledger.load_stats()[name]
+        self.assertEqual(patched_stats["version"], 2)
+        self.assertGreaterEqual(patched_stats["updated_ts"], patched_stats["created_ts"])
+
+        ledger.record_journal_state(journal.get_entry(patched["journal_id"]))
+        reconciled_stats = ledger.load_stats()[name]
+        self.assertEqual(reconciled_stats["version"], 2)
+        self.assertEqual(reconciled_stats["created_ts"], patched_stats["created_ts"])
+        self.assertGreaterEqual(
+            reconciled_stats["updated_ts"], patched_stats["updated_ts"]
+        )
+
+    def test_ledger_reports_churn_and_loads_legacy_stats(self):
+        created = time.time() - (30 * 86400)
+        ledger.stats_path().write_text(json.dumps({
+            "legacy-skill": {
+                "created_ts": created,
+                "journal_id": "legacy-entry",
+                "kind": "skill",
+                "action": "create",
+                "pattern_fingerprint": "",
+                "outcome": "applied",
+                "pending_id": "",
+            },
+            "churning-skill": {
+                "created_ts": created,
+                "updated_ts": created + 1,
+                "version": 3,
+                "journal_id": "churning-entry",
+                "kind": "skill",
+                "action": "patch",
+                "pattern_fingerprint": "",
+                "outcome": "applied",
+                "pending_id": "",
+            },
+        }), encoding="utf-8")
+        FakeHost.usage_counts["churning-skill"] = 2
+
+        rows = {row["name"]: row for row in ledger.audit([])}
+        self.assertEqual(rows["legacy-skill"]["version"], 1)
+        self.assertEqual(rows["legacy-skill"]["updated_ts"], created)
+        ledger.record_edit(
+            {"name": "legacy-skill", "kind": "skill", "action": "patch"},
+            "legacy-edit",
+        )
+        self.assertEqual(ledger.load_stats()["legacy-skill"]["version"], 2)
+        self.assertEqual(rows["churning-skill"]["verdict"], "churning")
+        report = ledger.format_audit(list(rows.values()))
+        self.assertIn("ver", report)
+        self.assertIn("v3", report)
+
     def test_skill_patch_gets_current_complete_content(self):
         name = "existing-skill"
         current = skill_content(name, "# Existing\n\nImportant old guidance.")

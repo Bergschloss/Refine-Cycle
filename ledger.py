@@ -70,13 +70,15 @@ def record_edit(
     with journal.mutation_lock():
         stats = load_stats()
         previous = stats.get(name, {})
-        created_ts = (
-            previous.get("created_ts", time.time())
-            if previous.get("journal_id") == journal_id
-            else time.time()
-        )
+        now = time.time()
+        same_edit = previous.get("journal_id") == journal_id
+        created_ts = previous.get("created_ts", now) if same_edit else now
+        previous_version = previous.get("version", 1 if previous else 0)
+        version = previous_version if same_edit else previous_version + 1
         stats[name] = {
             "created_ts": created_ts,
+            "updated_ts": now,
+            "version": version,
             "journal_id": journal_id,
             "kind": proposal.get("kind", "skill"),
             "action": proposal.get("action", ""),
@@ -190,6 +192,14 @@ def audit(current_patterns: Optional[List[Dict[str, Any]]] = None) -> List[Dict[
     for name, meta in sorted(load_stats().items()):
         created = meta.get("created_ts", 0) or now
         age_days = max(0, int((now - created) // 86400))
+        try:
+            version = max(1, int(meta.get("version", 1) or 1))
+        except (TypeError, ValueError):
+            version = 1
+        try:
+            updated_ts = float(meta.get("updated_ts", created) or created)
+        except (TypeError, ValueError):
+            updated_ts = created
         outcome = meta.get("outcome", "applied")
         fingerprint = str(meta.get("pattern_fingerprint", "") or "")
         recurred: Optional[bool] = None
@@ -226,10 +236,15 @@ def audit(current_patterns: Optional[List[Dict[str, Any]]] = None) -> List[Dict[
             else:
                 verdict = "too early" if age_days < 14 else "unclear"
 
+        if version >= 3 and verdict == "unclear":
+            verdict = "churning"
+
         rows.append({
             "name": name,
             "kind": meta.get("kind", "skill"),
             "age_days": age_days,
+            "version": version,
+            "updated_ts": updated_ts,
             "uses": uses,
             "usage_scope": usage_scope,
             "pattern_recurred": recurred,
@@ -249,7 +264,9 @@ def format_audit(rows: List[Dict[str, Any]]) -> str:
     if not rows:
         return "No refine-created skills recorded yet."
     lines = [f"Refine-created entries ({len(rows)}):", ""]
-    lines.append(f"  {'name':<28} {'age':>5}  {'uses':>7}  {'recurred':>8}  verdict")
+    lines.append(
+        f"  {'name':<28} {'age':>5}  {'ver':>3}  {'uses':>7}  {'recurred':>8}  verdict"
+    )
     for row in rows:
         scope = row.get("usage_scope")
         if row["uses"] is None:
@@ -263,7 +280,8 @@ def format_audit(rows: List[Dict[str, Any]]) -> str:
         recurred = {True: "yes", False: "no", None: "—"}[row["pattern_recurred"]]
         lines.append(
             f"  {row['name'][:28]:<28} {str(row['age_days']) + 'd':>5}  "
-            f"{uses:>7}  {recurred:>8}  {row['verdict']}"
+            f"{'v' + str(row.get('version', 1)):>3}  {uses:>7}  "
+            f"{recurred:>8}  {row['verdict']}"
         )
         expected_outcome = str(row.get("expected_outcome", "") or "—")
         lines.append(f"      expects: {expected_outcome[:57]}")
