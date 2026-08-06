@@ -612,6 +612,36 @@ def _refine_once(
         skill_content_loader=journal.read_skill_content,
     )
     proposal = sanitize(proposal)
+    failure = scrub_text(str(proposal.get("failure", "")).strip())
+    if failure:
+        failure_messages = {
+            "truncated": "The refine proposal was cut off before it completed.",
+            "malformed": "The refine proposal was malformed and could not be read.",
+            "no_final_text": "The model returned no final refine proposal.",
+        }
+        failure_message = failure_messages.get(
+            failure, "The refine proposal could not be completed."
+        )
+        entry_id = _journal_nonmutation(
+            trigger=trigger,
+            reason=safe_reason or failure_message,
+            session_id=session,
+            proposal=proposal,
+            outcome="llm_incomplete",
+            error=failure_message,
+        )
+        response = {
+            "success": False,
+            "message": failure_message,
+            "llm_called": True,
+            "failure": failure,
+            "proposal": proposal,
+            "evidence": evidence,
+            "reversible": False,
+        }
+        if entry_id:
+            response["journal_id"] = entry_id
+        return response
     if proposal.get("kind") == "prompt":
         scope = config.prompt_notes_default_scope()
         proposal = dict(

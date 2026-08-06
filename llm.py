@@ -3,7 +3,7 @@
 import json
 import logging
 import re
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 from agent.plugin_llm import (
     PluginLlm,
@@ -89,10 +89,50 @@ REVIEWER_FALLBACK_SYSTEM_PROMPT = (
 )
 
 
-def _salvage_parsed(result: Any) -> Any:
+class _Reply(NamedTuple):
+    """Structured reply plus a failure that must not be disguised as no_op."""
+
+    parsed: Optional[Dict[str, Any]]
+    failure: str = ""
+    detail: str = ""
+
+
+def _output_tokens(result: Any) -> int:
+    """Read optional host usage without requiring test doubles to expose it."""
+    usage = getattr(result, "usage", None)
+    try:
+        return max(0, int(getattr(usage, "output_tokens", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _has_incomplete_json_structure(text: str) -> bool:
+    """Detect unclosed strings/braces without attempting to repair model JSON."""
+    depth = 0
+    in_string = False
+    escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+    return in_string or depth > 0
+
+
+def _salvage_parsed(result: Any, *, requested_max_tokens: int) -> _Reply:
+    """Parse one reply and name incomplete output instead of returning a false no_op."""
     parsed = getattr(result, "parsed", None)
     if isinstance(parsed, dict):
-        return parsed
+        return _Reply(parsed)
     text = getattr(result, "text", "") or ""
     if isinstance(parsed, str) and not text:
         text = parsed
@@ -100,10 +140,41 @@ def _salvage_parsed(result: Any) -> Any:
         match = re.search(r"\{.*\}", text, re.S)
         if match:
             try:
-                return json.loads(match.group(0))
+                value = json.loads(match.group(0))
+                if isinstance(value, dict):
+                    return _Reply(value)
             except json.JSONDecodeError:
                 pass
-    return parsed
+    output_tokens = _output_tokens(result)
+    if not text:
+        if output_tokens:
+            return _Reply(
+                None,
+                "no_final_text",
+                "Model returned output but no final structured answer.",
+            )
+        return _Reply(None, "malformed", "Model returned no structured answer.")
+    if output_tokens >= requested_max_tokens:
+        return _Reply(
+            None,
+            "truncated",
+            "Model output reached its token limit before the proposal completed.",
+        )
+    if _has_incomplete_json_structure(text):
+        return _Reply(
+            None,
+            "truncated",
+            "Model output ended before the proposal JSON completed.",
+        )
+    return _Reply(None, "malformed", "Model returned malformed structured output.")
+
+
+def _incomplete_proposal(reply: _Reply) -> Dict[str, Any]:
+    return {
+        "action": "no_op",
+        "failure": reply.failure,
+        "reason": reply.detail,
+    }
 
 
 def _propose_structured(
@@ -131,7 +202,8 @@ def _propose_structured(
             json_schema=sanitize(REFINE_PROPOSAL_SCHEMA),
             **common,
         )
-        return _salvage_parsed(result)
+        reply = _salvage_parsed(result, requested_max_tokens=PROPOSAL_MAX_TOKENS)
+        return reply.parsed or _incomplete_proposal(reply)
     except PluginLlmTrustError:
         raise
     except Exception as first_exc:
@@ -145,7 +217,8 @@ def _propose_structured(
             json_mode=True,
             **common,
         )
-        return _salvage_parsed(result)
+        reply = _salvage_parsed(result, requested_max_tokens=PROPOSAL_MAX_TOKENS)
+        return reply.parsed or _incomplete_proposal(reply)
 
 
 def _ensure_dict(parsed: Any) -> Optional[Dict[str, Any]]:
@@ -180,7 +253,8 @@ def review_fallback(llm: PluginLlm, evidence_text: str) -> Dict[str, Any]:
             temperature=0.0,
             max_tokens=REVIEWER_MAX_TOKENS,
         )
-        parsed = _ensure_dict(_salvage_parsed(result))
+        reply = _salvage_parsed(result, requested_max_tokens=REVIEWER_MAX_TOKENS)
+        parsed = _ensure_dict(reply.parsed)
     except Exception as exc:
         logger.warning("Reviewer fallback failed: %s", scrub_text(str(exc)))
         parsed = None
@@ -320,6 +394,8 @@ def propose(
         )
         if parsed is None:
             return {"action": "no_op", "reason": "LLM returned non-object output"}
+        if parsed.get("failure"):
+            return sanitize(parsed)
 
         action, kind, name, content, category = _normalize_fields(parsed)
         if action == "create" and not content:
@@ -328,6 +404,8 @@ def propose(
                 _propose_structured(llm, short, [PluginLlmTextInput(text=retry_text)])
             )
             if retry is not None:
+                if retry.get("failure"):
+                    return sanitize(retry)
                 parsed = retry
                 action, kind, name, content, category = _normalize_fields(parsed)
 
@@ -389,6 +467,8 @@ def propose(
             )
             if retry is None:
                 return {"action": "no_op", "reason": "LLM did not return a complete skill replacement"}
+            if retry.get("failure"):
+                return sanitize(retry)
             retry_action, retry_kind, retry_name, retry_content, retry_category = _normalize_fields(retry)
             if (retry_action, retry_kind, retry_name) != ("patch", "skill", name) or not retry_content:
                 return {"action": "no_op", "reason": "Patch retry changed target or omitted complete content"}
