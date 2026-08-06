@@ -212,8 +212,9 @@ def llm_provider() -> str:
 def llm_model() -> str:
     """Model to request for refine's own calls; empty means host default.
 
-    Hermes resolves the model inside ``call_llm`` and exposes no session model
-    to plugins, so this is the only way to steer which model refine uses. The
+    Unset, Hermes resolves refine's model through its ``auto`` path, which
+    prefers the live main model. Pinning makes the target deterministic and
+    immune to the host's auxiliary client cache keeping an older model. The
     host still gates it: without ``allow_model_override`` (and
     ``allow_provider_override``) the request is refused rather than applied.
     """

@@ -316,13 +316,23 @@ serialized flow with an optional reason.
 
 ### Which model refine uses
 
-**Refine cannot follow the model you switch to inside a chat session.** Hermes
-resolves provider and model inside its own `call_llm`, and the plugin surface
-(`ctx.llm`, which is itself a `PluginLlm(plugin_id="refine")`) carries no
-session runtime. A mid-session `/model` switch is therefore invisible to this
-plugin, and no arrangement of plugin-side code changes that.
+By default refine inherits the user's **live main model**. Hermes resolves the
+model inside its own `call_llm`: with no explicit provider/model it takes the
+`auto` path, whose first step is "main provider + main model", and the main
+model is read from a process-local runtime override that the agent refreshes at
+the top of every turn. So a model switched mid-session is intended to apply to
+refine as well, without any plugin-side plumbing.
 
-What does work is pinning refine's own target explicitly:
+One caveat is worth knowing, because it is not a refine bug and refine cannot
+fix it: Hermes caches auxiliary clients under a key that does **not** include
+the resolved model, and the plugin call passes no live-runtime dict, so the key
+is constant. In a long-running gateway the first cached client keeps supplying
+the model captured when it was built, which can outlive a mid-session switch
+until that entry is evicted or the process restarts. Restarting the gateway is
+the reliable way to clear it.
+
+Pinning refine's own target sidesteps all of that and makes the choice
+deterministic:
 
 ```yaml
 plugins:
@@ -336,8 +346,8 @@ plugins:
 ```
 
 Both `allow_*` flags are fail-closed in Hermes: with them off, a pinned value is
-refused rather than applied. Leave `provider`/`model` unset to accept whatever
-the host resolves by default. Every path — the `/refine` command, the
+refused rather than applied. Leave `provider`/`model` unset to inherit the live
+main model as described above. Every path — the `/refine` command, the
 `refine_run` tool, and both automatic triggers — shares the one host-provided
 client and honors this setting identically.
 
@@ -402,12 +412,14 @@ llm:
   reasoning and no final text is reported as `llm_incomplete`; pin a
   non-reasoning model for refine with `plugins.entries.refine.llm` (`model` /
   `provider`) under the existing trust policy when that mitigation is needed.
-- **No access to the session's active model:** `ctx.llm` is a
-  `PluginLlm(plugin_id=...)` facade, and Hermes resolves provider and model
-  inside `call_llm` without passing any session runtime to plugins. A model
-  switched mid-session cannot reach refine, so the pinned `llm.model` /
-  `llm.provider` keys above are the only way to steer it. Closing this would
-  need Hermes to expose the resolved session provider/model to the plugin call.
+- **A model switch can be masked by Hermes's auxiliary client cache:** plugin
+  calls resolve through the `auto` path, which prefers the live main model, but
+  the client cache key omits the resolved model and the plugin call supplies no
+  live-runtime dict, so the key never changes. A cached client therefore keeps
+  its original model until it is evicted or the process restarts. Refine cannot
+  close this from the plugin side; the fix is host-side (include the resolved
+  model in the cache key, or pass the live runtime through the plugin call).
+  Pin `llm.model` / `llm.provider` when a deterministic target is needed.
 - **No host approval for the prompt-note store:** it is a plugin-owned atomic
   file, not a host memory or skill write. Host-managed skill and memory changes
   still respect staged approvals and reconciliation.

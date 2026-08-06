@@ -64,11 +64,10 @@ def _session_llm() -> PluginLlm:
     """Return the host-provided client, falling back to a fresh one.
 
     Reusing the host-provided facade keeps every path on one client instead of
-    building a new one per invocation. It does **not** change which model is
-    used: ``ctx.llm`` is itself a ``PluginLlm(plugin_id=...)``, and Hermes
-    resolves provider and model inside its own ``call_llm``. A model switched
-    during a chat session is not visible to plugins; pin
-    ``plugins.entries.refine.llm.model`` to steer refine's own calls.
+    building a new one per invocation. It does not by itself decide the model:
+    ``ctx.llm`` is a ``PluginLlm(plugin_id=...)`` and Hermes resolves the model
+    inside its own ``call_llm``, preferring the live main model. Pin
+    ``plugins.entries.refine.llm.model`` when a deterministic target is needed.
     """
     return _REGISTERED_LLM if _REGISTERED_LLM is not None else PluginLlm(
         plugin_id="refine"
