@@ -9,6 +9,7 @@ import importlib.util
 import inspect
 import json
 import shutil
+import subprocess
 from contextlib import contextmanager
 import sqlite3
 import sys
@@ -1545,6 +1546,203 @@ class RefineTests(unittest.TestCase):
         self.assertIn("verified session ID", core._validate_proposal(proposal))
         proposal["session_id"] = 'api_key="unsafe-secret"'
         self.assertIn("verified session ID", core._validate_proposal(proposal))
+
+    def test_mutation_lock_and_budget_hold_across_processes(self):
+        if not Path(sys.executable).is_file():
+            self.skipTest("No spawnable Python interpreter is available")
+        FakeHost.entry_config().update({
+            "max_edits_per_day": 1,
+            "max_edits_per_run": 1,
+            "min_signal_required": False,
+            "cross_session_enabled": False,
+        })
+        ready_paths = [self.root / f"ready-{label}" for label in ("a", "b")]
+        go_path = self.root / "go"
+        driver = r'''
+import json
+import sys
+import types
+from pathlib import Path
+
+repo_root = Path(sys.argv[1])
+hermes_root = Path(sys.argv[2])
+name = sys.argv[3]
+ready_path = Path(sys.argv[4])
+go_path = Path(sys.argv[5])
+sys.path.insert(0, str(repo_root))
+
+agent_module = types.ModuleType("agent")
+plugin_module = types.ModuleType("agent.plugin_llm")
+class PluginLlmTrustError(Exception):
+    pass
+class PluginLlmInput:
+    pass
+class PluginLlmTextInput(PluginLlmInput):
+    def __init__(self, text):
+        self.text = text
+class PluginLlm:
+    pass
+class Result:
+    def __init__(self, parsed):
+        self.parsed = parsed
+        self.text = ""
+class ProcessLlm(PluginLlm):
+    def complete_structured(self, **kwargs):
+        content = (
+            f"---\nname: {name}\ndescription: Process concurrency proof\n---"
+            "\n\n# Guidance\n\nKeep this mutation serialized."
+        )
+        return Result({
+            "action": "create", "kind": "skill", "name": name,
+            "content": content, "reason": "Cross-process budget proof",
+            "evidence": ["shared temporary root"], "pattern_fingerprint": "deadbeef1234",
+        })
+plugin_module.PluginLlm = PluginLlm
+plugin_module.PluginLlmInput = PluginLlmInput
+plugin_module.PluginLlmTextInput = PluginLlmTextInput
+plugin_module.PluginLlmStructuredResult = object
+plugin_module.PluginLlmTrustError = PluginLlmTrustError
+agent_module.plugin_llm = plugin_module
+sys.modules.update({"agent": agent_module, "agent.plugin_llm": plugin_module})
+
+constants = types.ModuleType("hermes_constants")
+constants.get_hermes_home = lambda: str(hermes_root)
+cli = types.ModuleType("hermes_cli")
+cli.__path__ = []
+cli_config = types.ModuleType("hermes_cli.config")
+cli_config.load_config = lambda: {"plugins": {"entries": {"refine": {
+    "journal_dir": str(hermes_root / "journal"),
+    "max_edits_per_day": 1,
+    "max_edits_per_run": 1,
+    "min_signal_required": False,
+    "cross_session_enabled": False,
+}}}}
+cli.config = cli_config
+sys.modules.update({
+    "hermes_constants": constants,
+    "hermes_cli": cli,
+    "hermes_cli.config": cli_config,
+})
+
+tools = types.ModuleType("tools")
+tools.__path__ = []
+skills = types.ModuleType("tools.skills_tool")
+manager = types.ModuleType("tools.skill_manager_tool")
+usage = types.ModuleType("tools.skill_usage")
+memory = types.ModuleType("tools.memory_tool")
+approval = types.ModuleType("tools.write_approval")
+skills_root = hermes_root / "driver-skills"
+def skill_path(skill_name):
+    return skills_root / skill_name / "SKILL.md"
+def skills_list():
+    values = []
+    if skills_root.is_dir():
+        values = [{"name": child.name} for child in skills_root.iterdir() if child.is_dir()]
+    return json.dumps({"skills": values})
+def skill_view(skill_name):
+    path = skill_path(skill_name)
+    if not path.is_file():
+        return json.dumps({"success": False, "error": "not found"})
+    return json.dumps({"success": True, "skill_dir": str(path.parent), "content": path.read_text(encoding="utf-8")})
+def skill_manage(action, name, content=None, category=None):
+    path = skill_path(name)
+    if action == "create":
+        if path.exists():
+            return json.dumps({"success": False, "error": "exists"})
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content or "", encoding="utf-8")
+        return json.dumps({"success": True, "message": "created"})
+    return json.dumps({"success": False, "error": "unsupported"})
+class MemoryStore:
+    memory_entries = []
+    user_entries = []
+    def load_from_disk(self):
+        return None
+    def _entries_for(self, target):
+        return self.user_entries if target == "user" else self.memory_entries
+skills.skills_list = skills_list
+skills.skill_view = skill_view
+manager.skill_manage = skill_manage
+usage.is_agent_created = lambda skill_name: skill_path(skill_name).is_file()
+usage.get_usage_count = lambda skill_name, since_ts=None: 0
+memory.MemoryStore = MemoryStore
+approval.get_pending = lambda subsystem, pending_id: None
+tools.skills_tool = skills
+tools.skill_manager_tool = manager
+tools.skill_usage = usage
+tools.memory_tool = memory
+tools.write_approval = approval
+sys.modules.update({
+    "tools": tools,
+    "tools.skills_tool": skills,
+    "tools.skill_manager_tool": manager,
+    "tools.skill_usage": usage,
+    "tools.memory_tool": memory,
+    "tools.write_approval": approval,
+})
+
+import core
+ready_path.write_text("ready", encoding="utf-8")
+for _ in range(1000):
+    if go_path.is_file():
+        break
+    import time
+    time.sleep(0.01)
+else:
+    raise RuntimeError("Timed out waiting for process rendezvous")
+print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
+'''
+        processes = []
+        try:
+            for label, ready_path in zip(("process-a", "process-b"), ready_paths):
+                processes.append(subprocess.Popen(
+                    [
+                        sys.executable, "-c", driver, str(ROOT), str(self.root), label,
+                        str(ready_path), str(go_path),
+                    ],
+                    cwd=str(ROOT),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                ))
+        except OSError as exc:
+            for process in processes:
+                process.kill()
+                process.communicate()
+            self.skipTest(f"Cannot spawn a second interpreter: {exc}")
+
+        deadline = time.monotonic() + 10
+        while not all(path.is_file() for path in ready_paths):
+            if time.monotonic() >= deadline:
+                for process in processes:
+                    process.kill()
+                    process.communicate()
+                self.fail("Child processes did not reach the file rendezvous")
+            time.sleep(0.01)
+        go_path.write_text("go", encoding="utf-8")
+        outputs = []
+        for process in processes:
+            try:
+                stdout, stderr = process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+                self.fail("Cross-process refine driver timed out")
+            self.assertEqual(process.returncode, 0, stderr)
+            outputs.append(json.loads(stdout))
+
+        self.assertEqual(sum(bool(output.get("success")) for output in outputs), 1)
+        self.assertEqual(journal.count_today_applied(), 1)
+        consumed = [
+            entry for entry in journal.entries()
+            if entry.get("outcome") in {"applied", "pending_approval", "prepared"}
+        ]
+        self.assertEqual(len(consumed), 1)
+        stats = ledger.load_stats()
+        self.assertEqual(len(stats), 1)
+        self.assertEqual(
+            len(list((self.root / "driver-skills").glob("*/SKILL.md"))), 1
+        )
 
 
 if __name__ == "__main__":
