@@ -74,7 +74,11 @@ fallback to `json_mode` (then raw-text JSON salvage) for providers that reject
 
 > **Note:** this is a plugin for [Hermes Agent](https://hermes-agent.nousresearch.com/docs) — it requires a working Hermes installation (≥ 0.17.0) and does not run standalone.
 
-The plugin lives in `~/.hermes/plugins/refine/`.
+The plugin lives in `<HERMES_HOME>/plugins/refine/` — that is `~/.hermes/plugins/refine/`
+on Linux and macOS, and `%LOCALAPPDATA%\hermes\plugins\refine\` on Windows. Under a
+Hermes profile it follows the profile. The plugin resolves this itself via
+`hermes_constants.get_hermes_home()`, so the journal and the trajectory are always
+read from the same place Hermes uses.
 
 1. Add to `~/.hermes/config.yaml`:
 
