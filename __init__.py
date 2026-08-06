@@ -54,7 +54,7 @@ def _handle_refine_command(raw_args: str) -> Optional[str]:
         if not entry_id:
             return (
                 "Usage: /refine rollback <journal_id>\n"
-                "Find ids in ~/.hermes/plugins/refine/refine_journal.jsonl"
+                "Find ids in <HERMES_HOME>/plugins/refine/refine_journal.jsonl"
             )
         result = core.refine_rollback(entry_id)
         if result.get("success"):

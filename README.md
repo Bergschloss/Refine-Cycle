@@ -41,7 +41,7 @@ trajectory (state.db) → scrub → fingerprint + aggregate → signal gate ─�
 
 | Stage | What happens |
 |---|---|
-| **1. Collect evidence** | Reads the last N messages of the session from `~/.hermes/state.db` (read-only). Credentials are redacted at this point, so every downstream consumer gets scrubbed text |
+| **1. Collect evidence** | Reads the last N messages of the session from `<HERMES_HOME>/state.db` (read-only). Credentials are redacted at this point, so every downstream consumer gets scrubbed text |
 | **2. Aggregate** | Normalizes each error to its invariant shape (ids, paths, timestamps stripped) and fingerprints it, then counts occurrences — within this session and across the last 7 days |
 | **3. Signal gate** | No failure repeated and no user correction → `no_op` **without calling the model at all** |
 | **4. LLM proposal** | Calls the host model with structured output: one minimal `create`/`patch`/`no_op` proposal, grounded in a listed pattern |
@@ -80,7 +80,7 @@ Hermes profile it follows the profile. The plugin resolves this itself via
 `hermes_constants.get_hermes_home()`, so the journal and the trajectory are always
 read from the same place Hermes uses.
 
-1. Add to `~/.hermes/config.yaml`:
+1. Add to your Hermes `config.yaml`:
 
 ```yaml
 plugins:
@@ -179,7 +179,7 @@ All keys live under `plugins.entries.refine`:
 | `max_edits_per_run` | int | `1` | Max CRUD edits per single run |
 | `max_edits_per_day` | int | `3` | Max edits per day (all triggers) |
 | `only_agent_created` | bool | `true` | Only patch agent-created skills |
-| `journal_dir` | path | `~/.hermes/plugins/refine` | Journal + backup location |
+| `journal_dir` | path | `<HERMES_HOME>/plugins/refine` | Journal + backup location |
 | `min_signal_required` | bool | `true` | Skip the model call when nothing repeated |
 | `min_pattern_count` | int | `2` | Repeats before a failure counts as a signal |
 | `cross_session_enabled` | bool | `true` | Aggregate failures across recent sessions |
@@ -214,7 +214,7 @@ Manual fallback: find the entry in `refine_journal.jsonl`, restore the matching
 ## Tests
 
 ```bash
-cd ~/.hermes/plugins/refine
+cd <HERMES_HOME>/plugins/refine
 python3 -m tests.run_tests
 ```
 
