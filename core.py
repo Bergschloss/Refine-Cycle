@@ -251,20 +251,60 @@ def collect_cross_session_patterns(
 # ── host context ───────────────────────────────────────────────────────────
 
 
-def list_skill_names() -> List[str]:
+def _skill_items() -> List[Any]:
+    """Read the host's one skill listing without opening individual skills."""
     try:
         from tools.skills_tool import skills_list
 
         raw = skills_list()
         result = raw if not isinstance(raw, str) else json.loads(raw)
         skills = result.get("skills", []) if isinstance(result, dict) else result
-        return [
-            scrub_text(str(item.get("name", "")))
-            for item in skills
-            if isinstance(item, dict)
-        ]
+        return skills if isinstance(skills, list) else []
     except Exception:
         return []
+
+
+def list_skill_names() -> List[str]:
+    names: List[str] = []
+    for item in _skill_items():
+        raw_name = item.get("name", "") if isinstance(item, dict) else item
+        name = scrub_text(str(raw_name)).strip()
+        if name:
+            names.append(name)
+    return names
+
+
+def list_skill_entries() -> List[Dict[str, Any]]:
+    """Return safe host metadata with a local version when the ledger knows it."""
+    try:
+        stats = ledger.load_stats()
+    except Exception:
+        stats = {}
+    entries: List[Dict[str, Any]] = []
+    for item in _skill_items():
+        raw_name = item.get("name", "") if isinstance(item, dict) else item
+        name = scrub_text(str(raw_name)).strip()
+        if not name:
+            continue
+        entry: Dict[str, Any] = {
+            "name": name,
+            "description": scrub_text(str(item.get("description", ""))).strip()
+            if isinstance(item, dict)
+            else "",
+            "category": scrub_text(str(item.get("category", ""))).strip()
+            if isinstance(item, dict)
+            else "",
+        }
+        metadata = stats.get(name) if isinstance(stats, dict) else None
+        if isinstance(metadata, dict):
+            try:
+                version = int(metadata.get("version", 0) or 0)
+            except (TypeError, ValueError):
+                version = 0
+            if version >= 1:
+                entry["version"] = version
+        entries.append(entry)
+    return entries
 
 
 def list_memory_snippets() -> List[str]:
@@ -611,7 +651,7 @@ def _refine_once(
     proposal = _llm.propose(
         llm=llm,
         evidence_text=evidence_text,
-        existing_skills=list_skill_names(),
+        existing_skills=list_skill_entries(),
         existing_memories=list_memory_snippets(),
         error_patterns=error_patterns,
         user_corrections=[item.get("snippet", "") for item in corrections],
