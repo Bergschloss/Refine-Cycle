@@ -26,11 +26,23 @@ logger = logging.getLogger(__name__)
 # under-budgeting silently truncates the proposals this limit permits.
 MAX_CONTENT_CHARS = 15000
 MAX_EXPECTED_OUTCOME_CHARS = 300
+MAX_SUMMARY_CHARS = 300
 _CHARS_PER_TOKEN = 3
 _PROPOSAL_ENVELOPE_TOKENS = 1024
-PROPOSAL_MAX_TOKENS = (
-    MAX_CONTENT_CHARS // _CHARS_PER_TOKEN + _PROPOSAL_ENVELOPE_TOKENS
-)
+
+
+def proposal_max_tokens(edit_count: int = 1) -> int:
+    """Budget output for the largest reply the content guardrail actually permits.
+
+    A transaction may carry one permitted content body per edit, so a budget
+    sized for a single edit truncates exactly the multi-edit proposals that
+    matter most. The two limits stay derived from one constant.
+    """
+    edits = max(1, int(edit_count))
+    return MAX_CONTENT_CHARS * edits // _CHARS_PER_TOKEN + _PROPOSAL_ENVELOPE_TOKENS
+
+
+PROPOSAL_MAX_TOKENS = proposal_max_tokens(1)
 # Reviewer fallback must remain materially cheaper than a full proposal pass.
 REVIEWER_MAX_TOKENS = 300
 
@@ -55,6 +67,30 @@ REFINE_PROPOSAL_SCHEMA: Dict[str, Any] = {
             "type": "string",
             "description": "Exact 12-character fp value from the repeated-failures list.",
         },
+        "summary": {
+            "type": "string",
+            "description": "One line naming the coherent change, used only with edits.",
+        },
+        "edits": {
+            "type": "array",
+            "description": (
+                "Two or more inseparable edits applied as one transaction under the "
+                "shared reason and expected_outcome. Omit entirely for a single edit."
+            ),
+            "items": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["create", "patch"]},
+                    "kind": {"type": "string", "enum": ["skill", "memory", "prompt"]},
+                    "name": {"type": "string"},
+                    "content": {"type": "string"},
+                    "category": {"type": "string"},
+                    "reason": {"type": "string"},
+                    "expected_outcome": {"type": "string"},
+                },
+                "required": ["action", "kind"],
+            },
+        },
     },
     "required": ["action", "reason"],
 }
@@ -63,7 +99,9 @@ REFINE_SYSTEM_PROMPT = (
     "You are a self-improvement mechanic for an AI agent named Hermes. Read the "
     "trajectory and propose ONE evidence-grounded, minimal edit.\n\n"
     "RULES:\n"
-    "1. Return only one create, patch, or no_op proposal.\n"
+    "1. Return one create, patch, or no_op proposal. Use the edits array only when two or "
+    "more edits are inseparable, such as a new skill plus the memory entry that records "
+    "when to reach for it; never use it to batch unrelated ideas.\n"
     "2. Never guess or duplicate an existing skill, memory, or prompt note.\n"
     "3. Never edit built-in or bundled skills.\n"
     "4. For every skill create or patch, content is the COMPLETE SKILL.md, not a diff. "
@@ -77,6 +115,10 @@ REFINE_SYSTEM_PROMPT = (
     "what the edit should improve and how to check it. It must not restate reason.\n"
     "9. Use exactly: action, kind, name, content, category, reason, expected_outcome, evidence, and optional "
     "pattern_fingerprint. Never combine action and kind.\n"
+    "10. For a transaction, set edits to the full edit objects and keep reason, "
+    "expected_outcome, evidence, and summary at the top level. Every edit still obeys every "
+    "rule above, and each one is applied, journaled, and reverted on its own. There is no "
+    "delete action: never propose removing anything.\n"
 )
 
 REVIEWER_FALLBACK_SCHEMA: Dict[str, Any] = {
@@ -192,7 +234,11 @@ def _incomplete_proposal(reply: _Reply) -> Dict[str, Any]:
 
 
 def _propose_structured(
-    llm: PluginLlm, instructions: str, input_blocks: List[PluginLlmInput]
+    llm: PluginLlm,
+    instructions: str,
+    input_blocks: List[PluginLlmInput],
+    *,
+    max_tokens: int = PROPOSAL_MAX_TOKENS,
 ) -> Any:
     """Invoke the model only with recursively sanitized text inputs."""
     safe_blocks: List[PluginLlmInput] = []
@@ -207,7 +253,7 @@ def _propose_structured(
         schema_name="refine_proposal",
         purpose="refine",
         temperature=0.0,
-        max_tokens=PROPOSAL_MAX_TOKENS,
+        max_tokens=max_tokens,
     )
     system_prompt = scrub_text(REFINE_SYSTEM_PROMPT)
     try:
@@ -216,7 +262,7 @@ def _propose_structured(
             json_schema=sanitize(REFINE_PROPOSAL_SCHEMA),
             **common,
         )
-        reply = _salvage_parsed(result, requested_max_tokens=PROPOSAL_MAX_TOKENS)
+        reply = _salvage_parsed(result, requested_max_tokens=max_tokens)
         return reply.parsed or _incomplete_proposal(reply)
     except PluginLlmTrustError:
         raise
@@ -231,7 +277,7 @@ def _propose_structured(
             json_mode=True,
             **common,
         )
-        reply = _salvage_parsed(result, requested_max_tokens=PROPOSAL_MAX_TOKENS)
+        reply = _salvage_parsed(result, requested_max_tokens=max_tokens)
         return reply.parsed or _incomplete_proposal(reply)
 
 
@@ -455,6 +501,232 @@ def _render_refinement_history(
     return "\n".join(lines)
 
 
+def _finalize_edit(
+    llm: PluginLlm,
+    short: str,
+    instructions: str,
+    parsed: Dict[str, Any],
+    *,
+    skill_content_loader: Optional[Callable[[str], Optional[str]]] = None,
+    allow_content_retry: bool = True,
+) -> Dict[str, Any]:
+    """Normalize and complete exactly one edit, shared by single and multi proposals.
+
+    Returns a flat edit, a ``no_op`` with the reason it was not usable, or a
+    reply carrying ``failure`` so an incomplete sub-call is never disguised.
+    """
+    action, kind, name, content, category = _normalize_fields(parsed)
+    if allow_content_retry and action == "create" and not content:
+        retry_text = instructions + "\n\nA create requires non-empty complete content. Return it now."
+        retry = _ensure_dict(
+            _propose_structured(llm, short, [PluginLlmTextInput(text=retry_text)])
+        )
+        if retry is not None:
+            if retry.get("failure"):
+                return sanitize(retry)
+            parsed = retry
+            action, kind, name, content, category = _normalize_fields(parsed)
+
+    if action not in ("create", "patch", "no_op"):
+        return {"action": "no_op", "reason": f"Invalid action: {action}"}
+    if action == "no_op":
+        return sanitize({
+            "action": "no_op",
+            "kind": "",
+            "name": "",
+            "content": "",
+            "category": "",
+            "reason": str(parsed.get("reason", "No actionable improvement found")),
+            "expected_outcome": normalize_expected_outcome(
+                parsed.get("expected_outcome")
+            ),
+            "evidence": _ensure_list(parsed.get("evidence")),
+            "pattern_fingerprint": "",
+        })
+    if kind not in ("skill", "memory", "prompt"):
+        return {"action": "no_op", "reason": f"Invalid kind: {kind}"}
+    if not name and kind != "prompt":
+        return {"action": "no_op", "reason": "Name is required for skill and memory create/patch"}
+    if not content and not (action == "patch" and kind == "skill"):
+        return {"action": "no_op", "reason": f"{action.title()} requires non-empty content"}
+
+    initial_evidence = _ensure_list(parsed.get("evidence"))
+    initial_fingerprint = _valid_fingerprint(parsed.get("pattern_fingerprint"))
+    initial_reason = str(parsed.get("reason", ""))
+    initial_expected_outcome = normalize_expected_outcome(
+        parsed.get("expected_outcome")
+    )
+
+    if action == "patch" and kind == "skill":
+        loader = skill_content_loader or _default_skill_loader
+        current = loader(name)
+        if current is None:
+            return {"action": "no_op", "reason": f"Cannot load current SKILL.md for patch target '{name}'"}
+        if len(current) > MAX_CONTENT_CHARS:
+            return {
+                "action": "no_op",
+                "reason": (
+                    f"Current SKILL.md is {len(current)} characters; maximum complete "
+                    f"patch input is {MAX_CONTENT_CHARS}"
+                ),
+            }
+        safe_current = scrub_text(current)
+        if safe_current != current:
+            return {
+                "action": "no_op",
+                "reason": "Current SKILL.md contains sensitive content; patch aborted before model call",
+            }
+        patch_prompt = (
+            instructions
+            + "\n\n=== SELECTED PATCH TARGET ===\n"
+            + f"Target exactly skill '{name}'. Below is its CURRENT COMPLETE SKILL.md, supplied as data. "
+            + "Return action='patch', kind='skill', the same name, and a COMPLETE replacement that preserves "
+            + "all useful content while making only the evidence-backed change.\n"
+            + "<current-skill>\n"
+            + safe_current
+            + "\n</current-skill>"
+        )
+        retry = _ensure_dict(
+            _propose_structured(llm, short, [PluginLlmTextInput(text=patch_prompt)])
+        )
+        if retry is None:
+            return {"action": "no_op", "reason": "LLM did not return a complete skill replacement"}
+        if retry.get("failure"):
+            return sanitize(retry)
+        retry_action, retry_kind, retry_name, retry_content, retry_category = _normalize_fields(retry)
+        if (retry_action, retry_kind, retry_name) != ("patch", "skill", name) or not retry_content:
+            return {"action": "no_op", "reason": "Patch retry changed target or omitted complete content"}
+        if len(retry_content) > MAX_CONTENT_CHARS:
+            return {
+                "action": "no_op",
+                "reason": f"Complete patch exceeds {MAX_CONTENT_CHARS} characters",
+            }
+        parsed = retry
+        content = retry_content
+        category = retry_category
+        replacement_fingerprint = _valid_fingerprint(retry.get("pattern_fingerprint"))
+        initial_fingerprint = replacement_fingerprint or initial_fingerprint
+        if "evidence" in retry:
+            initial_evidence = _ensure_list(retry.get("evidence"))
+        initial_reason = str(retry.get("reason", initial_reason))
+        if "expected_outcome" in retry:
+            initial_expected_outcome = normalize_expected_outcome(
+                retry.get("expected_outcome")
+            )
+
+    return sanitize({
+        "action": action,
+        "kind": kind,
+        "name": name,
+        "content": content,
+        "category": category,
+        "reason": initial_reason,
+        "expected_outcome": initial_expected_outcome,
+        "evidence": initial_evidence,
+        "pattern_fingerprint": initial_fingerprint,
+    })
+
+
+def _finalize_edits(
+    llm: PluginLlm,
+    short: str,
+    instructions: str,
+    parsed: Dict[str, Any],
+    raw_edits: List[Any],
+    *,
+    max_edits: int,
+    skill_content_loader: Optional[Callable[[str], Optional[str]]] = None,
+) -> Dict[str, Any]:
+    """Turn a proposed transaction into a bounded list of independent edits.
+
+    Shared justification stays at the top level, edits beyond the cap are
+    dropped, and a second edit that targets an already-claimed name is dropped
+    here rather than being applied and failing the collision guardrail later.
+    """
+    shared_reason = str(parsed.get("reason", ""))
+    shared_expected = normalize_expected_outcome(parsed.get("expected_outcome"))
+    shared_evidence = _ensure_list(parsed.get("evidence"))
+    shared_fingerprint = _valid_fingerprint(parsed.get("pattern_fingerprint"))
+    summary = scrub_text(str(parsed.get("summary", ""))).strip()[:MAX_SUMMARY_CHARS]
+
+    edits: List[Dict[str, Any]] = []
+    claimed: set = set()
+    dropped = max(0, len(raw_edits) - max_edits)
+    for raw_edit in raw_edits[:max_edits]:
+        if not isinstance(raw_edit, dict):
+            dropped += 1
+            continue
+        candidate = dict(raw_edit)
+        if not str(candidate.get("reason", "")).strip():
+            candidate["reason"] = shared_reason
+        if not str(candidate.get("expected_outcome", "") or "").strip():
+            candidate["expected_outcome"] = shared_expected
+        if not candidate.get("evidence"):
+            candidate["evidence"] = shared_evidence
+        if not _valid_fingerprint(candidate.get("pattern_fingerprint")):
+            candidate["pattern_fingerprint"] = shared_fingerprint
+        edit = _finalize_edit(
+            llm,
+            short,
+            instructions,
+            candidate,
+            skill_content_loader=skill_content_loader,
+            # A create without content is dropped from a transaction instead of
+            # spending an extra model call per edit on a retry.
+            allow_content_retry=False,
+        )
+        if edit.get("failure"):
+            return sanitize(edit)
+        if edit.get("action") == "no_op":
+            dropped += 1
+            logger.warning(
+                "Dropping unusable edit from a refine transaction: %s",
+                scrub_text(str(edit.get("reason", "")))[:200],
+            )
+            continue
+        target = (edit["kind"], edit["name"])
+        if edit["kind"] != "prompt":
+            if target in claimed:
+                dropped += 1
+                logger.warning(
+                    "Dropping a refine transaction edit that repeats target %s",
+                    scrub_text(f"{edit['kind']}:{edit['name']}"),
+                )
+                continue
+            claimed.add(target)
+        edits.append(edit)
+
+    if dropped:
+        logger.warning(
+            "Refine transaction kept %d of %d proposed edit(s)", len(edits), len(raw_edits)
+        )
+    if not edits:
+        return {
+            "action": "no_op",
+            "reason": (
+                f"Proposed transaction contained no usable edit ({dropped} discarded)"
+            ),
+        }
+    if len(edits) == 1:
+        return sanitize(edits[0])
+    return sanitize({
+        "action": "multi",
+        "kind": "",
+        "name": "",
+        "content": "",
+        "category": "",
+        "summary": summary,
+        "reason": shared_reason,
+        "expected_outcome": shared_expected,
+        "evidence": shared_evidence,
+        "pattern_fingerprint": shared_fingerprint,
+        "edits": edits,
+        # Reported so a transaction the model called inseparable cannot be
+        # journaled as complete after part of it was discarded.
+        "dropped_edits": dropped,
+    })
+
+
 def propose(
     llm: PluginLlm,
     evidence_text: str,
@@ -488,6 +760,7 @@ def propose(
     overview_max_entries = config.overview_max_entries()
     overview_max_chars = config.overview_max_chars()
     history_max_entries = config.history_max_entries()
+    max_edits = config.max_edits_per_proposal()
     del purpose  # The host purpose is fixed to the plugin's trusted purpose.
 
     skills_list = _render_overview(
@@ -539,130 +812,45 @@ def propose(
         f"{history_block}\n"
         "=== RECENT TRAJECTORY ===\n"
         f"{evidence_text[-8000:]}\n\n"
-        "Return one JSON object. Copy the full 12-character fp exactly when applicable."
+        "Return one JSON object. Copy the full 12-character fp exactly when applicable.\n"
+        f"Prefer a single edit. Use edits only for inseparable changes, at most {max_edits}; "
+        "anything past that is discarded."
     )
     short = "Propose one minimal skill, memory, or prompt-note edit."
 
     try:
         parsed = _ensure_dict(
-            _propose_structured(llm, short, [PluginLlmTextInput(text=instructions)])
+            _propose_structured(
+                llm,
+                short,
+                [PluginLlmTextInput(text=instructions)],
+                # The first reply may legitimately carry one permitted body per edit.
+                max_tokens=proposal_max_tokens(max_edits),
+            )
         )
         if parsed is None:
             return {"action": "no_op", "reason": "LLM returned non-object output"}
         if parsed.get("failure"):
             return sanitize(parsed)
 
-        action, kind, name, content, category = _normalize_fields(parsed)
-        if action == "create" and not content:
-            retry_text = instructions + "\n\nA create requires non-empty complete content. Return it now."
-            retry = _ensure_dict(
-                _propose_structured(llm, short, [PluginLlmTextInput(text=retry_text)])
+        raw_edits = parsed.get("edits")
+        if isinstance(raw_edits, list) and raw_edits:
+            return _finalize_edits(
+                llm,
+                short,
+                instructions,
+                parsed,
+                raw_edits,
+                max_edits=max_edits,
+                skill_content_loader=skill_content_loader,
             )
-            if retry is not None:
-                if retry.get("failure"):
-                    return sanitize(retry)
-                parsed = retry
-                action, kind, name, content, category = _normalize_fields(parsed)
-
-        if action not in ("create", "patch", "no_op"):
-            return {"action": "no_op", "reason": f"Invalid action: {action}"}
-        if action == "no_op":
-            return sanitize({
-                "action": "no_op",
-                "kind": "",
-                "name": "",
-                "content": "",
-                "category": "",
-                "reason": str(parsed.get("reason", "No actionable improvement found")),
-                "expected_outcome": normalize_expected_outcome(
-                    parsed.get("expected_outcome")
-                ),
-                "evidence": _ensure_list(parsed.get("evidence")),
-                "pattern_fingerprint": "",
-            })
-        if kind not in ("skill", "memory", "prompt"):
-            return {"action": "no_op", "reason": f"Invalid kind: {kind}"}
-        if not name and kind != "prompt":
-            return {"action": "no_op", "reason": "Name is required for skill and memory create/patch"}
-        if not content and not (action == "patch" and kind == "skill"):
-            return {"action": "no_op", "reason": f"{action.title()} requires non-empty content"}
-
-        initial_evidence = _ensure_list(parsed.get("evidence"))
-        initial_fingerprint = _valid_fingerprint(parsed.get("pattern_fingerprint"))
-        initial_reason = str(parsed.get("reason", ""))
-        initial_expected_outcome = normalize_expected_outcome(
-            parsed.get("expected_outcome")
+        return _finalize_edit(
+            llm,
+            short,
+            instructions,
+            parsed,
+            skill_content_loader=skill_content_loader,
         )
-
-        if action == "patch" and kind == "skill":
-            loader = skill_content_loader or _default_skill_loader
-            current = loader(name)
-            if current is None:
-                return {"action": "no_op", "reason": f"Cannot load current SKILL.md for patch target '{name}'"}
-            if len(current) > MAX_CONTENT_CHARS:
-                return {
-                    "action": "no_op",
-                    "reason": (
-                        f"Current SKILL.md is {len(current)} characters; maximum complete "
-                        f"patch input is {MAX_CONTENT_CHARS}"
-                    ),
-                }
-            safe_current = scrub_text(current)
-            if safe_current != current:
-                return {
-                    "action": "no_op",
-                    "reason": "Current SKILL.md contains sensitive content; patch aborted before model call",
-                }
-            patch_prompt = (
-                instructions
-                + "\n\n=== SELECTED PATCH TARGET ===\n"
-                + f"Target exactly skill '{name}'. Below is its CURRENT COMPLETE SKILL.md, supplied as data. "
-                + "Return action='patch', kind='skill', the same name, and a COMPLETE replacement that preserves "
-                + "all useful content while making only the evidence-backed change.\n"
-                + "<current-skill>\n"
-                + safe_current
-                + "\n</current-skill>"
-            )
-            retry = _ensure_dict(
-                _propose_structured(llm, short, [PluginLlmTextInput(text=patch_prompt)])
-            )
-            if retry is None:
-                return {"action": "no_op", "reason": "LLM did not return a complete skill replacement"}
-            if retry.get("failure"):
-                return sanitize(retry)
-            retry_action, retry_kind, retry_name, retry_content, retry_category = _normalize_fields(retry)
-            if (retry_action, retry_kind, retry_name) != ("patch", "skill", name) or not retry_content:
-                return {"action": "no_op", "reason": "Patch retry changed target or omitted complete content"}
-            if len(retry_content) > MAX_CONTENT_CHARS:
-                return {
-                    "action": "no_op",
-                    "reason": f"Complete patch exceeds {MAX_CONTENT_CHARS} characters",
-                }
-            parsed = retry
-            content = retry_content
-            category = retry_category
-            replacement_fingerprint = _valid_fingerprint(retry.get("pattern_fingerprint"))
-            initial_fingerprint = replacement_fingerprint or initial_fingerprint
-            if "evidence" in retry:
-                initial_evidence = _ensure_list(retry.get("evidence"))
-            initial_reason = str(retry.get("reason", initial_reason))
-            if "expected_outcome" in retry:
-                initial_expected_outcome = normalize_expected_outcome(
-                    retry.get("expected_outcome")
-                )
-
-        result = {
-            "action": action,
-            "kind": kind,
-            "name": name,
-            "content": content,
-            "category": category,
-            "reason": initial_reason,
-            "expected_outcome": initial_expected_outcome,
-            "evidence": initial_evidence,
-            "pattern_fingerprint": initial_fingerprint,
-        }
-        return sanitize(result)
     except PluginLlmTrustError as exc:
         safe_error = scrub_text(str(exc))
         logger.warning("PluginLlm trust denied: %s", safe_error)

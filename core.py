@@ -5,6 +5,7 @@ import logging
 import re
 import sqlite3
 import time
+import uuid
 from typing import Any, Dict, List, Optional
 
 from agent.plugin_llm import PluginLlm
@@ -700,18 +701,24 @@ def _refine_once(
         if entry_id:
             response["journal_id"] = entry_id
         return response
-    if proposal.get("kind") == "prompt":
-        scope = config.prompt_notes_default_scope()
-        proposal = dict(
+    evidence_summary = {
+        "session_id": session,
+        "messages": len(evidence.get("messages", [])),
+        "errors": evidence.get("error_count", 0),
+    }
+
+    if proposal.get("action") == "multi":
+        transaction = _apply_transaction(
             proposal,
-            content=journal.normalize_prompt_note_content(proposal.get("content", "")),
-            scope=scope,
-            session_id=(
-                journal.normalize_prompt_note_session_id(session)
-                if scope == "session"
-                else ""
-            ),
+            trigger=trigger,
+            safe_reason=safe_reason,
+            session=session,
+            started=started,
         )
+        transaction["evidence"] = evidence_summary
+        return transaction
+
+    proposal = _normalize_edit(proposal, session)
 
     if proposal.get("action") == "no_op":
         entry_id = _journal_nonmutation(
@@ -736,6 +743,31 @@ def _refine_once(
             "reversible": False,
         }
 
+    response = _apply_edit(
+        proposal,
+        trigger=trigger,
+        safe_reason=safe_reason,
+        session=session,
+        started=started,
+    )
+    response["evidence"] = evidence_summary
+    return response
+
+
+def _apply_edit(
+    proposal: Dict[str, Any],
+    *,
+    trigger: str,
+    safe_reason: str,
+    session: str,
+    started: float,
+    group: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Validate, back up, apply, and finalize exactly one edit.
+
+    Guardrails read live host and journal state, so an edit inside a transaction
+    is checked against the edits that were already applied before it.
+    """
     guardrail_error = _validate_proposal(proposal)
     if guardrail_error:
         entry_id = _journal_nonmutation(
@@ -745,12 +777,14 @@ def _refine_once(
             proposal=proposal,
             outcome="rejected",
             error=guardrail_error,
+            group=group,
         )
         result = {
             "success": False,
             "message": f"Proposal rejected by guardrails: {guardrail_error}",
             "proposal": proposal,
             "reversible": False,
+            "edits_applied": 0,
         }
         if entry_id:
             result["record_id"] = entry_id
@@ -773,12 +807,14 @@ def _refine_once(
                 proposal=proposal,
                 outcome="error",
                 error=error,
+                group=group,
             )
             return {
                 "success": False,
                 "message": error,
                 "proposal": proposal,
                 "reversible": False,
+                "edits_applied": 0,
             }
         backup_path = str(backup)
         recovery = {"type": "skill_patch", "name": name}
@@ -799,12 +835,14 @@ def _refine_once(
                 proposal=proposal,
                 outcome="error",
                 error=error,
+                group=group,
             )
             return {
                 "success": False,
                 "message": error,
                 "proposal": proposal,
                 "reversible": False,
+                "edits_applied": 0,
             }
         proposal = dict(proposal, name=prompt_note["id"], note_id=prompt_note["id"])
         name = prompt_note["id"]
@@ -821,12 +859,14 @@ def _refine_once(
                 proposal=proposal,
                 outcome="error",
                 error=error,
+                group=group,
             )
             return {
                 "success": False,
                 "message": error,
                 "proposal": proposal,
                 "reversible": False,
+                "edits_applied": 0,
             }
         recovery = memory_recovery
 
@@ -838,6 +878,7 @@ def _refine_once(
             proposal=proposal,
             backup_path=backup_path,
             recovery=recovery,
+            group=group,
         )
     except Exception as exc:
         return {
@@ -845,6 +886,7 @@ def _refine_once(
             "message": f"Journal preparation failed; mutation aborted: {scrub_text(str(exc))}",
             "proposal": proposal,
             "reversible": False,
+            "edits_applied": 0,
         }
 
     try:
@@ -899,6 +941,10 @@ def _refine_once(
                 "result": sanitize(apply_result),
                 "backup_path": backup_path,
                 "reversible": not staged,
+                # The mutation landed and its prepared record already consumed
+                # budget, so this edit still owns a recovery id even though the
+                # run must stop.
+                "edits_applied": 1,
             }
         return {
             "success": False,
@@ -906,6 +952,7 @@ def _refine_once(
             "proposal": proposal,
             "result": sanitize(apply_result),
             "reversible": False,
+            "edits_applied": 0,
         }
 
     if outcome in ("applied", "pending_approval"):
@@ -938,17 +985,246 @@ def _refine_once(
         "reversible": bool(
             success and outcome == "applied" and journal.is_reversible(finalized)
         ),
-        "evidence": {
-            "session_id": session,
-            "messages": len(evidence.get("messages", [])),
-            "errors": evidence.get("error_count", 0),
-        },
+        "outcome": outcome,
+        # The daily budget counts edits, so a transaction reports each applied or
+        # reserved edit rather than one proposal.
+        "edits_applied": 1 if success else 0,
     }
     if success:
         response["journal_id"] = entry_id
     else:
         response["record_id"] = entry_id
     return response
+
+
+def _normalize_edit(proposal: Dict[str, Any], session: str) -> Dict[str, Any]:
+    """Apply the boundary normalization every edit needs before guardrails run."""
+    normalized = dict(
+        proposal,
+        expected_outcome=_llm.normalize_expected_outcome(
+            proposal.get("expected_outcome")
+        ),
+    )
+    if normalized.get("kind") == "prompt":
+        scope = config.prompt_notes_default_scope()
+        normalized = dict(
+            normalized,
+            content=journal.normalize_prompt_note_content(normalized.get("content", "")),
+            scope=scope,
+            session_id=(
+                journal.normalize_prompt_note_session_id(session)
+                if scope == "session"
+                else ""
+            ),
+        )
+    return normalized
+
+
+def _apply_transaction(
+    proposal: Dict[str, Any],
+    *,
+    trigger: str,
+    safe_reason: str,
+    session: str,
+    started: float,
+) -> Dict[str, Any]:
+    """Apply one multi-edit proposal as a sequence of independent durable edits.
+
+    Each edit keeps its own journal record, recovery metadata, and rollback id, so
+    the existing single-edit rollback and approval machinery is reused unchanged.
+    Edits are applied in order and the run stops at the first failure, leaving a
+    journal that states exactly which edits applied and which did not.
+    """
+    edits = [edit for edit in proposal.get("edits", []) if isinstance(edit, dict)]
+    if not edits:
+        error = "Transaction contained no usable edit"
+        _journal_nonmutation(
+            trigger=trigger,
+            reason=safe_reason or error,
+            session_id=session,
+            proposal=proposal,
+            outcome="rejected",
+            error=error,
+        )
+        return {
+            "success": False,
+            "outcome": "failed",
+            "message": error,
+            "proposal": proposal,
+            "results": [],
+            "recoveries": [],
+            "journal_ids": [],
+            "reversible": False,
+            "edits_applied": 0,
+        }
+    group_id = uuid.uuid4().hex[:12]
+    summary = scrub_text(str(proposal.get("summary", ""))).strip()[
+        : _llm.MAX_SUMMARY_CHARS
+    ]
+    shared_reason = scrub_text(str(proposal.get("reason", "")))
+    shared_expected = _llm.normalize_expected_outcome(proposal.get("expected_outcome"))
+    shared_fingerprint = str(proposal.get("pattern_fingerprint", "") or "")
+    dropped = int(proposal.get("dropped_edits", 0) or 0)
+
+    def edit_proposal(edit: Dict[str, Any]) -> Dict[str, Any]:
+        """Give one edit the transaction's shared justification, then normalize it."""
+        merged = dict(edit)
+        if not str(merged.get("reason", "")).strip():
+            merged["reason"] = shared_reason
+        if not str(merged.get("expected_outcome", "") or "").strip():
+            merged["expected_outcome"] = shared_expected
+        if not str(merged.get("pattern_fingerprint", "") or ""):
+            merged["pattern_fingerprint"] = shared_fingerprint
+        return _normalize_edit(sanitize(merged), session)
+
+    def edit_group(index: int) -> Dict[str, Any]:
+        group = {
+            "id": group_id,
+            "index": index,
+            "size": len(edits),
+            "summary": summary,
+        }
+        if dropped:
+            group["dropped"] = dropped
+        return group
+
+    results: List[Dict[str, Any]] = []
+    stop_reason = ""
+    for index, edit in enumerate(edits):
+        # Re-read the durable budget between edits: it counts edits, so a long
+        # transaction can legitimately exhaust it part way through.
+        if journal.daily_limit_reached():
+            stop_reason = (
+                f"Daily edit limit reached ({config.max_edits_per_day()}) "
+                "before this edit was attempted"
+            )
+            break
+        item = _apply_edit(
+            edit_proposal(edit),
+            trigger=trigger,
+            safe_reason=safe_reason,
+            session=session,
+            started=started,
+            group=edit_group(index),
+        )
+        results.append(item)
+        if not item.get("success"):
+            stop_reason = (
+                f"An earlier edit of transaction {group_id} did not complete"
+            )
+            break
+
+    # Every edit of a transaction leaves a durable trace, so a partial
+    # application is readable from the journal alone rather than only from a
+    # message that automatic runs discard. ``rejected`` consumes no daily budget.
+    for index in range(len(results), len(edits)):
+        _journal_nonmutation(
+            trigger=trigger,
+            reason=safe_reason,
+            session_id=session,
+            proposal=edit_proposal(edits[index]),
+            outcome="rejected",
+            error=stop_reason or "Edit was not attempted",
+            group=edit_group(index),
+        )
+
+    # "Recoverable" is deliberately wider than "successful": an edit whose host
+    # mutation landed but whose journal finalization then failed still owns a
+    # recovery id and must appear in the list the message points the user at.
+    recoverable = [item for item in results if int(item.get("edits_applied", 0) or 0)]
+    succeeded = [item for item in results if item.get("success")]
+    recoveries = _recoveries_for(recoverable)
+    skipped = len(edits) - len(results)
+    elapsed = time.time() - started
+
+    if len(succeeded) == len(edits) and not dropped:
+        success, outcome = True, "completed"
+        message = (
+            f"transaction {group_id}: {len(succeeded)} edit(s) applied or reserved "
+            f"({elapsed:.1f}s)"
+        )
+    elif recoverable:
+        success, outcome = False, "partial_success"
+        message = (
+            f"PARTIAL SUCCESS: transaction {group_id} applied or reserved "
+            f"{len(recoverable)} of {len(edits)} edit(s) and then stopped. "
+            "Use the recovery IDs listed below, newest first."
+        )
+    else:
+        success, outcome = False, "failed"
+        message = f"transaction {group_id}: no edit was applied"
+    if results and not results[-1].get("success"):
+        message += f" | stopped: {scrub_text(str(results[-1].get('message', '')))[:160]}"
+    elif skipped:
+        message += (
+            f" | stopped: daily edit limit reached ({config.max_edits_per_day()}); "
+            f"{skipped} edit(s) not attempted"
+        )
+    if dropped:
+        message += f" | {dropped} proposed edit(s) discarded before apply"
+    if summary:
+        message += f" | {summary}"
+
+    return {
+        "success": success,
+        "outcome": outcome,
+        "message": message,
+        "proposal": proposal,
+        "results": results,
+        "recoveries": recoveries,
+        "journal_ids": [item["journal_id"] for item in recoveries],
+        "reversible": any(item.get("reversible") for item in recoveries),
+        "edits_applied": len(recoverable),
+    }
+
+
+def _completed_targets(result: Dict[str, Any]) -> List[str]:
+    """Name what a pass already reserved, so the next pass cannot repeat it."""
+    items = result.get("results")
+    proposals = (
+        [
+            item.get("proposal", {})
+            for item in items
+            if isinstance(item, dict) and item.get("success")
+        ]
+        if isinstance(items, list)
+        else [result.get("proposal", {})]
+    )
+    targets: List[str] = []
+    for proposal in proposals:
+        if not isinstance(proposal, dict):
+            continue
+        action = scrub_text(str(proposal.get("action", "")))
+        if action in ("", "no_op", "multi"):
+            continue
+        kind = scrub_text(str(proposal.get("kind", "")))
+        name = scrub_text(str(proposal.get("name", "")))
+        targets.append(f"{action} {kind} '{name}'")
+    return targets
+
+
+def _recoveries_for(applied: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Describe every durable recovery id an applied or reserved edit left behind.
+
+    Newest first, because that is the only safe rollback order: memory recovery
+    is positional, so undoing an earlier append before a later one shifts the
+    later entry and its rollback fails closed as a conflict.
+    """
+    recoveries: List[Dict[str, Any]] = []
+    for item in reversed(applied):
+        journal_id = item.get("journal_id")
+        if not journal_id:
+            continue
+        durable = journal.get_entry(str(journal_id)) or {}
+        recovery: Dict[str, Any] = {
+            "journal_id": str(journal_id),
+            "outcome": durable.get("outcome", item.get("outcome", "unknown")),
+            "reversible": bool(item.get("reversible")),
+        }
+        if item.get("reversible"):
+            recovery["rollback_command"] = f"/refine rollback {journal_id}"
+        recoveries.append(recovery)
+    return recoveries
 
 
 def refine_run(
@@ -963,6 +1239,9 @@ def refine_run(
     with journal.mutation_lock():
         _reconcile_pending()
         runs: List[Dict[str, Any]] = []
+        # ``max_edits_per_run`` bounds proposal passes; ``max_edits_per_proposal``
+        # bounds edits inside one transaction; the daily edit budget bounds edits
+        # overall and is re-checked before every single edit.
         max_runs = max(1, config.max_edits_per_run())
         run_reason = scrub_text(reason)
         for _ in range(max_runs):
@@ -972,14 +1251,13 @@ def refine_run(
                 llm, reason=run_reason, session_id=session_id, auto=auto
             )
             runs.append(result)
-            action = result.get("proposal", {}).get("action")
-            accepted = bool(result.get("result", {}).get("success"))
-            if not result.get("success") or action in (None, "no_op") or not accepted:
+            if not result.get("success") or not int(result.get("edits_applied", 0) or 0):
                 break
-            done_name = scrub_text(str(result.get("proposal", {}).get("name", "")))
-            done_kind = scrub_text(str(result.get("proposal", {}).get("kind", "")))
+            targets = _completed_targets(result)
+            if not targets:
+                break
             note = (
-                f"Already completed or reserved {action} {done_kind} '{done_name}' in this run; "
+                f"Already completed or reserved {'; '.join(targets)} in this run; "
                 "propose a different edit or no_op."
             )
             run_reason = f"{reason}\n{note}".strip() if reason else note
@@ -996,21 +1274,15 @@ def refine_run(
 
         recoveries: List[Dict[str, Any]] = []
         for item in runs:
-            journal_id = item.get("journal_id")
-            if not journal_id or not item.get("result", {}).get("success"):
+            inner = item.get("recoveries")
+            if isinstance(inner, list) and inner:
+                recoveries.extend(inner)
                 continue
-            durable = journal.get_entry(str(journal_id)) or {}
-            recovery_item: Dict[str, Any] = {
-                "journal_id": str(journal_id),
-                "outcome": durable.get("outcome", "unknown"),
-                "reversible": bool(item.get("reversible")),
-            }
-            if item.get("reversible"):
-                recovery_item["rollback_command"] = f"/refine rollback {journal_id}"
-            recoveries.append(recovery_item)
+            if item.get("journal_id") and int(item.get("edits_applied", 0) or 0):
+                recoveries.extend(_recoveries_for([item]))
 
         failed_after_success = bool(
-            recoveries and any(not item.get("success") for item in runs[1:])
+            recoveries and any(not item.get("success") for item in runs)
         )
         last = runs[-1]
         if failed_after_success:
@@ -1037,6 +1309,7 @@ def refine_run(
             "journal_ids": [item["journal_id"] for item in recoveries],
             "evidence": runs[0].get("evidence", {}),
             "reversible": any(item.get("reversible") for item in recoveries),
+            "edits_applied": len(recoveries),
         }
         return response
 

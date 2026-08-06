@@ -345,6 +345,27 @@ def skill_proposal(name, body="# Guidance\n\nNew guidance."):
     }
 
 
+def multi_proposal(*edits, summary="Add the skill and the memory that points at it"):
+    return {
+        "action": "multi", "kind": "", "name": "", "content": "", "category": "",
+        "summary": summary, "reason": "Repeated failure",
+        "expected_outcome": "The repeated failure stops.",
+        "evidence": ["request failed"], "pattern_fingerprint": "deadbeef1234",
+        "edits": list(edits),
+    }
+
+
+def memory_edit(content, name="lesson"):
+    return {
+        "action": "create", "kind": "memory", "name": name, "content": content,
+        "reason": "Repeated failure", "evidence": [],
+    }
+
+
+def grouped_entries():
+    return [entry for entry in journal.entries() if entry.get("group")]
+
+
 def prompt_proposal(content):
     return {
         "action": "create", "kind": "prompt", "name": "",
@@ -452,10 +473,24 @@ class RefineTests(unittest.TestCase):
         )
         self.assertLess(llm.REVIEWER_MAX_TOKENS, llm.PROPOSAL_MAX_TOKENS // 4)
 
+        # A transaction may carry one permitted body per edit, so the budget has
+        # to scale with the edit cap or it truncates the largest proposals.
+        FakeHost.entry_config()["max_edits_per_proposal"] = 3
+        self.assertGreaterEqual(
+            llm.proposal_max_tokens(3) * llm._CHARS_PER_TOKEN,
+            llm.MAX_CONTENT_CHARS * 3,
+        )
         proposal_model = MockLlm({"action": "no_op", "reason": "none"})
         llm.propose(proposal_model, "evidence", [], [])
         self.assertEqual(
-            proposal_model.calls[0]["max_tokens"], llm.PROPOSAL_MAX_TOKENS
+            proposal_model.calls[0]["max_tokens"], llm.proposal_max_tokens(3)
+        )
+
+        FakeHost.entry_config()["max_edits_per_proposal"] = 1
+        single_model = MockLlm({"action": "no_op", "reason": "none"})
+        llm.propose(single_model, "evidence", [], [])
+        self.assertEqual(
+            single_model.calls[0]["max_tokens"], llm.PROPOSAL_MAX_TOKENS
         )
 
         reviewer_model = MockLlm({
@@ -1467,6 +1502,310 @@ class RefineTests(unittest.TestCase):
         self.assertIn("⚠️", output)
         self.assertIn(recovery["journal_id"], output)
         self.assertIn(recovery["rollback_command"], output)
+
+    def test_multi_edit_transaction_applies_each_edit_as_one_recoverable_unit(self):
+        FakeHost.entry_config()["max_edits_per_day"] = 5
+        lesson = memory_edit("Reach for the endpoint skill instead of retrying by hand.")
+        result = self.run_proposal(
+            multi_proposal(skill_proposal("endpoint-retry"), lesson)
+        )
+        self.assertTrue(result["success"])
+        self.assertEqual(result["outcome"], "completed")
+        self.assertEqual(result["edits_applied"], 2)
+        self.assertIn("endpoint-retry", FakeHost.skills)
+        self.assertIn(lesson["content"], FakeHost.memory_entries)
+
+        grouped = grouped_entries()
+        self.assertEqual(len({entry["group"]["id"] for entry in grouped}), 1)
+        self.assertEqual(sorted(entry["group"]["index"] for entry in grouped), [0, 1])
+        self.assertEqual({entry["group"]["size"] for entry in grouped}, {2})
+        self.assertEqual([entry["outcome"] for entry in grouped], ["applied", "applied"])
+        # The shared prediction is carried onto every edit that was journaled.
+        for entry in grouped:
+            self.assertEqual(
+                entry["proposal"]["expected_outcome"], "The repeated failure stops."
+            )
+        # The daily budget counts edits, not proposals.
+        self.assertEqual(journal.count_today_applied(), 2)
+
+        self.assertEqual(len(result["recoveries"]), 2)
+        for recovery in result["recoveries"]:
+            self.assertTrue(core.refine_rollback(recovery["journal_id"])["success"])
+        self.assertNotIn("endpoint-retry", FakeHost.skills)
+        self.assertNotIn(lesson["content"], FakeHost.memory_entries)
+
+    def test_multi_edit_partial_application_journals_applied_and_failed_edits(self):
+        FakeHost.entry_config()["max_edits_per_day"] = 5
+        broken = {
+            "action": "create", "kind": "skill", "name": "broken-second",
+            "content": "not a skill at all", "reason": "later failure", "evidence": [],
+        }
+        result = self.run_proposal(
+            multi_proposal(skill_proposal("good-first"), broken)
+        )
+        self.assertFalse(result["success"])
+        self.assertEqual(result["outcome"], "partial_success")
+        self.assertEqual(result["edits_applied"], 1)
+        self.assertIn("good-first", FakeHost.skills)
+        self.assertNotIn("broken-second", FakeHost.skills)
+
+        outcomes = {
+            entry["proposal"]["name"]: entry["outcome"] for entry in grouped_entries()
+        }
+        self.assertEqual(outcomes, {"good-first": "applied", "broken-second": "rejected"})
+        self.assertEqual(len(result["recoveries"]), 1)
+        self.assertIn("rollback_command", result["recoveries"][0])
+
+        with patch.object(plugin_init.core, "refine_run", return_value=result):
+            output = plugin_init._handle_refine_command("")
+        self.assertIn("⚠️", output)
+        self.assertIn(result["recoveries"][0]["journal_id"], output)
+        self.assertIn("good-first", output)
+        self.assertIn("broken-second", output)
+
+    def test_transaction_guardrails_see_edits_applied_earlier_in_the_same_run(self):
+        FakeHost.entry_config()["max_edits_per_day"] = 5
+        result = self.run_proposal(
+            multi_proposal(
+                skill_proposal("collides"), skill_proposal("collides", "# Second body")
+            )
+        )
+        self.assertEqual(result["outcome"], "partial_success")
+        self.assertEqual(result["edits_applied"], 1)
+        rejected = [
+            entry for entry in grouped_entries() if entry["outcome"] == "rejected"
+        ]
+        self.assertEqual(len(rejected), 1)
+        self.assertIn("already exists", rejected[0]["error"])
+        self.assertEqual(
+            FakeHost.skills["collides"], skill_content("collides", "# Guidance\n\nNew guidance.")
+        )
+
+    def test_multi_edit_stops_when_the_daily_edit_budget_is_exhausted(self):
+        FakeHost.entry_config()["max_edits_per_day"] = 1
+        lesson = memory_edit("second lesson")
+        result = self.run_proposal(
+            multi_proposal(skill_proposal("budget-first"), lesson)
+        )
+        self.assertFalse(result["success"])
+        self.assertEqual(result["outcome"], "partial_success")
+        self.assertEqual(result["edits_applied"], 1)
+        self.assertIn("budget-first", FakeHost.skills)
+        self.assertNotIn("second lesson", FakeHost.memory_entries)
+        self.assertIn("daily edit limit", result["message"])
+        # The unattempted edit is journaled so a partial transaction is readable
+        # from the journal alone, but it consumes no daily budget.
+        self.assertEqual(journal.count_today_applied(), 1)
+        outcomes = {
+            entry["proposal"]["name"]: entry["outcome"] for entry in grouped_entries()
+        }
+        self.assertEqual(outcomes, {"budget-first": "applied", "lesson": "rejected"})
+        skipped = next(
+            entry for entry in grouped_entries() if entry["outcome"] == "rejected"
+        )
+        self.assertIn("Daily edit limit reached", skipped["error"])
+        self.assertEqual(skipped["group"]["index"], 1)
+
+    def test_transaction_edits_are_capped_and_duplicate_targets_collapse(self):
+        reply = {
+            "action": "create", "reason": "Repeated failure",
+            "expected_outcome": "The repeated failure stops.",
+            "pattern_fingerprint": "deadbeef1234",
+            "summary": "Add the skill and its memory pointer",
+            "edits": [
+                {"action": "create", "kind": "skill", "name": "capped-one",
+                 "content": skill_content("capped-one")},
+                {"action": "create", "kind": "skill", "name": "capped-one",
+                 "content": skill_content("capped-one", "# Duplicate")},
+                {"action": "create", "kind": "memory", "name": "note",
+                 "content": "Reach for capped-one first."},
+            ],
+        }
+        FakeHost.entry_config()["max_edits_per_proposal"] = 2
+        capped = llm.propose(MockLlm(reply), "evidence", [], [])
+        # The duplicate target is dropped and the third edit is past the cap, so a
+        # transaction of one collapses back to the ordinary single-edit shape.
+        self.assertNotIn("edits", capped)
+        self.assertEqual((capped["action"], capped["name"]), ("create", "capped-one"))
+        self.assertEqual(capped["expected_outcome"], "The repeated failure stops.")
+
+        FakeHost.entry_config()["max_edits_per_proposal"] = 3
+        model = MockLlm(reply)
+        grouped = llm.propose(model, "evidence", [], [])
+        self.assertEqual(grouped["action"], "multi")
+        self.assertEqual([edit["kind"] for edit in grouped["edits"]], ["skill", "memory"])
+        self.assertEqual(grouped["summary"], "Add the skill and its memory pointer")
+        for edit in grouped["edits"]:
+            self.assertEqual(edit["expected_outcome"], "The repeated failure stops.")
+            self.assertEqual(edit["pattern_fingerprint"], "deadbeef1234")
+        # Creates inside a transaction cost no extra retry call.
+        self.assertEqual(len(model.calls), 1)
+
+    def test_transaction_subcall_truncation_is_reported_not_disguised(self):
+        name = "patched-in-transaction"
+        FakeHost.add_skill(name, skill_content(name, "# Old\n\nKeep."))
+        reply = {
+            "action": "patch", "reason": "Repeated failure",
+            "edits": [
+                {"action": "patch", "kind": "skill", "name": name},
+                memory_edit("lesson", name="note"),
+            ],
+        }
+        truncated = MockResult(
+            text='{"action": "patch", "kind": "skill", "name": "patched',
+            output_tokens=llm.PROPOSAL_MAX_TOKENS,
+        )
+        result = llm.propose(
+            MockLlm(reply, truncated), "evidence", [name], [],
+            skill_content_loader=journal.read_skill_content,
+        )
+        self.assertEqual(result["failure"], "truncated")
+        self.assertEqual(result["action"], "no_op")
+        self.assertNotIn("edits", result)
+
+    def test_transaction_lists_a_recovery_id_for_an_unfinalized_mutation(self):
+        FakeHost.entry_config()["max_edits_per_day"] = 5
+        original_finalize = journal.finalize
+        calls = []
+
+        def fail_second(entry_id, outcome, **kwargs):
+            calls.append(entry_id)
+            if len(calls) == 2:
+                raise OSError("finalize disk error")
+            return original_finalize(entry_id, outcome, **kwargs)
+
+        lesson = memory_edit("second body")
+        with patch.object(
+            core._llm, "propose",
+            return_value=multi_proposal(skill_proposal("finalized-first"), lesson),
+        ), patch.object(journal, "finalize", side_effect=fail_second):
+            result = core.refine_run(MockLlm())
+
+        self.assertEqual(result["outcome"], "partial_success")
+        # The second edit really mutated the host and really consumed budget, so
+        # its recovery id has to be listed, not merely mentioned in free text.
+        self.assertIn(lesson["content"], FakeHost.memory_entries)
+        self.assertEqual(journal.count_today_applied(), 2)
+        self.assertEqual(result["edits_applied"], 2)
+        self.assertEqual(len(result["journal_ids"]), 2)
+        unfinalized = [
+            entry for entry in grouped_entries() if entry["outcome"] == "prepared"
+        ]
+        self.assertEqual(len(unfinalized), 1)
+        self.assertIn(unfinalized[0]["id"], result["journal_ids"])
+
+    def test_transaction_recovery_ids_are_listed_in_a_safe_rollback_order(self):
+        FakeHost.entry_config()["max_edits_per_day"] = 5
+        result = self.run_proposal(multi_proposal(
+            memory_edit("first lesson", name="first"),
+            memory_edit("second lesson", name="second"),
+        ))
+        self.assertTrue(result["success"])
+        self.assertEqual(FakeHost.memory_entries, ["first lesson", "second lesson"])
+        # Memory recovery is positional, so rolling back in the printed order has
+        # to work; the reverse order fails closed and strands half the change.
+        for recovery in result["recoveries"]:
+            self.assertTrue(core.refine_rollback(recovery["journal_id"])["success"])
+        self.assertEqual(FakeHost.memory_entries, [])
+
+    def test_transaction_summary_and_edits_are_scrubbed_everywhere(self):
+        FakeHost.entry_config()["max_edits_per_day"] = 5
+        secret = "ghp_" + "S" * 36
+        result = self.run_proposal(multi_proposal(
+            skill_proposal("scrubbed-skill"),
+            memory_edit(f"remember token={secret} for later"),
+            summary=f"summary carrying {secret}",
+        ))
+        self.assertTrue(result["success"])
+        self.assertNotIn(secret, journal.journal_path().read_text(encoding="utf-8"))
+        self.assertNotIn(secret, json.dumps(result))
+        self.assertNotIn(secret, "\n".join(FakeHost.memory_entries))
+        group = grouped_entries()[0]["group"]
+        self.assertNotIn(secret, group["summary"])
+        self.assertIn("[REDACTED]", group["summary"])
+
+    def test_prompt_note_edit_inside_a_transaction_persists_and_reverts(self):
+        FakeHost.entry_config()["max_edits_per_day"] = 5
+        note = prompt_proposal(
+            "When the request returns 500, retry with the other endpoint."
+        )
+        result = self.run_proposal(multi_proposal(skill_proposal("with-note"), note))
+        self.assertTrue(result["success"])
+        self.assertEqual(result["edits_applied"], 2)
+        self.assertEqual(len(journal.load_prompt_notes()), 1)
+        for recovery in result["recoveries"]:
+            self.assertTrue(core.refine_rollback(recovery["journal_id"])["success"])
+        self.assertEqual(journal.load_prompt_notes(), [])
+        self.assertNotIn("with-note", FakeHost.skills)
+
+    def test_ledger_separates_a_skill_from_a_same_named_memory_edit(self):
+        FakeHost.entry_config()["max_edits_per_day"] = 5
+        result = self.run_proposal(multi_proposal(
+            skill_proposal("shared-name"),
+            memory_edit("Reach for shared-name first.", name="shared-name"),
+        ))
+        self.assertTrue(result["success"])
+        stats = ledger.load_stats()
+        self.assertEqual(
+            sorted(stats), ["memory:shared-name", "shared-name"]
+        )
+        self.assertEqual(stats["shared-name"]["version"], 1)
+        self.assertEqual(stats["memory:shared-name"]["version"], 1)
+        rows = ledger.audit([])
+        self.assertEqual([row["name"] for row in rows], ["shared-name", "shared-name"])
+        self.assertEqual(
+            {row["journal_id"] for row in rows}, set(result["journal_ids"])
+        )
+
+    def test_discarded_edits_are_reported_instead_of_a_clean_completion(self):
+        FakeHost.entry_config()["max_edits_per_day"] = 5
+        proposal = multi_proposal(
+            skill_proposal("kept-a"), memory_edit("kept b", name="kept-b")
+        )
+        proposal["dropped_edits"] = 1
+        result = self.run_proposal(proposal)
+        self.assertFalse(result["success"])
+        self.assertEqual(result["outcome"], "partial_success")
+        self.assertEqual(result["edits_applied"], 2)
+        self.assertIn("discarded before apply", result["message"])
+        self.assertEqual(grouped_entries()[0]["group"]["dropped"], 1)
+
+    def test_transaction_container_never_reaches_guardrails_or_the_ledger(self):
+        FakeHost.entry_config()["max_edits_per_day"] = 5
+        seen = []
+        real_validate = core._validate_proposal
+
+        def record(proposal):
+            seen.append(proposal.get("action"))
+            return real_validate(proposal)
+
+        with patch.object(core, "_validate_proposal", side_effect=record):
+            result = self.run_proposal(multi_proposal(
+                skill_proposal("guarded"), memory_edit("guarded lesson")
+            ))
+        self.assertTrue(result["success"])
+        self.assertEqual(seen, ["create", "create"])
+        self.assertNotIn("multi", [meta["kind"] for meta in ledger.load_stats().values()])
+        self.assertEqual(
+            sorted(entry["proposal"]["action"] for entry in grouped_entries()),
+            ["create", "create"],
+        )
+
+    def test_transaction_drops_a_create_edit_that_omits_content(self):
+        FakeHost.entry_config()["max_edits_per_day"] = 5
+        reply = {
+            "action": "create", "reason": "Repeated failure",
+            "edits": [
+                {"action": "create", "kind": "skill", "name": "kept-edit",
+                 "content": skill_content("kept-edit")},
+                {"action": "create", "kind": "memory", "name": "no-content"},
+            ],
+        }
+        model = MockLlm(reply)
+        result = llm.propose(model, "evidence", [], [])
+        self.assertNotIn("edits", result)
+        self.assertEqual(result["name"], "kept-edit")
+        self.assertEqual(len(model.calls), 1)
 
     def test_patch_selection_without_content_reaches_complete_replacement(self):
         name = "contentless-patch"
