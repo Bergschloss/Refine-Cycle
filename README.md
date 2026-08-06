@@ -1,5 +1,7 @@
 # Refine Cycle
 
+![Refine Cycle — a self-improvement plugin for Hermes Agent](assets/banner.jpg)
+
 **Self-improvement loop for Hermes Agent** — the agent reads its own trajectory,
 finds repeated failures and reusable tactics, then proposes and applies the
 **smallest possible edit** to its skills or memory. Every edit is journaled with
