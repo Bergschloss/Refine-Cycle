@@ -1206,40 +1206,109 @@ class RefineTests(unittest.TestCase):
         self.assertTrue(core.refine_rollback(entry_id)["success"])
         self.assertEqual(FakeHost.skills[name], old)
 
-    def test_a_snapshot_that_fails_its_digest_falls_back_to_the_backup_file(self):
-        name = "digest-mismatch"
-        old = skill_content(name, "# Old\n\nTrue body.")
-        backup = journal.backups_dir() / "digest_skill.bak"
-        backup.write_text(old, encoding="utf-8")
-        entry = {
-            "backup_path": str(backup),
-            "snapshot": {
-                "kind": "skill", "name": name,
-                "before": skill_content(name, "# Old\n\n[REDACTED] body."),
-                "before_sha256": journal._content_digest(old),
-            },
-        }
-        # The stored text no longer hashes to the recorded digest, so the raw
-        # backup wins and redacted text is never written over the user's skill.
-        self.assertEqual(journal.snapshot_before_content(entry), old)
+    def test_the_snapshot_digest_is_taken_from_raw_host_content(self):
+        # The journal scrubs credentials out of everything it writes, so the
+        # digest must come from the real skill content. Digesting the scrubbed
+        # text instead would make a rewritten snapshot verify and let rollback
+        # write redacted text over the user's skill.
+        name = "digest-provenance"
+        secret = "ghp_" + "D" * 36
+        raw = skill_content(name, f"# Body\n\ntoken={secret}")
+        FakeHost.add_skill(name, raw)
+        captured = journal.prepare_skill_recovery(name)
+        self.assertEqual(
+            captured["snapshot"]["before_sha256"], journal._content_digest(raw)
+        )
+        self.assertNotEqual(
+            captured["snapshot"]["before_sha256"],
+            journal._content_digest(core.scrub_text(raw)),
+        )
+        # The raw backup file still holds restorable content.
+        self.assertEqual(Path(captured["backup_path"]).read_text(encoding="utf-8"), raw)
 
-    def test_patch_rollback_fails_clearly_when_no_recovery_source_survives(self):
+    def test_a_scrubbed_snapshot_is_refused_in_favour_of_the_backup_file(self):
+        name = "digest-mismatch"
+        secret = "ghp_" + "M" * 36
+        raw = skill_content(name, f"# Old\n\ntoken={secret}")
+        new = skill_content(name, "# Old\n\nPatched.")
+        FakeHost.add_skill(name, raw)
+        captured = journal.prepare_skill_recovery(name)
+        entry_id = journal.log(
+            trigger="manual", reason="scrub-unstable", session_id="session",
+            proposal={
+                "action": "patch", "kind": "skill", "name": name,
+                "content": new, "reason": "why", "evidence": [],
+            },
+            outcome="applied", backup_path=captured["backup_path"],
+            recovery={"type": "skill_patch", "name": name},
+            snapshot=captured["snapshot"],
+        )
+        FakeHost.add_skill(name, new)
+        stored = journal.get_entry(entry_id)
+        # The journal write redacted the snapshot, so it no longer matches its
+        # digest and must not be trusted as a restore source.
+        self.assertNotIn(secret, stored["snapshot"]["before"])
+        # Restoring the snapshot would write redacted text; the raw backup wins.
+        self.assertEqual(journal.snapshot_before_content(stored), raw)
+        self.assertTrue(core.refine_rollback(entry_id)["success"])
+        self.assertEqual(FakeHost.skills[name], raw)
+
+    def test_an_unrestorable_patch_is_not_advertised_as_reversible(self):
         name = "no-recovery"
-        old = skill_content(name, "# Old\n\nBody.")
-        new = skill_content(name, "# Old\n\nBody.\n\nPatched.")
+        secret = "ghp_" + "N" * 36
+        raw = skill_content(name, f"# Old\n\ntoken={secret}")
+        new = skill_content(name, "# Old\n\nPatched.")
+        FakeHost.add_skill(name, raw)
+        captured = journal.prepare_skill_recovery(name)
+        entry_id = journal.log(
+            trigger="manual", reason="scrub-unstable", session_id="session",
+            proposal={
+                "action": "patch", "kind": "skill", "name": name,
+                "content": new, "reason": "why", "evidence": [],
+            },
+            outcome="applied", backup_path=captured["backup_path"],
+            recovery={"type": "skill_patch", "name": name},
+            snapshot=captured["snapshot"],
+        )
+        FakeHost.add_skill(name, new)
+        Path(captured["backup_path"]).unlink()
+        stored = journal.get_entry(entry_id)
+        # Neither source survives, so reversibility and restorability must agree
+        # instead of promising a rollback that then refuses.
+        self.assertFalse(journal.is_reversible(stored))
+        self.assertIsNone(journal.snapshot_before_content(stored))
+        failed = core.refine_rollback(entry_id)
+        self.assertFalse(failed["success"])
+        self.assertEqual(FakeHost.skills[name], new)
+
+    def test_staged_patch_rollback_reconciles_through_the_snapshot(self):
+        name = "staged-snapshot"
+        old = skill_content(name, "# Old\n\nRestore me.")
+        new = skill_content(name, "# Old\n\nRestore me.\n\nFixed.")
         FakeHost.add_skill(name, old)
         result = self.run_proposal({
             "action": "patch", "kind": "skill", "name": name,
             "content": new, "reason": "failure", "evidence": [],
         })
-        Path(result["backup_path"]).unlink()
-        stripped = dict(journal.get_entry(result["journal_id"]))
-        stripped.pop("snapshot")
-        with patch.object(journal, "get_entry", return_value=stripped):
-            failed = journal.rollback_skill(result["journal_id"])
-        self.assertFalse(failed["success"])
-        self.assertIn("no verified", failed["error"])
         self.assertEqual(FakeHost.skills[name], new)
+
+        # Losing the backup file must not stop a staged rollback from being
+        # proven once the host approves it.
+        Path(result["backup_path"]).unlink()
+        FakeHost.stage_writes = True
+        staged = core.refine_rollback(result["journal_id"])
+        self.assertTrue(staged["staged"])
+        entry = journal.get_entry(result["journal_id"])
+        self.assertEqual(entry["outcome"], "pending_rollback")
+        self.assertEqual(FakeHost.skills[name], new)
+
+        FakeHost.approve_pending("skills", entry["pending_id"])
+        FakeHost.stage_writes = False
+        core.refine_audit()
+        self.assertEqual(FakeHost.skills[name], old)
+        self.assertEqual(
+            journal.get_entry(result["journal_id"])["outcome"], "rolled_back"
+        )
 
     def test_memory_rollback_removes_exact_append_only(self):
         FakeHost.memory_entries[:] = ["before"]

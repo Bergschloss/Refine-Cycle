@@ -798,7 +798,7 @@ def _apply_edit(
     recovery: Dict[str, Any] = {}
     prompt_note: Optional[Dict[str, str]] = None
     if kind == "skill" and action == "patch":
-        captured = journal.prepare_skill_recovery(name, proposal.get("content", ""))
+        captured = journal.prepare_skill_recovery(name)
         if captured is None:
             error = f"Cannot create durable backup for skill '{name}'; mutation aborted"
             _journal_nonmutation(
