@@ -513,6 +513,46 @@ class RefineTests(unittest.TestCase):
         self.assertTrue(genuine_noop["success"])
         self.assertEqual(journal.get_entry(genuine_noop["journal_id"])["outcome"], "no_op")
 
+    def test_reasoning_only_reply_and_reviewer_decline_are_distinct(self):
+        with self.assertLogs(llm.logger, "WARNING") as proposal_logs:
+            proposal = core.refine_run(MockLlm(MockResult(
+                None, text="", output_tokens=800, model="reasoning-test-model"
+            )))
+        self.assertFalse(proposal["success"])
+        self.assertEqual(proposal["failure"], "no_final_text")
+        self.assertIn("only reasoning", proposal["message"].lower())
+        self.assertIn("reasoning-test-model", "\n".join(proposal_logs.output))
+        self.assertFalse(FakeHost.actions)
+
+        now = time.time()
+        FakeHost.make_db([
+            ("session", "user", f"Routine context {index}", "", now - index, 1)
+            for index in range(20)
+        ])
+        FakeHost.entry_config().update({
+            "min_signal_required": True,
+            "reviewer_fallback_enabled": True,
+            "reviewer_min_messages": 20,
+        })
+        reviewer_model = MockLlm(MockResult(
+            None, text="", output_tokens=200, model="reviewer-reasoning-model"
+        ))
+        with self.assertLogs(llm.logger, "WARNING") as reviewer_logs:
+            reviewer_result = core.refine_run(reviewer_model)
+        self.assertTrue(reviewer_result["success"])
+        self.assertEqual(reviewer_result["reviewer"], "declined")
+        self.assertEqual(len(reviewer_model.calls), 1)
+        self.assertIn("no final answer", reviewer_result["message"].lower())
+        self.assertIn("reviewer-reasoning-model", "\n".join(reviewer_logs.output))
+        self.assertEqual(
+            journal.get_entry(reviewer_result["journal_id"])["outcome"], "no_op"
+        )
+
+        empty_without_output = llm.propose(
+            MockLlm(MockResult(None, text="", output_tokens=0)), "evidence", [], []
+        )
+        self.assertEqual(empty_without_output["failure"], "malformed")
+
     def test_skill_patch_gets_current_complete_content(self):
         name = "existing-skill"
         current = skill_content(name, "# Existing\n\nImportant old guidance.")

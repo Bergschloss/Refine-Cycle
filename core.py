@@ -617,7 +617,9 @@ def _refine_once(
         failure_messages = {
             "truncated": "The refine proposal was cut off before it completed.",
             "malformed": "The refine proposal was malformed and could not be read.",
-            "no_final_text": "The model returned no final refine proposal.",
+            "no_final_text": (
+                "The model returned only reasoning and no final refine proposal."
+            ),
         }
         failure_message = failure_messages.get(
             failure, "The refine proposal could not be completed."
