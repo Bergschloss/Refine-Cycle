@@ -509,6 +509,60 @@ def _apply_prompt_note(note: Dict[str, str]) -> Dict[str, Any]:
     return journal.add_prompt_note(note)
 
 
+def _skill_baseline_conflict(
+    proposal: Dict[str, Any], observed_sha: str = ""
+) -> Optional[str]:
+    """Return a conflict message when the patch target no longer matches planning.
+
+    Returns None (no conflict) when:
+      - baseline is absent or not a dict (legacy proposal without baseline);
+      - baseline has invalid structure (logged but not treated as conflict).
+
+    Returns an error string when the current state diverges from the planning
+    baseline, meaning the model's replacement was built from stale content.
+    """
+    import re as _re
+
+    baseline = proposal.get("refine_baseline")
+    if not isinstance(baseline, dict):
+        return None  # Legacy proposal without baseline — today's behaviour unchanged.
+    exists = baseline.get("exists")
+    sha = str(baseline.get("sha256", ""))
+    if exists is not True or not _re.fullmatch(r"[0-9a-f]{64}", sha):
+        logger.warning(
+            "Ignoring malformed refine_baseline in proposal for '%s'",
+            proposal.get("name", ""),
+        )
+        return None
+    name = str(proposal.get("name", ""))
+    if observed_sha:
+        # Check B: compare against the sha from prepare_skill_recovery snapshot.
+        if observed_sha != sha:
+            return (
+                f"Skill '{name}': entry changed during refinement planning "
+                f"(baseline {sha[:12]}… vs current {observed_sha[:12]}…)"
+            )
+        return None
+    # Check A: read current state from host before backup.
+    current = journal.skill_baseline(name)
+    if current is None:
+        return (
+            f"Skill '{name}': entry changed during refinement planning "
+            "(cannot confirm target state)"
+        )
+    if not current.get("exists"):
+        return (
+            f"Skill '{name}': entry changed during refinement planning "
+            "(target was deleted after planning)"
+        )
+    if current["sha256"] != sha:
+        return (
+            f"Skill '{name}': entry changed during refinement planning "
+            f"(baseline {sha[:12]}… vs current {current['sha256'][:12]}…)"
+        )
+    return None
+
+
 def _journal_nonmutation(**kwargs: Any) -> Optional[str]:
     try:
         return journal.log(**kwargs)
@@ -798,6 +852,28 @@ def _apply_edit(
     recovery: Dict[str, Any] = {}
     prompt_note: Optional[Dict[str, str]] = None
     if kind == "skill" and action == "patch":
+        # Check A: refuse before backup if planning baseline is stale.
+        conflict_a = _skill_baseline_conflict(proposal)
+        if conflict_a:
+            entry_id = _journal_nonmutation(
+                trigger=trigger,
+                reason=safe_reason,
+                session_id=session,
+                proposal=proposal,
+                outcome="conflict",
+                error=conflict_a,
+                group=group,
+            )
+            result = {
+                "success": False,
+                "message": conflict_a,
+                "proposal": proposal,
+                "reversible": False,
+                "edits_applied": 0,
+            }
+            if entry_id:
+                result["record_id"] = entry_id
+            return result
         captured = journal.prepare_skill_recovery(name)
         if captured is None:
             error = f"Cannot create durable backup for skill '{name}'; mutation aborted"
@@ -817,6 +893,30 @@ def _apply_edit(
                 "reversible": False,
                 "edits_applied": 0,
             }
+        # Check B: verify the snapshot digest matches baseline (zero-window).
+        conflict_b = _skill_baseline_conflict(
+            proposal, observed_sha=captured["snapshot"]["before_sha256"]
+        )
+        if conflict_b:
+            entry_id = _journal_nonmutation(
+                trigger=trigger,
+                reason=safe_reason,
+                session_id=session,
+                proposal=proposal,
+                outcome="conflict",
+                error=conflict_b,
+                group=group,
+            )
+            result = {
+                "success": False,
+                "message": conflict_b,
+                "proposal": proposal,
+                "reversible": False,
+                "edits_applied": 0,
+            }
+            if entry_id:
+                result["record_id"] = entry_id
+            return result
         backup_path = str(captured["backup_path"])
         snapshot = captured["snapshot"]
         recovery = {"type": "skill_patch", "name": name}
@@ -1094,6 +1194,60 @@ def _apply_transaction(
 
     results: List[Dict[str, Any]] = []
     stop_reason = ""
+
+    # ── Stale-plan preflight: reject the entire transaction if any skill patch
+    # was built from content that no longer matches the live host state. This
+    # prevents a partial apply where edit #1 succeeds but edit #2 would conflict.
+    stale_edits: List[int] = []
+    for index, edit in enumerate(edits):
+        normalized = edit_proposal(edit)
+        if (
+            normalized.get("kind") == "skill"
+            and normalized.get("action") == "patch"
+            and isinstance(normalized.get("refine_baseline"), dict)
+        ):
+            conflict = _skill_baseline_conflict(normalized)
+            if conflict:
+                stale_edits.append(index)
+    if stale_edits:
+        conflict_msg = (
+            f"Transaction rejected: entry changed during refinement planning "
+            f"(stale edit(s) at index {stale_edits})"
+        )
+        for index, edit in enumerate(edits):
+            normalized = edit_proposal(edit)
+            if index in stale_edits:
+                _journal_nonmutation(
+                    trigger=trigger,
+                    reason=safe_reason,
+                    session_id=session,
+                    proposal=normalized,
+                    outcome="conflict",
+                    error=conflict_msg,
+                    group=edit_group(index),
+                )
+            else:
+                _journal_nonmutation(
+                    trigger=trigger,
+                    reason=safe_reason,
+                    session_id=session,
+                    proposal=normalized,
+                    outcome="rejected",
+                    error=conflict_msg,
+                    group=edit_group(index),
+                )
+        return {
+            "success": False,
+            "outcome": "failed",
+            "message": conflict_msg,
+            "proposal": proposal,
+            "results": [],
+            "recoveries": [],
+            "journal_ids": [],
+            "reversible": False,
+            "edits_applied": 0,
+        }
+
     for index, edit in enumerate(edits):
         # Re-read the durable budget between edits: it counts edits, so a long
         # transaction can legitimately exhaust it part way through.
