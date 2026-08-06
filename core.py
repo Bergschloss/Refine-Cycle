@@ -2,10 +2,12 @@
 
 import json
 import logging
+import os
 import re
 import sqlite3
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.plugin_llm import PluginLlm
@@ -339,6 +341,74 @@ def _reconcile_pending() -> List[Dict[str, Any]]:
         except Exception as exc:
             logger.warning("Cannot mirror reconciled state in ledger: %s", scrub_text(str(exc)))
     return changed
+
+
+def refine_status() -> Dict[str, Any]:
+    """Report why automatic refinement will or will not run. Read-only."""
+    auto = config.auto_enabled()
+    interval = config.auto_turn_interval()
+    min_msgs = config.auto_min_messages()
+    cooldown_minutes = config.auto_cooldown_minutes()
+    max_edits = config.max_edits_per_day()
+    edits_today = journal.count_today_applied()
+    last_ts = journal.last_attempt_ts()
+    jdir = config.journal_dir()
+
+    cooldown_remaining = 0.0
+    if last_ts is not None:
+        elapsed = time.time() - last_ts
+        remaining = cooldown_minutes * 60 - elapsed
+        if remaining > 0:
+            cooldown_remaining = remaining / 60
+
+    jdir_writable = False
+    try:
+        jdir.mkdir(parents=True, exist_ok=True)
+        jdir_writable = os.access(str(jdir), os.W_OK)
+    except Exception:
+        pass
+
+    jdir_is_plugin_source = False
+    try:
+        plugin_yaml = jdir / "plugin.yaml"
+        jdir_is_plugin_source = plugin_yaml.is_file()
+    except Exception:
+        pass
+
+    blockers: List[str] = []
+    if not auto:
+        blockers.append("Автоматичний режим вимкнений у налаштуваннях")
+    if interval <= 0:
+        blockers.append("Тригер за ходами вимкнений (interval=0)")
+    if edits_today >= max_edits:
+        blockers.append("Денний ліміт правок уже використаний")
+    if cooldown_remaining > 0:
+        blockers.append(f"Ще діє пауза між спробами ({cooldown_remaining:.0f} хв)")
+    if not jdir_writable:
+        blockers.append("Немає доступу до папки журналу")
+
+    warnings: List[str] = []
+    if jdir_is_plugin_source:
+        warnings.append(
+            "Папка журналу збігається з папкою коду плагіна — "
+            "hermes plugins install --force може видалити журнал"
+        )
+
+    return {
+        "auto_enabled": auto,
+        "auto_turn_interval": interval,
+        "auto_min_messages": min_msgs,
+        "auto_cooldown_minutes": cooldown_minutes,
+        "last_attempt_ts": last_ts,
+        "cooldown_remaining_minutes": round(cooldown_remaining, 1),
+        "edits_today": edits_today,
+        "max_edits_per_day": max_edits,
+        "journal_dir": str(jdir),
+        "journal_dir_writable": jdir_writable,
+        "journal_dir_is_plugin_source": jdir_is_plugin_source,
+        "blockers": blockers,
+        "warnings": warnings,
+    }
 
 
 def refine_audit() -> Dict[str, Any]:
@@ -893,17 +963,32 @@ def _apply_edit(
                 "reversible": False,
                 "edits_applied": 0,
             }
-        # Check B: verify the snapshot digest matches baseline (zero-window).
+        # Check B: verify the backup snapshot came from the planning baseline.
         conflict_b = _skill_baseline_conflict(
             proposal, observed_sha=captured["snapshot"]["before_sha256"]
         )
         if conflict_b:
+            # The recovery capture wrote a raw backup before discovering the
+            # conflict. A conflict is never reversible, so remove that copy;
+            # if cleanup fails, retain its path in the journal for auditability.
+            conflict_backup = Path(str(captured["backup_path"]))
+            retained_backup_path = ""
+            try:
+                conflict_backup.unlink(missing_ok=True)
+            except OSError as exc:
+                retained_backup_path = str(conflict_backup)
+                logger.warning(
+                    "Cannot remove unused conflict backup for skill '%s': %s",
+                    name,
+                    scrub_text(str(exc)),
+                )
             entry_id = _journal_nonmutation(
                 trigger=trigger,
                 reason=safe_reason,
                 session_id=session,
                 proposal=proposal,
                 outcome="conflict",
+                backup_path=retained_backup_path,
                 error=conflict_b,
                 group=group,
             )

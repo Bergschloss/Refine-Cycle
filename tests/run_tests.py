@@ -205,7 +205,7 @@ def install_fake_host():
         "skills": [{"name": name} for name in sorted(FakeHost.skills)]
     })
 
-    def skill_view(name):
+    def skill_view(name, preprocess=True):
         if name not in FakeHost.skills:
             return json.dumps({"success": False, "error": "not found"})
         return json.dumps({
@@ -2776,7 +2776,7 @@ def skills_list():
     if skills_root.is_dir():
         values = [{"name": child.name} for child in skills_root.iterdir() if child.is_dir()]
     return json.dumps({"skills": values})
-def skill_view(skill_name):
+def skill_view(skill_name, preprocess=True):
     path = skill_path(skill_name)
     if not path.is_file():
         return json.dumps({"success": False, "error": "not found"})
@@ -2894,6 +2894,32 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
         import hashlib
         expected_sha = hashlib.sha256(body.encode("utf-8", "replace")).hexdigest()
         self.assertEqual(result["sha256"], expected_sha)
+
+    def test_skill_state_reads_disable_host_preprocessing(self):
+        name = "baseline-raw"
+        raw_content = skill_content(name, "# Literal !`dynamic command`")
+        rendered_content = raw_content + "\n\nrendered-at-a-different-time"
+        preprocess_values = []
+
+        def dynamic_skill_view(skill_name, preprocess=True):
+            self.assertEqual(skill_name, name)
+            preprocess_values.append(preprocess)
+            return json.dumps({
+                "success": True,
+                "content": rendered_content if preprocess else raw_content,
+            })
+
+        skills_module = sys.modules["tools.skills_tool"]
+        with patch.object(skills_module, "skill_view", side_effect=dynamic_skill_view):
+            self.assertEqual(journal.read_skill_content(name), raw_content)
+            baseline = journal.skill_baseline(name)
+
+        import hashlib
+        expected_sha = hashlib.sha256(
+            raw_content.encode("utf-8", "replace")
+        ).hexdigest()
+        self.assertEqual(baseline, {"exists": True, "sha256": expected_sha})
+        self.assertEqual(preprocess_values, [False, False])
 
     def test_skill_baseline_absent_skill_returns_exists_false(self):
         result = journal.skill_baseline("nonexistent-skill")
@@ -3038,6 +3064,48 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
         # Budget NOT consumed
         self.assertEqual(journal.count_today_applied(), 0)
 
+    def test_conflict_after_backup_removes_backup(self):
+        name = "conflict-after-backup"
+        original = skill_content(name, "# Original guidance")
+        replacement = skill_content(name, "# Original guidance\n\nFix.")
+        external_content = skill_content(name, "# Externally modified")
+        FakeHost.add_skill(name, original)
+        initial = {
+            "action": "patch", "kind": "skill", "name": name,
+            "content": "stub", "reason": "failure", "evidence": [],
+            "pattern_fingerprint": "deadbeef1234",
+        }
+        proposal = llm.propose(
+            MockLlm(initial, dict(initial, content=replacement)),
+            "evidence", [name], [],
+            skill_content_loader=journal.read_skill_content,
+        )
+        real_prepare = journal.prepare_skill_recovery
+
+        def prepare_after_external_change(skill_name):
+            FakeHost.add_skill(skill_name, external_content)
+            return real_prepare(skill_name)
+
+        with patch.object(
+            journal,
+            "prepare_skill_recovery",
+            side_effect=prepare_after_external_change,
+        ):
+            result = core._apply_edit(
+                proposal, trigger="manual", safe_reason="test",
+                session="session", started=time.time()
+            )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(FakeHost.skills[name], external_content)
+        conflict = next(
+            entry for entry in journal.entries()
+            if entry.get("outcome") == "conflict"
+        )
+        retained_path = conflict.get("backup_path", "")
+        self.assertFalse(retained_path and Path(retained_path).exists())
+        self.assertEqual(list(journal.backups_dir().glob("*.bak")), [])
+
     def test_external_deletion_is_conflict_not_backup_failure(self):
         name = "conflict-del"
         original = skill_content(name, "# Will be deleted")
@@ -3176,6 +3244,86 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
         result = core.refine_run(model)
         self.assertFalse(result["success"])
         self.assertIn("entry changed during refinement planning", result["message"])
+
+    # ── Autostart / status tests ──────────────────────────────────────────────
+
+    def test_status_reports_blockers_when_auto_disabled(self):
+        with patch.object(config, "auto_enabled", return_value=False):
+            status = core.refine_status()
+        self.assertFalse(status["auto_enabled"])
+        self.assertTrue(any("вимкнений" in b for b in status["blockers"]))
+
+    def test_status_reports_no_blockers_when_ready(self):
+        status = core.refine_status()
+        self.assertTrue(status["auto_enabled"])
+        # Fresh journal, no cooldown, budget free → no blockers
+        self.assertEqual(status["blockers"], [])
+
+    def test_status_reports_budget_exhausted(self):
+        # Temporarily lower budget to 1 and exhaust it
+        FakeHost.entry_config()["max_edits_per_day"] = 1
+        result = self.run_proposal(skill_proposal("status-budget-test"))
+        self.assertTrue(result["success"])
+        status = core.refine_status()
+        self.assertEqual(status["edits_today"], 1)
+        self.assertGreater(len(status["blockers"]), 0)
+
+    def test_status_does_not_create_journal_entries(self):
+        before = len(journal.entries())
+        core.refine_status()
+        self.assertEqual(len(journal.entries()), before)
+
+    def test_status_does_not_call_model(self):
+        with patch.object(core, "refine_run", side_effect=AssertionError("model called")):
+            core.refine_status()  # should not raise
+
+    def test_status_command_returns_text_not_dict(self):
+        result = plugin_init._handle_refine_command("status")
+        self.assertIsInstance(result, str)
+        self.assertIn("auto:", result)
+
+    def test_status_as_reason_word_goes_to_proposal(self):
+        with patch.object(plugin_init.core, "refine_run", return_value={
+            "success": True, "message": "done", "outcome": "no_op",
+        }) as run:
+            plugin_init._handle_refine_command("status of gmail failures")
+        run.assert_called_once()
+        self.assertEqual(run.call_args.kwargs["reason"], "status of gmail failures")
+
+    def test_journal_dir_collision_warning(self):
+        # Place a plugin.yaml in journal_dir to simulate collision
+        jdir = Path(config.journal_dir())
+        jdir.mkdir(parents=True, exist_ok=True)
+        (jdir / "plugin.yaml").write_text("name: refine\n", encoding="utf-8")
+        status = core.refine_status()
+        self.assertTrue(status["journal_dir_is_plugin_source"])
+        self.assertTrue(len(status["warnings"]) > 0)
+
+    def test_register_warns_on_collision(self):
+        jdir = Path(config.journal_dir())
+        jdir.mkdir(parents=True, exist_ok=True)
+        (jdir / "plugin.yaml").write_text("name: refine\n", encoding="utf-8")
+        plugin_init._REGISTER_WARNED = False
+        # The logger name when imported directly is __init__
+        with self.assertLogs(level="WARNING") as cm:
+            plugin_init._warn_on_register()
+        self.assertTrue(any("journal_dir" in msg for msg in cm.output))
+        # Second call does not warn again due to the flag
+        self.assertTrue(plugin_init._REGISTER_WARNED)
+
+    def test_register_does_not_warn_without_collision(self):
+        plugin_init._REGISTER_WARNED = False
+        # No plugin.yaml in journal_dir — should not log a warning at our level
+        try:
+            with self.assertLogs(level="WARNING"):
+                plugin_init._warn_on_register()
+            self.fail("Should not have logged a warning without collision")
+        except AssertionError as exc:
+            if "no logs" not in str(exc).lower():
+                raise
+
+    def test_auto_enabled_defaults_to_true(self):
+        self.assertTrue(config.auto_enabled())
 
 
 if __name__ == "__main__":

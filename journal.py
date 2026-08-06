@@ -673,7 +673,10 @@ def _read_skill_state(name: str) -> tuple:
     from tools.skills_tool import skill_view
 
     try:
-        raw = skill_view(name)
+        # Baselines and backups must use literal SKILL.md bytes. The host's
+        # default preprocessing can render inline shell directives, producing
+        # changing content and executing commands on every guard read.
+        raw = skill_view(name, preprocess=False)
         result = raw if isinstance(raw, dict) else json.loads(raw)
     except Exception as exc:
         logger.warning("Cannot view skill '%s': %s", name, scrub_text(str(exc)))
