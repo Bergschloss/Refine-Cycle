@@ -715,6 +715,27 @@ def _content_digest(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8", "replace")).hexdigest()
 
 
+def content_digest(content: str) -> str:
+    """Public wrapper over the internal digest used by planning baseline capture."""
+    return _content_digest(content)
+
+
+def skill_baseline(name: str) -> Optional[Dict[str, Any]]:
+    """Return the current skill identity for planning-baseline comparison.
+
+    Returns:
+        None — host state is unknown (read error); cannot confirm or deny.
+        {"exists": False, "sha256": ""} — skill definitively does not exist.
+        {"exists": True, "sha256": "<hex>"} — skill exists with this content digest.
+    """
+    known, content = _read_skill_state(name)
+    if not known:
+        return None
+    if content is None:
+        return {"exists": False, "sha256": ""}
+    return {"exists": True, "sha256": _content_digest(content)}
+
+
 def prepare_skill_recovery(name: str) -> Optional[Dict[str, Any]]:
     """Capture a skill's pre-edit state as a journal snapshot and a backup file.
 

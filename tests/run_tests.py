@@ -1751,7 +1751,7 @@ class RefineTests(unittest.TestCase):
         self.assertIn("Daily edit limit reached", skipped["error"])
         self.assertEqual(skipped["group"]["index"], 1)
 
-    def test_transaction_edits_are_capped_and_duplicate_targets_collapse(self):
+    def test_transaction_edits_are_capped_and_duplicate_targets_are_reported(self):
         reply = {
             "action": "create", "reason": "Repeated failure",
             "expected_outcome": "The repeated failure stops.",
@@ -1768,10 +1768,13 @@ class RefineTests(unittest.TestCase):
         }
         FakeHost.entry_config()["max_edits_per_proposal"] = 2
         capped = llm.propose(MockLlm(reply), "evidence", [], [])
-        # The duplicate target is dropped and the third edit is past the cap, so a
-        # transaction of one collapses back to the ordinary single-edit shape.
-        self.assertNotIn("edits", capped)
-        self.assertEqual((capped["action"], capped["name"]), ("create", "capped-one"))
+        # The duplicate target is dropped and the third edit is past the cap.
+        # Preserve that loss so applying the remaining edit reports a partial
+        # transaction instead of silently claiming the inseparable set landed.
+        self.assertEqual(capped["action"], "multi")
+        self.assertEqual(len(capped["edits"]), 1)
+        self.assertEqual(capped["edits"][0]["name"], "capped-one")
+        self.assertEqual(capped["dropped_edits"], 2)
         self.assertEqual(capped["expected_outcome"], "The repeated failure stops.")
 
         FakeHost.entry_config()["max_edits_per_proposal"] = 3
@@ -1936,7 +1939,7 @@ class RefineTests(unittest.TestCase):
             ["create", "create"],
         )
 
-    def test_transaction_drops_a_create_edit_that_omits_content(self):
+    def test_transaction_reports_a_create_edit_dropped_for_missing_content(self):
         FakeHost.entry_config()["max_edits_per_day"] = 5
         reply = {
             "action": "create", "reason": "Repeated failure",
@@ -1947,10 +1950,19 @@ class RefineTests(unittest.TestCase):
             ],
         }
         model = MockLlm(reply)
-        result = llm.propose(model, "evidence", [], [])
-        self.assertNotIn("edits", result)
-        self.assertEqual(result["name"], "kept-edit")
+        proposal = llm.propose(model, "evidence", [], [])
+        self.assertEqual(proposal["action"], "multi")
+        self.assertEqual(len(proposal["edits"]), 1)
+        self.assertEqual(proposal["edits"][0]["name"], "kept-edit")
+        self.assertEqual(proposal["dropped_edits"], 1)
         self.assertEqual(len(model.calls), 1)
+
+        result = self.run_proposal(proposal)
+        self.assertFalse(result["success"])
+        self.assertEqual(result["outcome"], "partial_success")
+        self.assertEqual(result["edits_applied"], 1)
+        self.assertIn("discarded before apply", result["message"])
+        self.assertEqual(grouped_entries()[0]["group"]["dropped"], 1)
 
     def test_patch_selection_without_content_reaches_complete_replacement(self):
         name = "contentless-patch"
@@ -2868,6 +2880,32 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
         self.assertEqual(
             len(list((self.root / "driver-skills").glob("*/SKILL.md"))), 1
         )
+
+
+    # ── Phase 1: skill_baseline tests ─────────────────────────────────────────
+
+    def test_skill_baseline_existing_skill_returns_digest(self):
+        name = "baseline-existing"
+        body = skill_content(name, "# Current guidance\n\nSome text.")
+        FakeHost.add_skill(name, body)
+        result = journal.skill_baseline(name)
+        self.assertIsNotNone(result)
+        self.assertTrue(result["exists"])
+        import hashlib
+        expected_sha = hashlib.sha256(body.encode("utf-8", "replace")).hexdigest()
+        self.assertEqual(result["sha256"], expected_sha)
+
+    def test_skill_baseline_absent_skill_returns_exists_false(self):
+        result = journal.skill_baseline("nonexistent-skill")
+        self.assertIsNotNone(result)
+        self.assertFalse(result["exists"])
+        self.assertEqual(result["sha256"], "")
+
+    def test_skill_baseline_host_failure_returns_none(self):
+        skills_module = sys.modules["tools.skills_tool"]
+        with patch.object(skills_module, "skill_view", side_effect=OSError("host down")):
+            result = journal.skill_baseline("any-skill")
+        self.assertIsNone(result)
 
 
 if __name__ == "__main__":
