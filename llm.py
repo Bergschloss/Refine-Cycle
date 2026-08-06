@@ -34,11 +34,9 @@ _PROPOSAL_ENVELOPE_TOKENS = 1024
 def _pinned_target() -> Dict[str, str]:
     """Provider/model to request, when the config pins them.
 
-    Hermes resolves the model inside its own ``call_llm`` and gives plugins no
-    access to the model a session switched to, so an explicitly pinned target
-    is the only way to control which model refine uses. Omitted keys leave the
-    host default in place; the host's trust gate still decides whether a
-    request is honored.
+    Omitted keys leave resolution to Hermes, which prefers the live main model.
+    A pinned value makes the target deterministic instead; the host's trust
+    gate still decides whether the request is honored.
     """
     target: Dict[str, str] = {}
     provider = config.llm_provider()
