@@ -88,14 +88,17 @@ def _try_clear_stale_lock(path: Path) -> None:
 
 
 @contextmanager
-def mutation_lock(timeout: float = 30.0) -> Iterator[None]:
-    """Serialize refine mutations across threads and processes."""
-    with _THREAD_LOCK:
+def _acquire_mutation_lock(*, wait: bool, timeout: float = 0.0) -> Iterator[bool]:
+    """Acquire the re-entrant thread/process lock, optionally without waiting."""
+    if not _THREAD_LOCK.acquire(blocking=wait):
+        yield False
+        return
+    try:
         depth = getattr(_LOCK_STATE, "depth", 0)
         if depth:
             _LOCK_STATE.depth = depth + 1
             try:
-                yield
+                yield True
             finally:
                 _LOCK_STATE.depth -= 1
             return
@@ -115,13 +118,27 @@ def mutation_lock(timeout: float = 30.0) -> Iterator[None]:
                 break
             except FileExistsError:
                 _try_clear_stale_lock(lock_path)
+                if not wait:
+                    try:
+                        fd = os.open(
+                            str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+                        )
+                    except FileExistsError:
+                        yield False
+                        return
+                    try:
+                        os.write(fd, payload.encode("utf-8"))
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
+                    break
                 if time.monotonic() >= deadline:
                     raise TimeoutError(f"Timed out waiting for refine mutation lock: {lock_path}")
                 time.sleep(0.05)
 
         _LOCK_STATE.depth = 1
         try:
-            yield
+            yield True
         finally:
             _LOCK_STATE.depth = 0
             try:
@@ -132,6 +149,24 @@ def mutation_lock(timeout: float = 30.0) -> Iterator[None]:
                 pass
             except Exception as exc:
                 logger.warning("Could not release refine mutation lock: %s", scrub_text(str(exc)))
+    finally:
+        _THREAD_LOCK.release()
+
+
+@contextmanager
+def mutation_lock(timeout: float = 30.0) -> Iterator[None]:
+    """Serialize refine mutations across threads and processes."""
+    with _acquire_mutation_lock(wait=True, timeout=timeout) as acquired:
+        if not acquired:  # Defensive: blocking acquisition always either succeeds or raises.
+            raise TimeoutError("Timed out waiting for refine mutation lock")
+        yield
+
+
+@contextmanager
+def try_mutation_lock() -> Iterator[bool]:
+    """Attempt mutation serialization once, without queueing behind another owner."""
+    with _acquire_mutation_lock(wait=False) as acquired:
+        yield acquired
 
 
 # ── durable file I/O ───────────────────────────────────────────────────────
@@ -187,6 +222,21 @@ def _load_entries() -> List[Dict[str, Any]]:
 def entries() -> List[Dict[str, Any]]:
     """Return the latest durable state of each logical journal record."""
     return _load_entries()
+
+
+def last_attempt_ts(trigger: Optional[str] = None) -> Optional[float]:
+    """Return the most recent durable attempt timestamp, optionally by trigger."""
+    latest: Optional[float] = None
+    for entry in _load_entries():
+        if trigger is not None and entry.get("trigger") != trigger:
+            continue
+        try:
+            timestamp = float(entry.get("ts"))
+        except (TypeError, ValueError):
+            continue
+        if latest is None or timestamp > latest:
+            latest = timestamp
+    return latest
 
 
 def _append_entry(entry: Dict[str, Any]) -> None:

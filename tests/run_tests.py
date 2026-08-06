@@ -9,6 +9,7 @@ import importlib.util
 import inspect
 import json
 import shutil
+from contextlib import contextmanager
 import sqlite3
 import sys
 import tempfile
@@ -985,6 +986,216 @@ class RefineTests(unittest.TestCase):
         )
         self.assertEqual(sum(item["count"] for item in found), 1000)
         self.assertLessEqual(len(found), 20)
+
+    def test_auto_config_supports_disabled_interval(self):
+        self.assertEqual(config.auto_turn_interval(), 25)
+        self.assertEqual(config.auto_cooldown_minutes(), 20)
+        FakeHost.entry_config()["auto_turn_interval"] = 0
+        self.assertEqual(config.auto_turn_interval(), 0)
+        FakeHost.entry_config()["auto_turn_interval"] = -3
+        self.assertEqual(config.auto_turn_interval(), 0)
+
+    def test_post_llm_hook_uses_turn_boundaries_and_honors_disabled_setting(self):
+        FakeHost.entry_config().update({"auto_enabled": True, "auto_turn_interval": 3})
+        history = [{"role": "assistant"}] * 4
+        called = threading.Event()
+
+        def run(**kwargs):
+            called.set()
+            return {"success": True}
+
+        with patch.object(plugin_init.core, "refine_run", side_effect=run) as refine:
+            plugin_init._on_post_llm_call("session", history[:2])
+            self.assertFalse(called.wait(0.05))
+            plugin_init._on_post_llm_call("session", history[:3])
+            self.assertTrue(called.wait(1))
+            deadline = time.monotonic() + 1
+            while plugin_init._AUTO_THREAD_GUARD.locked() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertFalse(plugin_init._AUTO_THREAD_GUARD.locked())
+            plugin_init._on_post_llm_call("session", history)
+            time.sleep(0.05)
+            self.assertEqual(refine.call_count, 1)
+            FakeHost.entry_config()["auto_turn_interval"] = 0
+            plugin_init._on_post_llm_call("session", history * 2)
+        self.assertEqual(refine.call_count, 1)
+
+    def test_auto_cooldown_reads_preexisting_durable_journal_record(self):
+        FakeHost.entry_config().update({"auto_enabled": True, "auto_turn_interval": 1})
+        journal.log(
+            trigger="manual", reason="earlier", session_id="session",
+            proposal={"action": "no_op"}, outcome="no_op",
+        )
+        self.assertIsNotNone(journal.last_attempt_ts())
+        with patch.object(plugin_init.core, "refine_run") as refine:
+            plugin_init._on_post_llm_call("session", [{"role": "assistant"}])
+        refine.assert_not_called()
+        self.assertFalse(plugin_init._AUTO_THREAD_GUARD.locked())
+
+    def test_post_llm_hook_runs_in_background_with_registered_llm(self):
+        class RegisterContext:
+            def __init__(self):
+                self.llm = object()
+                self.hooks = {}
+
+            def register_command(self, *args, **kwargs):
+                return None
+
+            def register_tool(self, *args, **kwargs):
+                return None
+
+            def register_hook(self, name, callback):
+                self.hooks[name] = callback
+
+        FakeHost.entry_config().update({"auto_enabled": True, "auto_turn_interval": 2})
+        context = RegisterContext()
+        plugin_init.register(context)
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        worker_exited = threading.Event()
+        calls = []
+        original_try_lock = journal.try_mutation_lock
+
+        @contextmanager
+        def observing_try_lock():
+            try:
+                with original_try_lock() as acquired:
+                    yield acquired
+            finally:
+                worker_exited.set()
+
+        def run(llm, **kwargs):
+            calls.append((llm, kwargs, threading.current_thread().name))
+            started.set()
+            release.wait(1)
+            finished.set()
+            return {"success": True}
+
+        with patch.object(plugin_init.journal, "try_mutation_lock", observing_try_lock), patch.object(
+            plugin_init.core, "refine_run", side_effect=run
+        ):
+            context.hooks["post_llm_call"](
+                session_id="session",
+                conversation_history=[{"role": "assistant"}, {"role": "assistant"}],
+            )
+            self.assertTrue(started.wait(1))
+            self.assertFalse(finished.is_set())
+            self.assertFalse(FakeHost.actions)
+            release.set()
+            self.assertTrue(finished.wait(1))
+            self.assertTrue(worker_exited.wait(1))
+        self.assertEqual(set(context.hooks), {"post_llm_call", "on_session_end"})
+        self.assertIs(calls[0][0], context.llm)
+        self.assertEqual(calls[0][1], {"session_id": "session", "auto": True})
+        self.assertEqual(calls[0][2], "refine-auto")
+
+    def test_session_end_keeps_minimum_message_trigger_when_turn_trigger_is_disabled(self):
+        FakeHost.entry_config().update({"auto_enabled": True, "auto_turn_interval": 0})
+        messages = [{"role": "user"}] * config.auto_min_messages()
+        started = threading.Event()
+        worker_exited = threading.Event()
+        original_try_lock = journal.try_mutation_lock
+
+        @contextmanager
+        def observing_try_lock():
+            try:
+                with original_try_lock() as acquired:
+                    yield acquired
+            finally:
+                worker_exited.set()
+
+        def run(**kwargs):
+            started.set()
+            return {"success": True}
+
+        with patch.object(plugin_init.core, "collect_evidence", return_value={"messages": messages}), patch.object(
+            plugin_init.journal, "try_mutation_lock", observing_try_lock
+        ), patch.object(plugin_init.core, "refine_run", side_effect=run) as refine:
+            plugin_init._on_session_end(session_id="session")
+            self.assertTrue(started.wait(1))
+            self.assertTrue(worker_exited.wait(1))
+        self.assertEqual(refine.call_args.kwargs["session_id"], "session")
+        self.assertTrue(refine.call_args.kwargs["auto"])
+
+    def test_session_end_collects_evidence_in_background(self):
+        FakeHost.entry_config()["auto_enabled"] = True
+        collecting = threading.Event()
+        release = threading.Event()
+
+        def collect(**kwargs):
+            collecting.set()
+            release.wait(1)
+            return {"messages": []}
+
+        with patch.object(plugin_init.core, "collect_evidence", side_effect=collect):
+            plugin_init._on_session_end(session_id="session")
+            self.assertTrue(collecting.wait(1))
+            self.assertTrue(plugin_init._AUTO_THREAD_GUARD.locked())
+            release.set()
+        deadline = time.monotonic() + 1
+        while plugin_init._AUTO_THREAD_GUARD.locked() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(plugin_init._AUTO_THREAD_GUARD.locked())
+
+    def test_session_end_defers_while_a_turn_worker_is_active(self):
+        FakeHost.entry_config().update({"auto_enabled": True, "auto_turn_interval": 1})
+        messages = [{"role": "user"}] * config.auto_min_messages()
+        turn_started = threading.Event()
+        release_turn = threading.Event()
+        calls = []
+
+        def run(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                turn_started.set()
+                release_turn.wait(1)
+            return {"success": True}
+
+        with patch.object(plugin_init.core, "collect_evidence", return_value={"messages": messages}), patch.object(
+            plugin_init.core, "refine_run", side_effect=run
+        ):
+            plugin_init._on_post_llm_call("session", [{"role": "assistant"}])
+            self.assertTrue(turn_started.wait(1))
+            plugin_init._on_session_end(session_id="session")
+            self.assertEqual(len(calls), 1)
+            release_turn.set()
+            deadline = time.monotonic() + 1
+            while len(calls) < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(len(calls), 2)
+            deadline = time.monotonic() + 1
+            while plugin_init._AUTO_THREAD_GUARD.locked() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertFalse(plugin_init._AUTO_THREAD_GUARD.locked())
+        self.assertTrue(all(call["auto"] for call in calls))
+
+    def test_held_mutation_lock_skips_concurrent_auto_triggers_without_stranding(self):
+        FakeHost.entry_config().update({"auto_enabled": True, "auto_turn_interval": 1})
+        attempted = threading.Event()
+        finished = threading.Event()
+        original_try_lock = journal.try_mutation_lock
+
+        @contextmanager
+        def observing_try_lock():
+            attempted.set()
+            try:
+                with original_try_lock() as acquired:
+                    yield acquired
+            finally:
+                finished.set()
+
+        with patch.object(plugin_init.journal, "try_mutation_lock", observing_try_lock), patch.object(
+            plugin_init.core, "refine_run"
+        ) as refine, journal.mutation_lock():
+            history = [{"role": "assistant"}]
+            plugin_init._on_post_llm_call("session", history)
+            plugin_init._on_post_llm_call("session", history)
+            self.assertTrue(attempted.wait(1))
+            self.assertTrue(finished.wait(1))
+        refine.assert_not_called()
+        self.assertFalse(FakeHost.actions)
+        self.assertFalse(plugin_init._AUTO_THREAD_GUARD.locked())
 
 
 if __name__ == "__main__":
