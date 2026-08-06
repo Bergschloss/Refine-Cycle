@@ -368,12 +368,20 @@ journal record, and as a `.bak` file under `journal_dir/backups`. Both come from
 one host read, so they cannot disagree. Rollback prefers the snapshot, so losing
 the backup file no longer costs the rollback.
 
-The snapshot carries a SHA-256 digest of the real pre-edit content. The journal
-redacts credentials from everything it writes, so a snapshot of a skill that
-contained a secret would come back altered; the digest makes that detectable and
-the raw `.bak` file is used instead, rather than writing redacted text over the
-skill. If neither source survives, rollback refuses with an explicit error and
-changes nothing.
+Credential scrubbing needs two layers here, because the journal redacts
+credentials from everything it writes — including a snapshot. The first layer is
+the proposal path: a skill whose current `SKILL.md` is changed by scrubbing is
+never patched at all, and the patch becomes a `no_op` before the model is
+called. The second is a SHA-256 digest of the real pre-edit content stored beside
+the snapshot. If the stored text no longer matches that digest, the snapshot is
+refused and the raw `.bak` file is used instead, so redacted text is never
+written over a skill.
+
+`is_reversible` asks the restore path the same question rollback does, so an
+entry is never advertised as reversible when neither source survives. In that
+case rollback refuses with an explicit error and changes nothing, and a staged
+rollback whose state cannot be proven stays `pending_rollback` rather than being
+declared rejected.
 
 Records written before snapshots existed carry only `backup_path` and keep
 rolling back from it unchanged.

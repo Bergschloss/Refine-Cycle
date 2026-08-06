@@ -604,7 +604,9 @@ def is_reversible(entry: Optional[Dict[str, Any]]) -> bool:
     if kind == "skill" and action == "create":
         return bool(proposal.get("name") and proposal.get("content"))
     if kind == "skill" and action == "patch":
-        return snapshot_has_before(entry) or bool(entry.get("backup_path"))
+        # Ask the restore path itself rather than checking for a path string, so
+        # "reversible" cannot promise more than rollback can actually deliver.
+        return snapshot_before_content(entry) is not None
     if kind in ("memory", "user"):
         return bool(entry.get("recovery"))
     if kind == "prompt":
@@ -713,7 +715,7 @@ def _content_digest(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8", "replace")).hexdigest()
 
 
-def prepare_skill_recovery(name: str, after: str) -> Optional[Dict[str, Any]]:
+def prepare_skill_recovery(name: str) -> Optional[Dict[str, Any]]:
     """Capture a skill's pre-edit state as a journal snapshot and a backup file.
 
     One host read serves both, so the two records cannot disagree. The snapshot
@@ -742,7 +744,6 @@ def prepare_skill_recovery(name: str, after: str) -> Optional[Dict[str, Any]]:
             "name": name,
             "before": before,
             "before_sha256": _content_digest(before),
-            "after_sha256": _content_digest(after),
         },
     }
 
@@ -750,14 +751,6 @@ def prepare_skill_recovery(name: str, after: str) -> Optional[Dict[str, Any]]:
 def _snapshot_of(entry: Dict[str, Any]) -> Dict[str, Any]:
     snapshot = entry.get("snapshot")
     return snapshot if isinstance(snapshot, dict) else {}
-
-
-def snapshot_has_before(entry: Dict[str, Any]) -> bool:
-    """Report whether this entry carries its own restorable pre-edit content."""
-    snapshot = _snapshot_of(entry)
-    return isinstance(snapshot.get("before"), str) and bool(
-        snapshot.get("before_sha256")
-    )
 
 
 def snapshot_before_content(entry: Dict[str, Any]) -> Optional[str]:
@@ -879,7 +872,11 @@ def rollback_target_matches(entry: Dict[str, Any]) -> Optional[bool]:
             return (content is None) if known else None
         expected = snapshot_before_content(entry)
         if expected is None:
-            return False
+            # Without a restore source there is nothing to compare against, so
+            # the rollback state is unknown rather than proven false. Returning
+            # False here would let ``reconcile`` declare an approved staged
+            # rollback rejected and push the record back to ``applied``.
+            return None
         known, current = _read_skill_state(name)
         return (current == expected) if known else None
     if kind in ("memory", "user"):
