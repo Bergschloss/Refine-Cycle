@@ -175,3 +175,9 @@ def prompt_notes_max_count() -> int:
 def prompt_notes_max_chars() -> int:
     """Maximum characters for one complete rendered prompt-note block."""
     return get_int("prompt_notes_max_chars", 600, min_val=1)
+
+
+def prompt_notes_default_scope() -> str:
+    """Default lifetime for new prompt notes; invalid values fail closed to global."""
+    scope = get_str("prompt_notes_default_scope", "global").strip().lower()
+    return scope if scope in ("global", "session") else "global"

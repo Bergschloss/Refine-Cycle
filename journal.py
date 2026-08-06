@@ -51,6 +51,39 @@ def prompt_notes_path() -> Path:
     return ensure_dirs() / _PROMPT_NOTES_FILE_NAME
 
 
+def normalize_prompt_note_session_id(session_id: Any) -> str:
+    """Accept only a stable, already-safe hook/session identifier."""
+    raw = str(session_id).strip()
+    safe = scrub_text(raw).strip()
+    return safe if raw and raw == safe and len(safe) <= 64 else ""
+
+
+def _normalize_prompt_note(note: Any) -> Optional[Dict[str, str]]:
+    """Validate one plugin-owned note and canonicalize legacy notes as global."""
+    if not isinstance(note, dict):
+        return None
+    note_id = note.get("id")
+    content = note.get("content")
+    scope = note.get("scope", "global")
+    if (
+        not isinstance(note_id, str)
+        or len(note_id) != 12
+        or any(char not in "0123456789abcdef" for char in note_id)
+        or not isinstance(content, str)
+        or not content.strip()
+        or scrub_text(content) != content
+        or scope not in ("global", "session")
+    ):
+        return None
+    normalized = {"id": note_id, "content": content, "scope": scope}
+    if scope == "session":
+        session_id = normalize_prompt_note_session_id(note.get("session_id", ""))
+        if not session_id:
+            return None
+        normalized["session_id"] = session_id
+    return normalized
+
+
 def _load_prompt_notes() -> Optional[List[Dict[str, str]]]:
     """Return validated prompt notes, [] when absent, or None when unavailable."""
     path = prompt_notes_path()
@@ -67,22 +100,11 @@ def _load_prompt_notes() -> Optional[List[Dict[str, str]]]:
         notes: List[Dict[str, str]] = []
         seen_ids = set()
         for raw_note in raw_notes:
-            if not isinstance(raw_note, dict):
-                raise ValueError("note must be an object")
-            note_id = raw_note.get("id")
-            content = raw_note.get("content")
-            if (
-                not isinstance(note_id, str)
-                or len(note_id) != 12
-                or any(char not in "0123456789abcdef" for char in note_id)
-                or note_id in seen_ids
-                or not isinstance(content, str)
-                or not content.strip()
-                or scrub_text(content) != content
-            ):
+            note = _normalize_prompt_note(raw_note)
+            if note is None or note["id"] in seen_ids:
                 raise ValueError("unsafe prompt note")
-            seen_ids.add(note_id)
-            notes.append({"id": note_id, "content": content})
+            seen_ids.add(note["id"])
+            notes.append(note)
         return notes
     except Exception as exc:
         logger.warning("Cannot read prompt-note store: %s", scrub_text(str(exc)))
@@ -97,19 +119,13 @@ def load_prompt_notes() -> Optional[List[Dict[str, str]]]:
 def _write_prompt_notes(notes: List[Dict[str, str]]) -> None:
     """Atomically persist only validated, already-scrubbed note objects."""
     safe_notes = []
-    for note in notes:
-        note_id = note.get("id") if isinstance(note, dict) else None
-        content = note.get("content") if isinstance(note, dict) else None
-        if (
-            not isinstance(note_id, str)
-            or len(note_id) != 12
-            or any(char not in "0123456789abcdef" for char in note_id)
-            or not isinstance(content, str)
-            or not content.strip()
-            or scrub_text(content) != content
-        ):
+    seen_ids = set()
+    for raw_note in notes:
+        note = _normalize_prompt_note(raw_note)
+        if note is None or note["id"] in seen_ids:
             raise ValueError("Refusing to write an unsafe prompt note")
-        safe_notes.append({"id": note_id, "content": content})
+        seen_ids.add(note["id"])
+        safe_notes.append(note)
     _atomic_write_text(
         prompt_notes_path(),
         json.dumps({"notes": safe_notes}, ensure_ascii=False, separators=(",", ":")),
@@ -130,44 +146,76 @@ def normalize_prompt_note_content(content: str) -> str:
     return scrub_text(str(content)).strip()
 
 
-def new_prompt_note(content: str) -> Optional[Dict[str, str]]:
+def new_prompt_note(
+    content: str, *, scope: str = "global", session_id: str = ""
+) -> Optional[Dict[str, str]]:
     """Preflight storage and allocate a stable ID without mutating the store."""
-    safe_content = normalize_prompt_note_content(content)
-    if not safe_content:
+    candidate: Dict[str, str] = {
+        "id": uuid.uuid4().hex[:12],
+        "content": normalize_prompt_note_content(content),
+        "scope": scope,
+    }
+    if scope == "session":
+        candidate["session_id"] = session_id
+    note = _normalize_prompt_note(candidate)
+    if note is None:
         return None
     with mutation_lock():
         if _load_prompt_notes() is None:
             return None
-        return {"id": uuid.uuid4().hex[:12], "content": safe_content}
+        return note
 
 
 def add_prompt_note(note: Dict[str, str]) -> Dict[str, Any]:
     """Persist one note atomically; this is plugin-owned and needs no host approval."""
+    safe_note = _normalize_prompt_note(note)
+    if safe_note is None:
+        return {"success": False, "error": "Prompt note is invalid"}
     with mutation_lock():
         notes = _load_prompt_notes()
         if notes is None:
             return {"success": False, "error": "Prompt-note store is unavailable"}
-        note_id = note.get("id") if isinstance(note, dict) else None
-        content = note.get("content") if isinstance(note, dict) else None
-        if (
-            not isinstance(note_id, str)
-            or len(note_id) != 12
-            or any(char not in "0123456789abcdef" for char in note_id)
-            or not isinstance(content, str)
-            or not content.strip()
-            or scrub_text(content) != content
+        if any(
+            item["id"] == safe_note["id"] or item["content"] == safe_note["content"]
+            for item in notes
         ):
-            return {"success": False, "error": "Prompt note is invalid"}
-        if any(item["id"] == note_id or item["content"] == content for item in notes):
             return {"success": False, "error": "Prompt note already exists"}
         try:
-            _write_prompt_notes(notes + [{"id": note_id, "content": content}])
+            _write_prompt_notes(notes + [safe_note])
         except Exception as exc:
             return {
                 "success": False,
                 "error": f"Cannot persist prompt note: {scrub_text(str(exc))}",
             }
-        return {"success": True, "note_id": note_id}
+        return {"success": True, "note_id": safe_note["id"]}
+
+
+def clear_session_prompt_notes(session_id: str) -> Optional[int]:
+    """Remove all notes scoped to one ended/reset session; None means no mutation occurred."""
+    safe_session_id = normalize_prompt_note_session_id(session_id)
+    if not safe_session_id:
+        return None
+    with mutation_lock():
+        notes = _load_prompt_notes()
+        if notes is None:
+            return None
+        remaining = [
+            note
+            for note in notes
+            if not (
+                note.get("scope") == "session"
+                and note.get("session_id") == safe_session_id
+            )
+        ]
+        removed = len(notes) - len(remaining)
+        if not removed:
+            return 0
+        try:
+            _write_prompt_notes(remaining)
+        except Exception as exc:
+            logger.warning("Cannot clear session prompt notes: %s", scrub_text(str(exc)))
+            return None
+        return removed
 
 
 def _pid_is_alive(pid: int) -> bool:

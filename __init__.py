@@ -129,10 +129,10 @@ def _start_auto_refine(
 
 def _on_pre_llm_call(**kwargs) -> Optional[dict]:
     """Inject bounded plugin-owned notes without reading or changing the base prompt."""
-    del kwargs
     try:
         if not config.prompt_notes_enabled():
             return None
+        session_id = journal.normalize_prompt_note_session_id(kwargs.get("session_id", ""))
         with journal.try_mutation_lock() as acquired:
             if not acquired:
                 return None
@@ -141,6 +141,9 @@ def _on_pre_llm_call(**kwargs) -> Optional[dict]:
             return None
         selected = []
         for note in notes:
+            scope = note.get("scope", "global")
+            if scope == "session" and note.get("session_id") != session_id:
+                continue
             content = core.scrub_text(note["content"]).strip()
             if not content or core._prompt_note_content_error(content, check_rendered_size=False):
                 continue
@@ -159,6 +162,33 @@ def _on_pre_llm_call(**kwargs) -> Optional[dict]:
     except Exception:
         logger.debug("refine prompt-note hook failed", exc_info=True)
     return None
+
+
+def _schedule_session_note_cleanup(session_id: str) -> None:
+    """Eventually clear plugin-owned session notes without blocking a host hook."""
+    safe_session_id = journal.normalize_prompt_note_session_id(session_id)
+    if not safe_session_id:
+        return
+
+    def clear_notes() -> None:
+        try:
+            journal.clear_session_prompt_notes(safe_session_id)
+        except Exception:
+            logger.debug("refine session prompt-note cleanup failed", exc_info=True)
+
+    try:
+        threading.Thread(
+            target=clear_notes,
+            daemon=True,
+            name="refine-session-note-cleanup",
+        ).start()
+    except Exception:
+        logger.debug("refine session prompt-note cleanup thread could not start", exc_info=True)
+
+
+def _on_session_reset(session_id: str = "", **kwargs) -> None:
+    """Expire only notes owned by the session Hermes reset."""
+    _schedule_session_note_cleanup(session_id)
 
 
 def _on_post_llm_call(
@@ -249,6 +279,7 @@ def _on_session_end(
 ) -> None:
     """Run the session-end fallback without blocking or dropping it behind a turn run."""
     if not config.auto_enabled() or interrupted:
+        _schedule_session_note_cleanup(session_id)
         return
     if not _AUTO_THREAD_GUARD.acquire(blocking=False):
         _defer_session_end(session_id)
@@ -273,6 +304,7 @@ def _on_session_end(
         finally:
             if not handed_off:
                 _finish_auto_worker()
+            _schedule_session_note_cleanup(session_id)
 
     try:
         threading.Thread(
@@ -322,3 +354,4 @@ def register(ctx) -> None:
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
     ctx.register_hook("post_llm_call", _on_post_llm_call)
     ctx.register_hook("on_session_end", _on_session_end)
+    ctx.register_hook("on_session_reset", _on_session_reset)
