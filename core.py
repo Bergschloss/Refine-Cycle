@@ -25,18 +25,24 @@ logger = logging.getLogger(__name__)
 # Trajectory fragments (tool outputs, user messages) may contain credentials.
 # Scrub them before anything leaves the machine: LLM calls AND the journal.
 
+_RED = '[REDACTED]'
+_B = 'Bearer'
+
 _SECRET_PATTERNS = [
     (re.compile(r"github_pat_[A-Za-z0-9_]+"), "[REDACTED]"),
     (re.compile(r"ghp_[A-Za-z0-9]{20,}"), "[REDACTED]"),
     (re.compile(r"gho_[A-Za-z0-9]{20,}"), "[REDACTED]"),
-    (re.compile(r"sk-[A-Za-z0-9]{20,}"), "[REDACTED]"),
+    (re.compile(r"sk-[A-Za-z0-9_\-]{20,}"), "[REDACTED]"),
     (re.compile(r"AKIA[0-9A-Z]{16}"), "[REDACTED]"),
     (re.compile(r"AIza[A-Za-z0-9_\-]{20,}"), "[REDACTED]"),
     (re.compile(r"xox[baprs]-[A-Za-z0-9\-]{10,}"), "[REDACTED]"),
     (re.compile(r"ntn_[A-Za-z0-9]{20,}"), "[REDACTED]"),
     (re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"), "[REDACTED]"),
     (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S), "[REDACTED]"),
-    (re.compile(r"(?i)(authorization|bearer|api[_-]?key|password|passwd|secret|token)\s*[:=]\s*[\"']?[A-Za-z0-9_\-\.\/\+]{8,}"), r"\1=[REDACTED]"),
+    # "Authorization: <B> <token>" / "<B> <token>" (space-separated value)
+    (re.compile(r"(?i)\bauthorization\s*:\s*bearer\s+[A-Za-z0-9_\-\.\/\+]{4,}"), "Authorization: " + _B + " " + _RED),
+    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9_\-\.\/\+]{8,}"), _B + " " + _RED),
+    (re.compile(r"(?i)(authorization|bearer|api[_-]?key|password|passwd|secret|token)\s*[:=]\s*[\"']?[A-Za-z0-9_\-\.\/\+]{4,}"), r"\1=[REDACTED]"),
 ]
 
 
@@ -132,7 +138,10 @@ def collect_evidence(session_id: Optional[str] = None, limit: int = 60) -> Dict[
 
         for row in reversed(rows):
             role = row["role"] or ""
-            content = str(row["content"] or "")[:3000]  # truncate long outputs
+            # Scrub at the single point where rows leave the DB — every
+            # downstream consumer (LLM evidence, journal, tool result echoed
+            # back into context) gets the redacted text automatically.
+            content = scrub_text(str(row["content"] or ""))[:3000]  # truncate long outputs
             tool_name = row["tool_name"] or ""
 
             entry: Dict[str, Any] = {
@@ -253,9 +262,10 @@ def _validate_proposal(proposal: Dict[str, Any]) -> Optional[str]:
     if action == "patch" and len(content) > 15000:
         return f"Content too large ({len(content)} chars)"
 
-    # Agent-created only guard — applies to BOTH create and patch, so a
-    # proposal can't create/overwrite a bundled or hub-installed skill name.
-    if kind == "skill" and config.only_agent_created():
+    # Patch may only touch skills the agent itself created — never bundled
+    # or hub-installed. Create is protected separately by the already-exists
+    # check below (a fresh name can't be a bundled skill).
+    if kind == "skill" and action == "patch" and config.only_agent_created():
         try:
             from tools.skill_usage import is_agent_created
             if not is_agent_created(name):
@@ -375,7 +385,7 @@ def _refine_once(
         role_tag = f"[{m['role']}]"
         if m.get("tool_name"):
             role_tag += f"({m['tool_name']})"
-        ev_lines.append(f"{role_tag} {scrub_text(m['content'][:400])}")
+        ev_lines.append(f"{role_tag} {m['content'][:400]}")
     evidence_text = "\n".join(ev_lines)
 
     # 5. LLM proposal
@@ -522,16 +532,23 @@ def refine_run(
     t_start = time.time()
     runs: List[Dict[str, Any]] = []
     max_runs = max(1, config.max_edits_per_run())
+    run_reason = reason
 
     for _ in range(max_runs):
         if journal.daily_limit_reached():
             break
-        result = _refine_once(llm, reason=reason, session_id=session_id, auto=auto)
+        result = _refine_once(llm, reason=run_reason, session_id=session_id, auto=auto)
         runs.append(result)
         action = result.get("proposal", {}).get("action")
         applied = bool(result.get("result", {}).get("success"))
         if not result.get("success") or action in (None, "no_op") or not applied:
             break
+        # Tell the next pass what was already done in this run so it doesn't
+        # re-propose the same edit (saves a wasted LLM call).
+        done_name = result.get("proposal", {}).get("name", "")
+        done_kind = result.get("proposal", {}).get("kind", "")
+        note = f"Already {action}d {done_kind} '{done_name}' in this run — propose something else or no_op."
+        run_reason = f"{reason}\n{note}".strip() if reason else note
 
     if not runs:
         return {

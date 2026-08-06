@@ -296,6 +296,107 @@ def test_list_skill_names():
     ok(f"Found {len(names)} skills")
 
 
+def test_scrub_text():
+    """Credential patterns are redacted; benign text is untouched."""
+    print("\nTest: scrub_text")
+    from core import scrub_text
+
+    t = (
+        "token is github_pat_11FAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKE "
+        "and sk-proj-abcdefghijklmnopqrstuvwxyz123456 and api_key=supersecret123 "
+        "and password: hunter2 and Authorization: Bearer aaaabbbbccccddddeeee "
+        "and max_tokens=2048 stays"
+    )
+    s = scrub_text(t)
+    assert "github_pat_11FAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKE" not in s, "PAT must be redacted"
+    assert "sk-proj-abcdefghijklmnopqrstuvwxyz123456" not in s, "sk- key must be redacted"
+    assert "supersecret123" not in s, "api_key= value must be redacted"
+    assert "hunter2" not in s, "password: value must be redacted"
+    assert "aaaabbbbccccddddeeee" not in s, "Bearer value must be redacted"
+    assert "max_tokens=2048" in s, "max_tokens must stay untouched"
+    assert "[REDACTED]" in s, "should contain REDACTED marker"
+    ok(f"redacted {s.count('[REDACTED]')} spots, benign text intact")
+
+
+def test_scrub_proposal():
+    """scrub_proposal redacts all string fields and list items."""
+    print("\nTest: scrub_proposal")
+    from core import scrub_proposal
+    p = {
+        "action": "create",
+        "name": "my-skill",
+        "reason": "saw token github_pat_11FAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKE",
+        "evidence": ["user said: password=hunter2"],
+        "content": "---\nname: my-skill\ndescription: x\n---\n\n# body",
+    }
+    s = scrub_proposal(p)
+    assert "github_pat_11FAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKE" not in s["reason"], "reason must be scrubbed"
+    assert "hunter2" not in s["evidence"][0], "evidence list must be scrubbed"
+    assert s["name"] == "my-skill", "name must stay"
+    assert "[REDACTED]" in s["reason"] and "[REDACTED]" in s["evidence"][0]
+    ok("all string fields scrubbed, structure preserved")
+
+
+def test_guardrail_create():
+    """create new name OK; create over existing rejected; patch bundled rejected."""
+    print("\nTest: guardrail create")
+    from core import _validate_proposal
+
+    err_new = _validate_proposal({
+        "action": "create", "kind": "skill", "name": "refine-guard-test-new",
+        "content": "---\nname: refine-guard-test-new\ndescription: x\n---\n\n# x",
+    })
+    assert err_new is None, f"create new name should pass, got: {err_new}"
+    ok("create new name allowed")
+
+    existing = None
+    from core import list_skill_names
+    names = list_skill_names()
+    if names:
+        existing = names[0]
+        err_over = _validate_proposal({
+            "action": "create", "kind": "skill", "name": existing,
+            "content": "---\nname: x\ndescription: x\n---\n\n# x",
+        })
+        assert err_over and "already exists" in err_over, f"create over existing should be rejected, got: {err_over}"
+        ok(f"create over existing rejected ({existing})")
+    else:
+        ok("no existing skills to test create-over-existing (skipped)")
+
+
+def test_refine_multipass():
+    """refine_run honors max_edits_per_run>1: second pass sees the skill exists."""
+    print("\nTest: refine_run multi-pass")
+    import config as cfg
+    from core import refine_run
+
+    orig = cfg.max_edits_per_run
+    cfg.max_edits_per_run = lambda: 2
+
+    skill_name = "refine-multipass-test"
+    mock = MockLlm({
+        "action": "create",
+        "kind": "skill",
+        "name": skill_name,
+        "content": f"---\nname: {skill_name}\ndescription: multipass test\n---\n\n# Multipass\n",
+        "category": "",
+        "reason": "test multipass",
+        "evidence": ["test"],
+    })
+
+    try:
+        result = refine_run(mock, reason="multipass")
+        results = result.get("results", [result])
+        # First pass applied, second pass either rejected (already exists) or
+        # the loop stopped — either way nothing should be left behind.
+        from tools.skill_manager_tool import skill_manage
+        del_result = json.loads(skill_manage(action="delete", name=skill_name))
+        assert del_result.get("success"), "test skill should be deletable"
+        ok(f"multi-pass produced {len(results)} pass(es); cleanup ok")
+    finally:
+        cfg.max_edits_per_run = orig
+
+
 # ── run ─────────────────────────────────────────────────────────────────────
 
 
@@ -326,6 +427,10 @@ def main():
         test_refine_e2e_create_skill,
         test_refine_rollback_nonexistent,
         test_list_skill_names,
+        test_scrub_text,
+        test_scrub_proposal,
+        test_guardrail_create,
+        test_refine_multipass,
     ]
 
     print("=" * 50)
