@@ -278,7 +278,12 @@ llm:
 - **No plugin-level post-compaction hook:** Hermes exposes no normal plugin hook
   for `session:compress`; that event is gateway-only. `on_session_reset` is
   used to expire session-scoped notes, not as a claim that refinement runs after
-  context compaction.
+  context compaction. The only plugin-side compaction registration,
+  `register_context_engine`, replaces Hermes's built-in `ContextCompressor` and
+  permits only one engine per install. Taking it over would make Refine Cycle
+  responsible for the agent's whole compaction strategy and conflict with any
+  real context-engine plugin. A safe integration needs an observer-only
+  `VALID_HOOKS` member fired at the compaction boundary.
 - **No host approval for the prompt-note store:** it is a plugin-owned atomic
   file, not a host memory or skill write. Host-managed skill and memory changes
   still respect staged approvals and reconciliation.
