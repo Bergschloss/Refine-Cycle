@@ -52,7 +52,7 @@ trajectory (state.db) → scrub → fingerprint + aggregate → signal gate
 | **4. LLM proposal** | Requests one structured `create`, `patch`, or `no_op` proposal with an optional one-sentence, falsifiable `expected_outcome`. Kinds are `skill`, `memory`, and `prompt`. A proposal may instead carry an `edits` array of inseparable edits under one shared reason, `expected_outcome`, and `summary`. Every model-bound field is sanitized. The proposal output budget is derived locally from the shared 15,000-character content limit and scales with `max_edits_per_proposal`; the reviewer remains separately capped at 300 tokens. A cut-off, malformed, or reasoning-only reply is journaled as `llm_incomplete` rather than presented as a normal `no_op`. Skill patches receive the current complete `SKILL.md` only when it is unchanged by scrubbing and no larger than 15,000 characters. |
 | **5. Guardrails** | Enforces agent-created patch targets, fresh create names, content/frontmatter, prompt-note policy shape, size limits, daily budget, and recent-duplicate rejection. Every check runs per edit, so a later edit of a transaction is measured against the edits already applied before it. |
 | **6. Prepare** | Captures a skill's pre-edit content as both a journal snapshot and a readable `.bak` file, or memory/prompt-note recovery metadata, then appends and `fsync`s a `prepared` journal record before mutation. |
-| **7. Apply and reconcile** | Runs the standard host API for skills/memory (`patch` maps to host `edit`) or atomically writes the plugin-owned prompt-note store. It proves target state and records `applied`, `pending_approval`, or `error`. Host pending approvals reconcile lazily before later runs, audit, or rollback. |
+| **7. Apply and reconcile** | Runs the standard host API for skills/memory (`patch` maps to host `edit`) or atomically writes the plugin-owned prompt-note store. It proves target state and records `applied`, `pending_approval`, `conflict`, or `error`. A `conflict` occurs when a skill patch was planned against content that changed before apply; the budget is not consumed and the edit is not advertised as reversible. Host pending approvals reconcile lazily before later runs, audit, or rollback. |
 | **8. Rollback** | Journals `rollback_prepared` before a rollback side effect. A rollback is finalized only after target-state proof; staged host rollbacks remain `pending_rollback` until approval reconciliation. |
 
 ### Why fingerprinting
@@ -258,11 +258,13 @@ Candidates for removal:
 ```
 
 The audit deletes nothing. It prints a rollback command only for recorded
-candidates. Every row shows the model's sanitized expected outcome (`—` when
-omitted) alongside its observed result. Later edits of the same entry advance a
-version; version 3 or later is labelled `churning` only when the normal verdict
-would otherwise be `unclear`. Skills that remain unused are fed into later
-proposals as negative examples.
+candidates. Skill rows keep their plain names; memory and prompt-note rows use
+`memory:` / `prompt:` prefixes so same-named entries remain distinguishable.
+Every row shows the model's sanitized expected outcome (`—` when omitted)
+alongside its observed result. Later edits of the same entry advance a version;
+version 3 or later is labelled `churning` only when the normal verdict would
+otherwise be `unclear`. Skills that remain unused are fed into later proposals
+as negative examples.
 
 ### Agent-invocable tool
 
@@ -478,6 +480,12 @@ must be manually initiated.
 
 - **Credential scrubbing** covers evidence, reasons, proposals, reviewer
   verdicts, host errors, prompt notes, and recursively nested journal fields.
+- **Stale-plan guard** — a skill patch proposal carries a SHA-256 baseline
+  digest captured at planning time. Before backup and before apply, the plugin
+  re-reads the live host state and refuses the edit with a non-budget-consuming
+  `conflict` journal outcome when the content has changed or disappeared.
+  Transactions with any stale target apply zero edits. Proposals without a
+  baseline (manually assembled or legacy) bypass this check unchanged.
 - **Signal gate and reviewer** reject one-off noise; reviewer failures and
   malformed output decline safely without a proposal call.
 - **Incomplete model replies are visible:** a malformed, token-limited, or
