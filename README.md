@@ -3,85 +3,88 @@
 ![Refine Cycle — a self-improvement plugin for Hermes Agent](assets/banner.jpg)
 
 **Self-improvement loop for Hermes Agent** — the agent reads its own trajectory,
-finds repeated failures and reusable tactics, then proposes and applies the
-**smallest possible edit** to its skills or memory. Mutations are prepared in a
-durable journal before they run and carry conflict-aware recovery metadata.
+finds repeated failures and reusable tactics, then proposes the **smallest
+possible edit**: an agent-created skill, a memory entry, or a bounded,
+plugin-owned prompt note. Every mutation is prepared in a durable journal before
+it runs and has conflict-aware recovery metadata.
 
 This is a port of the `/refine` concept from
 [Prime Intellect's Prime Agent](https://www.primeintellect.ai/blog/prime-agent)
-(Continual Harness) built on top of the Hermes plugin system — no core changes,
-pure opt-in plugin.
+(Continual Harness) built on the Hermes plugin system — no core changes and
+pure opt-in plugin behavior.
 
 ---
 
 ## Why
 
 Modern agent harnesses ship static skills and prompts that never adapt to what
-the agent actually learns while running. Refine Cycle closes that loop:
+the agent learns while running. Refine Cycle closes that loop:
 
-- **Repeated failures** (e.g. the same tool call fails the same way twice) → the
-  plugin writes a skill that prevents them.
-- **Reusable tactics** (a workflow that worked and the user had to explain) →
-  the plugin captures them as a skill or memory entry so the agent doesn't need
-  to be re-taught.
+- **Repeated failures** (for example, the same tool call fails the same way
+twice) can produce a narrowly targeted skill, memory entry, or prompt note.
+- **Reusable tactics** (a workflow that worked and the user had to explain) can
+be captured so the agent does not need to be re-taught.
+- **Ambiguous trajectories** can receive one conservative reviewer pass rather
+than silently ending at the mechanical signal gate.
 
-The system prompt is never touched. Only **agent-created** skills and memory
-entries are editable. Built-in, pinned, and hub-installed skills are off-limits.
+The base system prompt is never touched. Only **agent-created** skills and
+memory entries are editable; built-in, pinned, and hub-installed skills remain
+off-limits. Prompt notes live only in Refine Cycle's own store, never in host
+memory or a skill.
 
 ---
 
 ## How it works
 
 ```
-trajectory (state.db) → scrub → fingerprint + aggregate → signal gate ─┬→ no_op
-                                                                      └→ LLM proposal
-                                                                         → guardrails + backup
-                                                                         → prepared journal record
-                                                                         → apply → finalized outcome
-                                                                                 → usefulness ledger
+trajectory (state.db) → scrub → fingerprint + aggregate → signal gate
+                                                  ├→ reviewer decline → journaled no_op
+                                                  └→ proposal → guardrails + prepare
+                                                              → apply → finalized outcome
+                                                                      → usefulness ledger
 ```
 
 | Stage | What happens |
 |---|---|
-| **1. Collect evidence** | Reads the last N messages of the session from `<HERMES_HOME>/state.db` (read-only). Credentials are redacted before downstream use |
-| **2. Aggregate** | Normalizes each error to its invariant shape and records a complete 12-character fingerprint, then counts occurrences within and across sessions |
-| **3. Signal gate** | No repeated failure and no explicit user correction → `no_op` without calling the model |
-| **4. LLM proposal** | Calls the host model with structured output: one minimal `create`/`patch`/`no_op` proposal. Every model-bound field is sanitized. Skill patches get the current complete `SKILL.md` only when it is unchanged by sanitization and at most 15,000 characters; otherwise the patch becomes `no_op` |
-| **5. Guardrails** | Validates agent-created patch targets, fresh create names, content/frontmatter, size limits, daily budget, and recent duplicates |
-| **6. Prepare** | Creates a durable patch backup or exact append-recovery metadata, then appends and `fsync`s a `prepared` journal record before mutation |
-| **7. Apply and reconcile** | Runs the standard host API (`patch` maps to host `edit`), proves immediate writes from actual target state, and records `applied`, `pending_approval`, or `error`. Pending approvals retain their host ID and reconcile lazily before later runs, audit, or rollback |
-| **8. Rollback** | Journals `rollback_prepared` before the side effect. Immediate rollback is finalized only after target-state proof; staged rollback remains `pending_rollback` until approval reconciliation |
+| **1. Collect evidence** | Reads the last N messages of the selected session from `<HERMES_HOME>/state.db` with `mode=ro`. Credentials are redacted before downstream use. |
+| **2. Aggregate** | Normalizes errors to invariant shapes, records complete 12-character fingerprints, and counts recurrence within and across sessions. |
+| **3. Signal gate and reviewer** | Repeated patterns or explicit corrections reach the proposal model. If neither exists, a substantial session may receive one small, conservative reviewer call; a decline is a sanitized, journaled `no_op`. |
+| **4. LLM proposal** | Requests one structured `create`, `patch`, or `no_op` proposal. Kinds are `skill`, `memory`, and `prompt`. Every model-bound field is sanitized. Skill patches receive the current complete `SKILL.md` only when it is unchanged by scrubbing and no larger than 15,000 characters. |
+| **5. Guardrails** | Enforces agent-created patch targets, fresh create names, content/frontmatter, prompt-note policy shape, size limits, daily budget, and recent-duplicate rejection. |
+| **6. Prepare** | Creates a durable skill backup, memory recovery metadata, or prompt-note recovery metadata, then appends and `fsync`s a `prepared` journal record before mutation. |
+| **7. Apply and reconcile** | Runs the standard host API for skills/memory (`patch` maps to host `edit`) or atomically writes the plugin-owned prompt-note store. It proves target state and records `applied`, `pending_approval`, or `error`. Host pending approvals reconcile lazily before later runs, audit, or rollback. |
+| **8. Rollback** | Journals `rollback_prepared` before a rollback side effect. A rollback is finalized only after target-state proof; staged host rollbacks remain `pending_rollback` until approval reconciliation. |
 
 ### Why fingerprinting
 
 "The same failure happened again" is a question about shapes, not strings.
-`HTTP 429 for /users/8821` and `HTTP 429 for /users/9134` are one failure, not two.
-Normalizing away volatile parts and hashing what remains turns a flat list of
+`HTTP 429 for /users/8821` and `HTTP 429 for /users/9134` are one failure, not
+two. Normalizing volatile parts and hashing the result turns a flat list of
 error text into countable patterns.
 
-A pattern that appears in several **different** sessions is a stronger signal
-than one repeated twice inside one conversation. Interactive prompts remain
+A pattern that appears in several **different** sessions is stronger evidence
+than one repeated twice inside a conversation. Interactive prompts remain
 bounded, while `/refine audit` evaluates recurrence over the complete available
 post-edit period.
 
 ### Provider compatibility
 
 The proposal is requested via `json_schema` structured output, with an automatic
-fallback to `json_mode` (then raw-text JSON salvage) for providers that reject
+fallback to `json_mode` and then raw-text JSON salvage for providers that reject
 `response_format.type=json_schema`.
 
 ---
 
 ## Installation
 
-> **Note:** this is a plugin for [Hermes Agent](https://hermes-agent.nousresearch.com/docs) — it requires a working Hermes installation (≥ 0.17.0) and does not run standalone.
+> **Note:** this is a plugin for [Hermes Agent](https://hermes-agent.nousresearch.com/docs). It requires a working Hermes installation (≥ 0.17.0) and does not run standalone.
 
 The plugin lives in `<HERMES_HOME>/plugins/refine/` — `~/.hermes/plugins/refine/`
-on Linux and macOS, and `%LOCALAPPDATA%\hermes\plugins\refine\` on Windows. Under
-a Hermes profile it follows the profile. The plugin resolves this through
-`hermes_constants.get_hermes_home()`.
+on Linux and macOS, and `%LOCALAPPDATA%\hermes\plugins\refine\` on Windows.
+Under a Hermes profile it follows that profile; the plugin resolves the location
+through `hermes_constants.get_hermes_home()`.
 
-1. Add to your Hermes `config.yaml`:
+1. Add to Hermes `config.yaml`:
 
 ```yaml
 plugins:
@@ -124,17 +127,78 @@ hermes plugins list
 including reasons beginning with those words, is passed to the proposal model as
 the manual reason.
 
+### Automatic refinement
+
+`post_llm_call` counts assistant turns and starts at most one background
+refinement attempt at a configured interval. The hook itself does not mutate or
+queue work. It skips an attempt when another pass owns the lock, and derives its
+cooldown from durable journal records, so the cooldown is visible across
+processes. `on_session_end` remains a background fallback based on the minimum
+message count.
+
+```yaml
+plugins:
+  entries:
+    refine:
+      auto_enabled: true
+      auto_min_messages: 15
+      auto_turn_interval: 25
+      auto_cooldown_minutes: 20
+```
+
+Automatic and manual runs share a cross-thread and cross-process mutation lock,
+then recheck the daily budget inside that lock.
+
+### Reviewer fallback
+
+When `min_signal_required` is enabled but the mechanical gate finds neither a
+repeated pattern nor an explicit correction, a substantial session can receive
+one structured reviewer call (`max_tokens: 300`). It asks only whether there is
+a durable lesson worth persisting. The reviewer has its own cooldown.
+
+A reviewer decline, malformed verdict, or reviewer error never reaches the
+proposal call. Declines are recorded as sanitized `no_op` journal entries so
+they can be audited. An approval supplies its narrow instructions to the normal
+proposal flow; it does not bypass guardrails, budget, backups, approvals, or the
+journal.
+
+### Prompt notes and scope
+
+A `prompt` proposal creates a short conditional policy in
+`<journal_dir>/prompt_notes.json`. Valid notes contain one or two policy lines
+beginning with `When <specific condition>, <one action>.`; they are not skills,
+memories, procedures, or system-prompt replacements.
+
+`pre_llm_call` returns a self-labelled `Refine notes:` context block. Hermes
+adds that ephemeral context to the current turn; Refine Cycle never reads or
+writes the base system prompt. Injection is bounded by
+`prompt_notes_max_count` and `prompt_notes_max_chars`; when necessary it drops
+whole oldest notes, never partial text. Empty, unavailable, unsafe, or
+out-of-scope note stores inject nothing and do not raise on the user path.
+
+New prompt notes use `prompt_notes_default_scope`:
+
+- `global` (the default) is injected in every session.
+- `session` stores the session identifier resolved while reading `state.db` and
+  injects only when the hook receives that same identifier. Session notes are
+  removed from the plugin-owned store after `on_session_end` or
+  `on_session_reset` for that session.
+
+The prompt-note store is plugin-owned, so there is **no host approval gate** for
+these notes. Creation, target-state proof, audit rows, and conflict-aware
+rollback are still journaled; host approval remains in force for host-managed
+skills and memory.
+
 ### Auditing what refine wrote
 
 `/refine audit` reports whether refine-created entries were used and whether the
 failure fingerprint recurred after the edit. Timestamp-aware host counts are
 preferred. If the host exposes only an all-time aggregate, the report labels it
 `all:` and does not claim post-edit use from it. Pending approvals remain marked
-as pending rather than being reported as applied. On the next audit, run, or
-rollback request, the plugin checks the host pending store and the actual skill
-or memory target: an exact target match becomes applied, an unresolved host
-record stays pending, and a removed host record without a target match becomes
-rejected.
+as pending rather than applied. On the next audit, run, or rollback request, the
+plugin checks the host pending store and actual skill or memory target: an exact
+target match becomes applied, an unresolved host record stays pending, and a
+removed host record without a target match becomes rejected.
 
 ```
 Refine-created entries (3):
@@ -152,21 +216,6 @@ The audit deletes nothing. It prints a rollback command only for recorded
 candidates. Skills that remain unused are fed into later proposals as negative
 examples.
 
-### Automatic
-
-Enable the session-end hook in config:
-
-```yaml
-plugins:
-  entries:
-    refine:
-      auto_enabled: true
-      auto_min_messages: 15
-```
-
-Automatic and manual runs share a cross-thread and cross-process mutation lock,
-then recheck the daily budget inside that lock.
-
 ### Agent-invocable tool
 
 The agent gets a `refine_run` tool (toolset `refine`) and may trigger the same
@@ -179,19 +228,28 @@ serialized flow with an optional reason.
 All keys live under `plugins.entries.refine`:
 
 | Key | Type | Default | Description |
-|---|---|---|---|
-| `auto_enabled` | bool | `false` | Auto-run on `on_session_end` |
-| `auto_min_messages` | int | `15` | Min messages for auto-analysis |
-| `max_edits_per_run` | int | `1` | Max applied or reserved edits per run |
-| `max_edits_per_day` | int | `3` | Max applied, pending, or prepared edits per UTC day |
-| `only_agent_created` | bool | `true` | Only patch agent-created skills |
-| `journal_dir` | path | `<HERMES_HOME>/plugins/refine` | Journal, lock, ledger, and backups |
-| `min_signal_required` | bool | `true` | Skip the model call when nothing repeated |
-| `min_pattern_count` | int | `2` | Repeats before a failure counts as a signal |
-| `cross_session_enabled` | bool | `true` | Aggregate failures across recent sessions |
-| `cross_session_days` | int | `7` | Interactive cross-session look-back window |
-| `cross_session_max_sessions` | int | `25` | Interactive session scan cap |
-| `dedup_window_days` | int | `7` | Refuse an edit identical to a recent applied, pending, or prepared edit |
+|---|---|---:|---|
+| `auto_enabled` | bool | `false` | Enable automatic turn and session-end attempts. |
+| `auto_min_messages` | int | `15` | Minimum messages for session-end auto-analysis. |
+| `auto_turn_interval` | int | `25` | Assistant turns between automatic attempts; `0` disables only the turn trigger. |
+| `auto_cooldown_minutes` | int | `20` | Minimum durable journal-derived gap between automatic attempts. |
+| `max_edits_per_run` | int | `1` | Maximum applied or reserved edits per run. |
+| `max_edits_per_day` | int | `3` | Maximum applied, pending, or prepared edits per UTC day. |
+| `only_agent_created` | bool | `true` | Only patch agent-created skills. |
+| `journal_dir` | path | `<HERMES_HOME>/plugins/refine` | Journal, lock, ledger, backups, and prompt notes. |
+| `min_signal_required` | bool | `true` | Require a signal before the proposal call; may enable reviewer fallback. |
+| `min_pattern_count` | int | `2` | Repeats before a failure counts as a mechanical signal. |
+| `reviewer_fallback_enabled` | bool | `true` | Allow one reviewer call when the mechanical gate finds nothing. |
+| `reviewer_min_messages` | int | `20` | Minimum session size for reviewer fallback. |
+| `reviewer_cooldown_minutes` | int | `60` | Minimum durable gap between reviewer decisions. |
+| `prompt_notes_enabled` | bool | `true` | Permit `prompt` proposals and note injection. |
+| `prompt_notes_max_count` | int | `5` | Maximum active notes injected into one turn. |
+| `prompt_notes_max_chars` | int | `600` | Maximum characters in the complete injected note block. |
+| `prompt_notes_default_scope` | str | `global` | Scope for newly created prompt notes: `global` or `session`; invalid values fall back to `global`. |
+| `cross_session_enabled` | bool | `true` | Aggregate failures across recent sessions. |
+| `cross_session_days` | int | `7` | Interactive cross-session look-back window. |
+| `cross_session_max_sessions` | int | `25` | Interactive session scan cap. |
+| `dedup_window_days` | int | `7` | Refuse an edit identical to a recent applied, pending, or prepared edit. |
 
 LLM trust policy (`plugins.entries.refine.llm`):
 
@@ -204,6 +262,18 @@ llm:
 
 ---
 
+## Known integration gaps
+
+- **No plugin-level post-compaction hook:** Hermes exposes no normal plugin hook
+  for `session:compress`; that event is gateway-only. `on_session_reset` is
+  used to expire session-scoped notes, not as a claim that refinement runs after
+  context compaction.
+- **No host approval for the prompt-note store:** it is a plugin-owned atomic
+  file, not a host memory or skill write. Host-managed skill and memory changes
+  still respect staged approvals and reconciliation.
+
+---
+
 ## Rollback
 
 A successful mutation returns a rollback command only when its journal record is
@@ -213,10 +283,12 @@ actually reversible:
 /refine rollback <journal_id>
 ```
 
-Create rollback deletes the skill only if its current content still exactly
-matches the refine proposal. Patch rollback likewise refuses to overwrite a
-later change before restoring its durable backup. Memory rollback removes only
-the exact appended entry and preserves unrelated later entries.
+Create rollback deletes a skill only if current content still exactly matches
+the refine proposal. Patch rollback refuses to overwrite a later change before
+restoring its durable backup. Memory rollback removes only the exact appended
+entry and preserves unrelated later entries. Prompt-note rollback removes only
+its exact unchanged note and preserves later notes; a changed or missing note is
+a conflict and is left untouched.
 
 If mutation succeeded but journal finalization failed, the returned recovery ID
 points to the durable `prepared` record. Pending forward approvals consume budget
@@ -235,17 +307,19 @@ cd <HERMES_HOME>/plugins/refine
 python -m tests.run_tests
 ```
 
-The stdlib-only suite installs an in-memory fake Hermes host before importing the
-plugin. Every database, journal, backup, skill, memory file, ledger, and lock
-lives under a fresh `TemporaryDirectory`; running the tests cannot touch live
-`~/.hermes` or profile state. It covers proposal completion, host action mapping,
-backup/journal failures, create/patch/memory rollback conflicts, failed applies,
-secret sanitation and idempotent redaction, pending approval/rejection
-reconciliation, staged rollback and finalization recovery, concurrent budget
-checks and lock initialization races, append-only journal tail recovery,
-multipass partial-success IDs, complete patch limits and metadata preservation,
-streaming full-history audit aggregation, full fingerprints, command parsing,
-error/correction classification, and audit scope. No model API is called.
+The stdlib-only suite installs a fake Hermes host before importing the plugin.
+Every database, journal, backup, skill, memory file, ledger, and lock lives
+under a fresh `TemporaryDirectory`; running the suite cannot touch live Hermes
+or profile state. It covers proposal completion, host action mapping,
+backup/journal failures, create/patch/memory/prompt rollback conflicts, secret
+sanitation, approval reconciliation, automatic triggers and cooldowns, reviewer
+fallback, prompt-note injection and scope cleanup, append-only journal recovery,
+and full-history aggregation.
+
+The suite also starts two real Python processes against one temporary Hermes
+root using a filesystem rendezvous and bounded timeouts. With
+`max_edits_per_day: 1`, it proves exactly one mutation is applied, one budget
+slot is consumed, and one ledger/skill record survives.
 
 ---
 
@@ -253,17 +327,17 @@ error/correction classification, and audit scope. No model API is called.
 
 ```
 refine/
-├── plugin.yaml          # Hermes plugin manifest
-├── __init__.py          # command, tool, and session-end hook registration
+├── plugin.yaml          # Hermes plugin manifest and registered hooks
+├── __init__.py          # command, tool, and hook registration
 ├── config.py            # plugins.entries.refine config reader
 ├── core.py              # evidence, guardrails, serialized apply orchestration
 ├── sanitization.py      # recursive credential redaction
 ├── patterns.py          # normalization, fingerprints, aggregation, signal gate
 ├── ledger.py            # timestamp-aware usefulness ledger and audit report
-├── llm.py               # structured proposal and complete patch regeneration
-├── journal.py           # atomic journal, lock, backups, recovery, rollback
+├── llm.py               # structured proposal, reviewer, and patch regeneration
+├── journal.py           # atomic journal, lock, prompt notes, recovery, rollback
 └── tests/
-    └── run_tests.py     # hermetic fake-host regression suite
+    └── run_tests.py     # hermetic regression and cross-process proof
 ```
 
 ---
@@ -272,39 +346,43 @@ refine/
 
 Refine sends sanitized aggregated error patterns, explicit correction excerpts,
 existing skill and memory names/snippets, the optional manual reason/prior-pass
-note, and up to 8000 characters of sanitized recent trajectory to the configured
-provider. When a skill patch is selected, a second structured request receives
-the target's current complete `SKILL.md` only if it is already safe and no larger
-than the shared 15,000-character input/output limit. Unsafe or oversized current
-skill content aborts the patch as `no_op`; it is never redacted, truncated, or
-used to generate a destructive replacement.
+note, and up to 8,000 characters of sanitized recent trajectory to the
+configured provider. If the mechanical signal gate has no signal, the reviewer
+receives only the bounded sanitized trajectory and returns a tiny verdict. When
+a skill patch is selected, a second structured request receives the target's
+current complete `SKILL.md` only if it is safe and no larger than the shared
+15,000-character input/output limit. Unsafe or oversized current skill content
+becomes `no_op`; it is never redacted, truncated, or used to generate a
+destructive replacement.
 
-Credentials are redacted first, but the remaining content is ordinary
-conversation or skill content. Keep `auto_enabled: false` if model-bound session
-analysis must be manually initiated. With the signal gate enabled, no model call
-occurs when nothing repeated and no explicit correction was detected.
+Credentials are redacted first, but remaining content is ordinary conversation
+or skill content. Keep `auto_enabled: false` if model-bound session analysis
+must be manually initiated.
 
 ---
 
 ## Safety & limits
 
-- **Credential scrubbing** covers evidence, reasons, proposals, host errors, and
-  every recursively nested journal field, including quoted JSON keys and
-  punctuation-heavy values.
-- **Signal gate** requires a repeated failure or explicit correction.
+- **Credential scrubbing** covers evidence, reasons, proposals, reviewer
+  verdicts, host errors, prompt notes, and recursively nested journal fields.
+- **Signal gate and reviewer** reject one-off noise; reviewer failures and
+  malformed output decline safely without a proposal call.
 - **Agent-created skills only** for patches; creates require a free normalized
   name and cannot use the reserved `hermes-` prefix.
-- **No autonomous delete** — delete is used only by an explicit rollback of an
-  unchanged skill created by refine.
-- **Serialized budget** counts applied, pending-approval, and unresolved prepared
-  records after acquiring the process-safe mutation lock.
+- **No autonomous skill delete** — skill deletion is used only by an explicit
+  rollback of an unchanged skill created by refine.
+- **Bounded ephemeral prompt context** is labelled, sanitized, whole-note
+  bounded, scoped, and never changes the base system prompt.
+- **Serialized budget** counts applied, pending-approval, and unresolved
+  prepared records after acquiring the process-safe mutation lock.
 - **Durable append journal** writes one locked, fsynced JSON line per state
   transition without rewriting history. A corrupt trailing line is skipped and
-  isolated before the next valid record; backup and ledger replacement writes
-  remain atomic.
-- **Conflict-aware rollback** preserves later skill and memory changes.
-- **Approval gate respected** — staged forward and rollback writes persist their
-  pending IDs and are reconciled from both host-pending and exact target state.
+  isolated before the next valid record; backup, ledger, and note-store writes
+  are atomic.
+- **Conflict-aware rollback** preserves later skill, memory, and prompt-note
+  changes.
+- **Approval gate respected** for host-managed staged forward and rollback
+  writes; plugin-owned prompt notes do not pretend to have a host approval.
 - **Read-only trajectory** — `state.db` is opened with `mode=ro`.
 - **No system prompt access** — the base prompt stays immutable.
 - Requires Hermes ≥ 0.17.0 (`register_tool`, `register_command`, `register_hook`,
