@@ -390,6 +390,13 @@ def _validate_proposal(proposal: Dict[str, Any]) -> Optional[str]:
         content_error = _prompt_note_content_error(content)
         if content_error:
             return content_error
+        scope = proposal.get("scope", "global")
+        if scope not in ("global", "session"):
+            return "Prompt-note scope must be global or session"
+        if scope == "session" and not journal.normalize_prompt_note_session_id(
+            proposal.get("session_id", "")
+        ):
+            return "Session-scoped prompt notes require a verified session ID"
         duplicate = journal.prompt_note_content_exists(content)
         if duplicate is None:
             return "Prompt-note store is unavailable"
@@ -606,9 +613,16 @@ def _refine_once(
     )
     proposal = sanitize(proposal)
     if proposal.get("kind") == "prompt":
+        scope = config.prompt_notes_default_scope()
         proposal = dict(
             proposal,
             content=journal.normalize_prompt_note_content(proposal.get("content", "")),
+            scope=scope,
+            session_id=(
+                journal.normalize_prompt_note_session_id(session)
+                if scope == "session"
+                else ""
+            ),
         )
 
     if proposal.get("action") == "no_op":
@@ -683,7 +697,11 @@ def _refine_once(
     elif kind == "skill":
         recovery = {"type": "skill_create", "name": name}
     elif kind == "prompt":
-        prompt_note = journal.new_prompt_note(proposal["content"])
+        prompt_note = journal.new_prompt_note(
+            proposal["content"],
+            scope=str(proposal.get("scope", "global")),
+            session_id=str(proposal.get("session_id", "")),
+        )
         if prompt_note is None:
             error = "Cannot access plugin-owned prompt-note storage; mutation aborted"
             _journal_nonmutation(

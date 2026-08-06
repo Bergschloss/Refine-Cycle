@@ -1093,7 +1093,10 @@ class RefineTests(unittest.TestCase):
             release.set()
             self.assertTrue(finished.wait(1))
             self.assertTrue(worker_exited.wait(1))
-        self.assertEqual(set(context.hooks), {"pre_llm_call", "post_llm_call", "on_session_end"})
+        self.assertEqual(
+            set(context.hooks),
+            {"pre_llm_call", "post_llm_call", "on_session_end", "on_session_reset"},
+        )
         self.assertIs(calls[0][0], context.llm)
         self.assertEqual(calls[0][1], {"session_id": "session", "auto": True})
         self.assertEqual(calls[0][2], "refine-auto")
@@ -1362,7 +1365,10 @@ class RefineTests(unittest.TestCase):
         note_id = entry["recovery"]["note_id"]
         self.assertEqual(entry["recovery"], {"type": "prompt_note", "note_id": note_id})
         stored = json.loads(journal.prompt_notes_path().read_text(encoding="utf-8"))
-        self.assertEqual(stored["notes"], [{"id": note_id, "content": policy}])
+        self.assertEqual(
+            stored["notes"],
+            [{"id": note_id, "content": policy, "scope": "global"}],
+        )
         self.assertEqual(plugin_init._on_pre_llm_call(), {"context": f"Refine notes:\n- {policy}"})
         audit_rows = core.refine_audit()["rows"]
         self.assertTrue(any(row["journal_id"] == result["journal_id"] and row["kind"] == "prompt" for row in audit_rows))
@@ -1469,6 +1475,76 @@ class RefineTests(unittest.TestCase):
         self.assertEqual(plugin_init._on_pre_llm_call()["context"], "Refine notes:\n- " + policy)
         FakeHost.entry_config()["prompt_notes_max_chars"] = exact_limit - 1
         self.assertIn("rendered context", core._validate_proposal(prompt_proposal("When updating a request, use a deliberately longer narrow policy.")))
+
+    def test_prompt_note_scope_uses_state_db_session_identity_and_cleans_up(self):
+        global_policy = "When retrying a global request, verify the endpoint."
+        session_policy = "When retrying this session request, verify the target."
+        global_result = self.run_proposal(prompt_proposal(global_policy))
+        self.assertTrue(global_result["success"])
+        self.assertEqual(global_result["evidence"]["session_id"], "session")
+        self.assertEqual(journal.get_entry(global_result["journal_id"])["session_id"], "session")
+        self.assertEqual(global_result["proposal"]["scope"], "global")
+
+        FakeHost.entry_config()["prompt_notes_default_scope"] = "session"
+        session_result = self.run_proposal(prompt_proposal(session_policy), session_id="session")
+        self.assertTrue(session_result["success"])
+        self.assertEqual(session_result["proposal"]["scope"], "session")
+        self.assertEqual(session_result["proposal"]["session_id"], "session")
+        stored = journal.load_prompt_notes()
+        self.assertEqual(stored[1]["scope"], "session")
+        self.assertEqual(stored[1]["session_id"], "session")
+
+        own_context = plugin_init._on_pre_llm_call(session_id="session")["context"]
+        other_context = plugin_init._on_pre_llm_call(session_id="other-session")["context"]
+        self.assertIn(global_policy, own_context)
+        self.assertIn(session_policy, own_context)
+        self.assertIn(global_policy, other_context)
+        self.assertNotIn(session_policy, other_context)
+        self.assertEqual(journal.clear_session_prompt_notes("session"), 1)
+        self.assertEqual(
+            plugin_init._on_pre_llm_call(session_id="session"),
+            {"context": f"Refine notes:\n- {global_policy}"},
+        )
+
+        ending_result = self.run_proposal(
+            prompt_proposal("When retrying an ending request, verify its parameters."),
+            session_id="session",
+        )
+        self.assertTrue(ending_result["success"])
+        cleared = threading.Event()
+        original_clear = journal.clear_session_prompt_notes
+
+        def observe_clear(session_id):
+            result = original_clear(session_id)
+            cleared.set()
+            return result
+
+        with patch.object(plugin_init.journal, "clear_session_prompt_notes", side_effect=observe_clear):
+            plugin_init._on_session_end(session_id="session")
+            self.assertTrue(cleared.wait(1))
+        self.assertNotIn(
+            "ending request", plugin_init._on_pre_llm_call(session_id="session")["context"]
+        )
+
+        reset_result = self.run_proposal(
+            prompt_proposal("When retrying a reset request, verify its response."),
+            session_id="session",
+        )
+        self.assertTrue(reset_result["success"])
+        cleared = threading.Event()
+        with patch.object(plugin_init.journal, "clear_session_prompt_notes", side_effect=observe_clear):
+            plugin_init._on_session_reset(session_id="session")
+            self.assertTrue(cleared.wait(1))
+        self.assertNotIn(
+            "reset request", plugin_init._on_pre_llm_call(session_id="session")["context"]
+        )
+
+    def test_session_scoped_prompt_note_rejects_missing_or_unsafe_identity(self):
+        proposal = prompt_proposal("When retrying a scoped request, verify its target.")
+        proposal.update({"scope": "session", "session_id": ""})
+        self.assertIn("verified session ID", core._validate_proposal(proposal))
+        proposal["session_id"] = 'api_key="unsafe-secret"'
+        self.assertIn("verified session ID", core._validate_proposal(proposal))
 
 
 if __name__ == "__main__":
