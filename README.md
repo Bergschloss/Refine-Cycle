@@ -49,7 +49,7 @@ trajectory (state.db) → scrub → fingerprint + aggregate → signal gate
 | **1. Collect evidence** | Reads the last N messages of the selected session from `<HERMES_HOME>/state.db` with `mode=ro`. Credentials are redacted before downstream use. |
 | **2. Aggregate** | Normalizes errors to invariant shapes, records complete 12-character fingerprints, and counts recurrence within and across sessions. |
 | **3. Signal gate and reviewer** | Repeated patterns or explicit corrections reach the proposal model. If neither exists, a substantial session may receive one small, conservative reviewer call; a decline is a sanitized, journaled `no_op`. |
-| **4. LLM proposal** | Requests one structured `create`, `patch`, or `no_op` proposal. Kinds are `skill`, `memory`, and `prompt`. Every model-bound field is sanitized. Skill patches receive the current complete `SKILL.md` only when it is unchanged by scrubbing and no larger than 15,000 characters. |
+| **4. LLM proposal** | Requests one structured `create`, `patch`, or `no_op` proposal with an optional one-sentence, falsifiable `expected_outcome`. Kinds are `skill`, `memory`, and `prompt`. Every model-bound field is sanitized. The proposal output budget is derived locally from the shared 15,000-character content limit; the reviewer remains separately capped at 300 tokens. A cut-off, malformed, or reasoning-only reply is journaled as `llm_incomplete` rather than presented as a normal `no_op`. Skill patches receive the current complete `SKILL.md` only when it is unchanged by scrubbing and no larger than 15,000 characters. |
 | **5. Guardrails** | Enforces agent-created patch targets, fresh create names, content/frontmatter, prompt-note policy shape, size limits, daily budget, and recent-duplicate rejection. |
 | **6. Prepare** | Creates a durable skill backup, memory recovery metadata, or prompt-note recovery metadata, then appends and `fsync`s a `prepared` journal record before mutation. |
 | **7. Apply and reconcile** | Runs the standard host API for skills/memory (`patch` maps to host `edit`) or atomically writes the plugin-owned prompt-note store. It proves target state and records `applied`, `pending_approval`, or `error`. Host pending approvals reconcile lazily before later runs, audit, or rollback. |
@@ -214,18 +214,24 @@ removed host record without a target match becomes rejected.
 ```
 Refine-created entries (3):
 
-  name                           age     uses  recurred  verdict
-  gmail-scope-fix                12d        5        no  working
-  prisma-migrate-note             9d       ~0         —  too early
-  bash-path-hint                  3d        2       yes  did not help
+  name                           age  ver     uses  recurred  verdict
+  gmail-scope-fix                12d   v2        5        no  working
+      expects: Gmail sends stop returning insufficient_scope
+  prisma-migrate-note             9d   v1       ~0         —  too early
+      expects: —
+  bash-path-hint                  3d   v3        2       yes  did not help
+      expects: PATH errors stop appearing before shell commands
 
 Candidates for removal:
   bash-path-hint — /refine rollback 8c1d2e3f4a5b
 ```
 
 The audit deletes nothing. It prints a rollback command only for recorded
-candidates. Skills that remain unused are fed into later proposals as negative
-examples.
+candidates. Every row shows the model's sanitized expected outcome (`—` when
+omitted) alongside its observed result. Later edits of the same entry advance a
+version; version 3 or later is labelled `churning` only when the normal verdict
+would otherwise be `unclear`. Skills that remain unused are fed into later
+proposals as negative examples.
 
 ### Agent-invocable tool
 
@@ -248,6 +254,9 @@ All keys live under `plugins.entries.refine`:
 | `max_edits_per_day` | int | `3` | Maximum applied, pending, or prepared edits per UTC day. |
 | `only_agent_created` | bool | `true` | Only patch agent-created skills. |
 | `journal_dir` | path | `<HERMES_HOME>/plugins/refine` | Journal, lock, ledger, backups, and prompt notes. |
+| `overview_max_entries` | int | `40` | Existing skills and memory snippets listed per kind in a proposal prompt. |
+| `overview_max_chars` | int | `240` | Maximum characters in each structured overview or history line. |
+| `history_max_entries` | int | `20` | Recent create/patch outcomes fed back into a proposal prompt. |
 | `min_signal_required` | bool | `true` | Require a signal before the proposal call; may enable reviewer fallback. |
 | `min_pattern_count` | int | `2` | Repeats before a failure counts as a mechanical signal. |
 | `reviewer_fallback_enabled` | bool | `true` | Allow one reviewer call when the mechanical gate finds nothing. |
@@ -284,6 +293,11 @@ llm:
   responsible for the agent's whole compaction strategy and conflict with any
   real context-engine plugin. A safe integration needs an observer-only
   `VALID_HOOKS` member fired at the compaction boundary.
+- **No plugin-level reasoning-effort control:** Hermes's structured plugin call
+  exposes no provider reasoning/thinking setting. A model that returns only
+  reasoning and no final text is reported as `llm_incomplete`; pin a
+  non-reasoning model for refine with `plugins.entries.refine.llm` (`model` /
+  `provider`) under the existing trust policy when that mitigation is needed.
 - **No host approval for the prompt-note store:** it is a plugin-owned atomic
   file, not a host memory or skill write. Host-managed skill and memory changes
   still respect staged approvals and reconciliation.
@@ -361,15 +375,24 @@ refine/
 ## What gets sent to the model
 
 Refine sends sanitized aggregated error patterns, explicit correction excerpts,
-existing skill and memory names/snippets, the optional manual reason/prior-pass
-note, and up to 8,000 characters of sanitized recent trajectory to the
-configured provider. If the mechanical signal gate has no signal, the reviewer
-receives only the bounded sanitized trajectory and returns a tiny verdict. When
-a skill patch is selected, a second structured request receives the target's
-current complete `SKILL.md` only if it is safe and no larger than the shared
-15,000-character input/output limit. Unsafe or oversized current skill content
-becomes `no_op`; it is never redacted, truncated, or used to generate a
-destructive replacement.
+a bounded structured overview of existing skills (name, description, category,
+and a known local version) and memory snippets, the optional manual
+reason/prior-pass note, and up to 8,000 characters of sanitized recent
+trajectory to the configured provider. Each overview line is bounded by
+`overview_max_chars`; each kind is capped by `overview_max_entries`, with a
+visible `+N more` marker. It also sends up to `history_max_entries` of its own
+most recent create/patch outcomes, including expected outcomes, so prior results
+can inform the next proposal. Empty history sends no history block; the existing
+negative examples for unused skills remain separate.
+
+If the mechanical signal gate has no signal, the reviewer receives only the
+bounded sanitized trajectory and returns a tiny verdict. When a skill patch is
+selected, a second structured request receives the target's current complete
+`SKILL.md` only if it is safe and no larger than the shared 15,000-character
+input/output limit. The proposal budget derives from that limit locally because
+Hermes exposes no model output-limit capability. Unsafe or oversized current
+skill content becomes `no_op`; it is never redacted, truncated, or used to
+generate a destructive replacement.
 
 Credentials are redacted first, but remaining content is ordinary conversation
 or skill content. Keep `auto_enabled: false` if model-bound session analysis
@@ -383,6 +406,12 @@ must be manually initiated.
   verdicts, host errors, prompt notes, and recursively nested journal fields.
 - **Signal gate and reviewer** reject one-off noise; reviewer failures and
   malformed output decline safely without a proposal call.
+- **Incomplete model replies are visible:** a malformed, token-limited, or
+  reasoning-only reply becomes a non-budget-consuming `llm_incomplete` journal
+  outcome, never a false "nothing to propose" result.
+- **Shared proposal limit:** the proposal token budget derives from the
+  15,000-character content guardrail, while the reviewer uses its independent
+  300-token cap.
 - **Agent-created skills only** for patches; creates require a free normalized
   name and cannot use the reserved `hermes-` prefix.
 - **No autonomous skill delete** — skill deletion is used only by an explicit
