@@ -5,6 +5,7 @@ to ``refine_journal.jsonl``. Before applying a skill/memory edit we
 back up the current state so it can be rolled back.
 """
 
+import hashlib
 import json
 import logging
 import shutil
@@ -121,6 +122,33 @@ def log(
     }
     _append_entry(entry)
     return entry_id
+
+
+def proposal_hash(proposal: Dict[str, Any]) -> str:
+    """Stable id for "this exact edit", used to refuse repeats."""
+    key = "|".join([
+        str(proposal.get("kind", "")),
+        str(proposal.get("name", "")),
+        hashlib.sha1(str(proposal.get("content", "")).encode("utf-8", "replace")).hexdigest(),
+    ])
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+
+
+def was_applied_recently(proposal: Dict[str, Any], within_days: int) -> bool:
+    """Has an identical proposal already been applied inside the window?
+
+    Stops a model that keeps re-proposing the same edit night after night.
+    """
+    target = proposal_hash(proposal)
+    cutoff = time.time() - (within_days * 86400)
+    for entry in _load_entries():
+        if entry.get("outcome") not in ("applied", "pending_approval"):
+            continue
+        if (entry.get("ts") or 0) < cutoff:
+            continue
+        if proposal_hash(entry.get("proposal", {})) == target:
+            return True
+    return False
 
 
 def get_entry(entry_id: str) -> Optional[Dict[str, Any]]:

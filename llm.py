@@ -55,6 +55,10 @@ REFINE_PROPOSAL_SCHEMA: Dict[str, Any] = {
             "items": {"type": "string"},
             "description": "Short verbatim quotes from the trajectory that justify this edit (2-4 items)."
         },
+        "pattern_fingerprint": {
+            "type": "string",
+            "description": "The fp value of the listed repeated failure this edit addresses, if any. Enables later checking whether the edit actually stopped that failure."
+        },
     },
     "required": ["action", "reason"],
 }
@@ -150,6 +154,9 @@ def propose(
     existing_skills: List[str],
     existing_memories: List[str],
     *,
+    error_patterns: Optional[List[Dict[str, Any]]] = None,
+    user_corrections: Optional[List[str]] = None,
+    unused_skills: Optional[List[str]] = None,
     purpose: str = "refine",
 ) -> Dict[str, Any]:
     """Call the LLM to propose a refine edit.
@@ -159,6 +166,9 @@ def propose(
         evidence_text: Recent trajectory content (truncated by caller).
         existing_skills: List of current skill names (to avoid duplicates).
         existing_memories: List of current memory entry short summaries.
+        error_patterns: Aggregated repeated failures from ``patterns.extract_patterns``.
+        user_corrections: Short quotes where the user corrected the agent.
+        unused_skills: Refine-created skills that were never used — negative examples.
         purpose: Audit purpose string.
 
     Returns:
@@ -166,20 +176,47 @@ def propose(
         "content": str, "category": str, "reason": str, "evidence": list}``,
         or ``{"action": "no_op", "reason": "..."}`` on failure.
     """
-    # Build instructions with context
+    # Build instructions with context. The aggregated signal goes FIRST: a model
+    # reasons far better over pre-counted patterns than over a transcript it has
+    # to count through itself.
+    try:
+        from . import patterns as _patterns
+    except ImportError:
+        import patterns as _patterns  # noqa: F811 — standalone test
+
     skills_list = "\n".join(f"  - {s}" for s in sorted(existing_skills)[:50]) or "  (none)"
     mems_list = "\n".join(f"  - {m[:100]}" for m in existing_memories[:30]) or "  (none)"
+    patterns_block = _patterns.format_patterns(error_patterns or [])
+    corrections_block = (
+        "\n".join(f"  - {c[:200]}" for c in (user_corrections or [])[:5]) or "  (none)"
+    )
+
+    unused_block = ""
+    if unused_skills:
+        unused_block = (
+            "\n=== YOUR PREVIOUS SKILLS THAT WERE NEVER USED ===\n"
+            + "\n".join(f"  - {s}" for s in unused_skills[:10])
+            + "\nDo not create skills of this shape again. A skill must change what "
+            "the agent DOES in a specific situation, not merely record a fact.\n"
+        )
 
     instructions = (
-        "Here is the agent's recent trajectory (tool results, messages, errors). "
-        "Find ONE repeat failure or ONE reusable tactic and propose the smallest edit.\n\n"
+        "Below is aggregated evidence from the agent's recent sessions. "
+        "Ground your proposal in ONE of the listed repeated failures or user "
+        "corrections and propose the smallest edit that would prevent it.\n\n"
+        "=== REPEATED FAILURES (aggregated, strongest first) ===\n"
+        f"{patterns_block}\n\n"
+        "=== USER CORRECTIONS ===\n"
+        f"{corrections_block}\n\n"
         "=== EXISTING SKILLS (do NOT duplicate) ===\n"
         f"{skills_list}\n\n"
         "=== EXISTING MEMORIES ===\n"
-        f"{mems_list}\n\n"
-        "=== TRAJECTORY ===\n"
+        f"{mems_list}\n"
+        f"{unused_block}\n"
+        "=== RECENT TRAJECTORY (context only — the signal is above) ===\n"
         f"{evidence_text[-8000:]}\n\n"
-        "Return a single JSON object with your proposal."
+        "Return a single JSON object with your proposal. When your proposal "
+        "addresses a listed failure, set pattern_fingerprint to its fp value."
     )
 
     # Short imperative instruction goes to ``instructions=``; the full context
@@ -283,6 +320,7 @@ def propose(
             "category": category,
             "reason": str(parsed.get("reason", "")),
             "evidence": _ensure_list(parsed.get("evidence")),
+            "pattern_fingerprint": str(parsed.get("pattern_fingerprint", "") or "")[:12],
         }
 
     except PluginLlmTrustError as exc:

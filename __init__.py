@@ -39,6 +39,15 @@ def _handle_refine_command(raw_args: str) -> Optional[str]:
     """
     args = raw_args.strip()
 
+    # Audit path — read-only, never deletes anything
+    if args.startswith("audit"):
+        try:
+            result = core.refine_audit()
+        except Exception as exc:
+            logger.exception("refine audit failed")
+            return f"❌ Audit failed: {exc}"
+        return result.get("report", "No data.")
+
     # Rollback path
     if args.startswith("rollback"):
         entry_id = args.replace("rollback", "").strip()
@@ -164,8 +173,8 @@ def register(ctx) -> None:
     ctx.register_command(
         "refine",
         _handle_refine_command,
-        description="Self-improve skills/memory from trajectory. Usage: /refine [reason|rollback <id>]",
-        args_hint="[reason or rollback <id>]",
+        description="Self-improve skills/memory from trajectory. Usage: /refine [reason|audit|rollback <id>]",
+        args_hint="[reason | audit | rollback <id>]",
     )
     logger.info("refine plugin: registered /refine command")
 

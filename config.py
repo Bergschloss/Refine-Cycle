@@ -85,6 +85,33 @@ def only_agent_created() -> bool:
     return get_bool("only_agent_created", True)
 
 
+def min_pattern_count() -> int:
+    """How many times a failure must repeat before it counts as a signal."""
+    return get_int("min_pattern_count", 2, min_val=1)
+
+
+def min_signal_required() -> bool:
+    """Skip the LLM call entirely when nothing repeated and nothing was corrected."""
+    return get_bool("min_signal_required", True)
+
+
+def cross_session_enabled() -> bool:
+    return get_bool("cross_session_enabled", True)
+
+
+def cross_session_days() -> int:
+    return get_int("cross_session_days", 7, min_val=1)
+
+
+def cross_session_max_sessions() -> int:
+    return get_int("cross_session_max_sessions", 25, min_val=1)
+
+
+def dedup_window_days() -> int:
+    """Refuse a proposal identical to one already applied within this window."""
+    return get_int("dedup_window_days", 7, min_val=1)
+
+
 def journal_dir() -> Path:
     default = Path.home() / ".hermes" / "plugins" / "refine"
     return Path(get_str("journal_dir", str(default)))

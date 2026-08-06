@@ -15,9 +15,9 @@ from typing import Any, Dict, List, Optional
 from agent.plugin_llm import PluginLlm
 
 try:
-    from . import config, journal, llm as _llm
+    from . import config, journal, ledger, llm as _llm, patterns
 except ImportError:
-    import config, journal, llm as _llm  # noqa: F811 — standalone test
+    import config, journal, ledger, llm as _llm, patterns  # noqa: F811 — standalone test
 
 logger = logging.getLogger(__name__)
 
@@ -37,12 +37,22 @@ _SECRET_PATTERNS = [
     (re.compile(r"AIza[A-Za-z0-9_\-]{20,}"), "[REDACTED]"),
     (re.compile(r"xox[baprs]-[A-Za-z0-9\-]{10,}"), "[REDACTED]"),
     (re.compile(r"ntn_[A-Za-z0-9]{20,}"), "[REDACTED]"),
+    (re.compile(r"hf_[A-Za-z0-9]{20,}"), "[REDACTED]"),
+    (re.compile(r"glpat-[A-Za-z0-9_\-]{15,}"), "[REDACTED]"),
+    (re.compile(r"SG\.[A-Za-z0-9_\-]{15,}\.[A-Za-z0-9_\-]{15,}"), "[REDACTED]"),
+    (re.compile(r"dop_v1_[a-f0-9]{60,}"), "[REDACTED]"),
     (re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"), "[REDACTED]"),
     (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S), "[REDACTED]"),
+    # Credentials embedded in a URL: https://user:pass@host
+    (re.compile(r"(https?://)[^/\s:@]+:[^/\s:@]+@"), r"\1[REDACTED]@"),
+    # .env-style line pasted into a message: FOO_API_KEY=value
+    (re.compile(r"(?m)^(\s*[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*\s*=\s*)\S+$"), r"\1[REDACTED]"),
     # "Authorization: <B> <token>" / "<B> <token>" (space-separated value)
     (re.compile(r"(?i)\bauthorization\s*:\s*bearer\s+[A-Za-z0-9_\-\.\/\+]{4,}"), "Authorization: " + _B + " " + _RED),
     (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9_\-\.\/\+]{8,}"), _B + " " + _RED),
-    (re.compile(r"(?i)(authorization|bearer|api[_-]?key|password|passwd|secret|token)\s*[:=]\s*[\"']?[A-Za-z0-9_\-\.\/\+]{4,}"), r"\1=[REDACTED]"),
+    # Generic key=value. Floor of 6 chars: shorter values are overwhelmingly
+    # literals like true/null/1234, and redacting those only destroys evidence.
+    (re.compile(r"(?i)(authorization|bearer|api[_-]?key|password|passwd|secret|token)\s*[:=]\s*[\"']?[A-Za-z0-9_\-\.\/\+]{6,}"), r"\1=[REDACTED]"),
 ]
 
 
@@ -135,6 +145,7 @@ def collect_evidence(session_id: Optional[str] = None, limit: int = 60) -> Dict[
         error_count = 0
         tool_errors: List[Dict[str, Any]] = []
         user_corrections: List[Dict[str, Any]] = []
+        error_items: List[Dict[str, Any]] = []
 
         for row in reversed(rows):
             role = row["role"] or ""
@@ -158,6 +169,12 @@ def collect_evidence(session_id: Optional[str] = None, limit: int = 60) -> Dict[
                     "tool": tool_name,
                     "snippet": content[:300],
                 })
+                error_items.append({
+                    "tool": tool_name,
+                    "content": content,
+                    "session_id": session_id,
+                    "ts": row["timestamp"] or 0,
+                })
 
             # Detect user corrections
             if role == "user" and _is_correction(content):
@@ -168,12 +185,74 @@ def collect_evidence(session_id: Optional[str] = None, limit: int = 60) -> Dict[
         return {
             "messages": messages[-limit:],
             "error_count": error_count,
+            # tool_errors is the flat pre-aggregation view — kept for
+            # compatibility. error_patterns is what callers should read.
             "tool_errors": tool_errors[-10:],
+            "error_patterns": patterns.extract_patterns(error_items),
             "user_corrections": user_corrections[-5:],
             "session_id": session_id,
         }
     finally:
         con.close()
+
+
+def collect_cross_session_patterns(
+    days: Optional[int] = None,
+    max_rows: int = 4000,
+) -> List[Dict[str, Any]]:
+    """Aggregate error patterns across recent sessions.
+
+    A failure that recurs in several *different* sessions is a much stronger
+    signal than one repeated twice inside a single conversation, where it is
+    usually just a retry loop. Only tool rows are read, and the row cap is hard —
+    this runs in a background thread at session end and must not turn into a
+    full-history scan.
+    """
+    if not config.cross_session_enabled():
+        return []
+
+    window_days = days if days is not None else config.cross_session_days()
+    con = _open_db()
+    if not con:
+        return []
+
+    try:
+        since = time.time() - (window_days * 86400)
+        rows = con.execute(
+            "SELECT session_id, tool_name, content, timestamp "
+            "FROM messages "
+            "WHERE role = 'tool' AND active = 1 AND timestamp >= ? "
+            "ORDER BY timestamp DESC LIMIT ?",
+            (since, max_rows),
+        ).fetchall()
+    except Exception as exc:
+        logger.warning("Cross-session query failed: %s", exc)
+        return []
+    finally:
+        con.close()
+
+    items: List[Dict[str, Any]] = []
+    sessions_seen: set = set()
+    max_sessions = config.cross_session_max_sessions()
+
+    for row in rows:
+        sid = str(row["session_id"] or "")
+        if sid and sid not in sessions_seen:
+            if len(sessions_seen) >= max_sessions:
+                continue
+            sessions_seen.add(sid)
+        # Scrub here too: the choke-point rule applies to every path out of the DB.
+        content = scrub_text(str(row["content"] or ""))[:3000]
+        if not _is_error_content(content):
+            continue
+        items.append({
+            "tool": row["tool_name"] or "",
+            "content": content,
+            "session_id": sid,
+            "ts": row["timestamp"] or 0,
+        })
+
+    return patterns.extract_patterns(items)
 
 
 def _is_error_content(content: str) -> bool:
@@ -242,6 +321,25 @@ def list_memory_snippets() -> List[str]:
 # ── guardrails ──────────────────────────────────────────────────────────────
 
 
+def _unused_skills_safe() -> List[str]:
+    """Never let ledger trouble break a refine run."""
+    try:
+        return ledger.unused_skills()
+    except Exception as exc:
+        logger.debug("Cannot compute unused skills: %s", exc)
+        return []
+
+
+def refine_audit() -> Dict[str, Any]:
+    """Read-only report: did the skills refine wrote actually help?"""
+    try:
+        current = collect_cross_session_patterns()
+    except Exception:
+        current = []
+    rows = ledger.audit(current)
+    return {"success": True, "rows": rows, "report": ledger.format_audit(rows)}
+
+
 def _validate_proposal(proposal: Dict[str, Any]) -> Optional[str]:
     """Check guardrails. Returns None if OK, or an error reason string."""
     action = proposal.get("action", "no_op")
@@ -280,6 +378,13 @@ def _validate_proposal(proposal: Dict[str, Any]) -> Optional[str]:
     # (bundled, user, or agent-created). Existing skills are patched, not created.
     if kind == "skill" and action == "create" and name in list_skill_names():
         return f"Skill '{name}' already exists — use patch, not create"
+
+    # Refuse an edit identical to one already applied recently
+    if journal.was_applied_recently(proposal, config.dedup_window_days()):
+        return (
+            f"Identical edit already applied within "
+            f"{config.dedup_window_days()} day(s)"
+        )
 
     # Don't delete anything
     if action == "delete":
@@ -375,11 +480,46 @@ def _refine_once(
             "evidence": evidence,
         }
 
-    # 3. Get existing skills/memories for context
+    # 3. Aggregate failures across this session and the recent window
+    error_patterns = patterns.merge_patterns(
+        evidence.get("error_patterns", []),
+        collect_cross_session_patterns(),
+    )
+    evidence["error_patterns"] = error_patterns
+    corrections = evidence.get("user_corrections", [])
+
+    # 4. Signal gate — a single one-off error teaches nothing generalizable,
+    # so do not spend a model call on it.
+    if config.min_signal_required() and not patterns.has_signal(
+        error_patterns, corrections, min_count=config.min_pattern_count()
+    ):
+        proposal = {
+            "action": "no_op",
+            "reason": (
+                f"No repeated failure (min {config.min_pattern_count()}x) and no user "
+                f"correction in the last {config.cross_session_days()} day(s)."
+            ),
+        }
+        entry_id = journal.log(
+            trigger=trigger,
+            reason=reason or proposal["reason"],
+            session_id=sid,
+            proposal=proposal,
+            outcome="no_op",
+        )
+        return {
+            "success": True,
+            "message": f"No actionable improvement found. {proposal['reason']}",
+            "journal_id": entry_id,
+            "llm_called": False,
+            "evidence": evidence,
+        }
+
+    # 5. Get existing skills/memories for context
     skills = list_skill_names()
     memories = list_memory_snippets()
 
-    # 4. Build evidence text for LLM
+    # 6. Build evidence text for LLM
     ev_lines: List[str] = []
     for m in evidence.get("messages", []):
         role_tag = f"[{m['role']}]"
@@ -388,12 +528,15 @@ def _refine_once(
         ev_lines.append(f"{role_tag} {m['content'][:400]}")
     evidence_text = "\n".join(ev_lines)
 
-    # 5. LLM proposal
+    # 7. LLM proposal
     proposal = _llm.propose(
         llm=llm,
         evidence_text=evidence_text,
         existing_skills=skills,
         existing_memories=memories,
+        error_patterns=error_patterns,
+        user_corrections=[c.get("snippet", "") for c in corrections],
+        unused_skills=_unused_skills_safe(),
         purpose="refine",
     )
 
@@ -489,6 +632,13 @@ def _refine_once(
         backup_path=backup_path,
         error=result.get("error", ""),
     )
+
+    # Register in the usefulness ledger so /refine audit can judge it later.
+    if outcome in ("applied", "pending_approval"):
+        try:
+            ledger.record_edit(proposal, entry_id)
+        except Exception as exc:
+            logger.warning("Cannot record edit in ledger: %s", exc)
 
     elapsed = time.time() - t_start
     msg_parts = [
