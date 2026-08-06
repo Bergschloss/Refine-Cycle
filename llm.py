@@ -1,151 +1,168 @@
-"""LLM proposal engine for the refine plugin.
-
-Wraps ``PluginLlm`` to call the user's active model with structured output
-and produce a validated refine proposal (or no_op).
-"""
+"""LLM proposal engine for the refine plugin."""
 
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from agent.plugin_llm import (
     PluginLlm,
     PluginLlmInput,
-    PluginLlmStructuredResult,
     PluginLlmTextInput,
     PluginLlmTrustError,
 )
 
-logger = logging.getLogger(__name__)
+try:
+    from .sanitization import sanitize, scrub_text
+except ImportError:
+    from sanitization import sanitize, scrub_text  # type: ignore
 
-# ── schema ──────────────────────────────────────────────────────────────────
+logger = logging.getLogger(__name__)
+MAX_CONTENT_CHARS = 15000
 
 REFINE_PROPOSAL_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
-        "action": {
-            "type": "string",
-            "enum": ["create", "patch", "no_op"],
-            "description": "The smallest useful action: create a new skill/memory, patch an existing one (tiny targeted fix), or no_op when nothing worthwhile found."
-        },
-        "kind": {
-            "type": "string",
-            "enum": ["skill", "memory"],
-            "description": "What to edit — a Hermes skill or a memory entry."
-        },
-        "name": {
-            "type": "string",
-            "description": "Target name. For create: new skill/memory name (lowercase, hyphens, max 64 chars for skills). For patch: existing name."
-        },
+        "action": {"type": "string", "enum": ["create", "patch", "no_op"]},
+        "kind": {"type": "string", "enum": ["skill", "memory"]},
+        "name": {"type": "string"},
         "content": {
             "type": "string",
-            "description": "For create: full SKILL.md content (YAML frontmatter + body). For patch: the new replacement text that fixes the issue. Empty for no_op."
+            "description": "Complete replacement SKILL.md for skill create/patch; appended entry for memory.",
         },
-        "category": {
-            "type": "string",
-            "description": "Optional category folder for skill creation (e.g. 'devops', 'research')."
-        },
-        "reason": {
-            "type": "string",
-            "description": "Why this edit, citing the specific failure/pattern from the trajectory."
-        },
-        "evidence": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "Short verbatim quotes from the trajectory that justify this edit (2-4 items)."
-        },
+        "category": {"type": "string"},
+        "reason": {"type": "string"},
+        "evidence": {"type": "array", "items": {"type": "string"}},
         "pattern_fingerprint": {
             "type": "string",
-            "description": "The fp value of the listed repeated failure this edit addresses, if any. Enables later checking whether the edit actually stopped that failure."
+            "description": "Exact 12-character fp value from the repeated-failures list.",
         },
     },
     "required": ["action", "reason"],
 }
 
-REFINE_SYSTEM_PROMPT: str = (
-    "You are a self-improvement mechanic for an AI agent named Hermes. "
-    "Your job: read the agent's recent conversation trajectory and find "
-    "ONE specific, recurring problem or ONE useful reusable tactic. "
-    "Propose the SMALLEST possible edit — a create or patch of ONE skill "
-    "or ONE memory entry — that would prevent the problem or capture the tactic.\n\n"
+REFINE_SYSTEM_PROMPT = (
+    "You are a self-improvement mechanic for an AI agent named Hermes. Read the "
+    "trajectory and propose ONE evidence-grounded, minimal edit.\n\n"
     "RULES:\n"
-    "1. Only ONE edit per proposal. If you see multiple issues, pick the most impactful.\n"
-    "2. Only act when there is real evidence in the trajectory — do not guess.\n"
-    "3. Do not duplicate existing skills (existing skill names are listed above).\n"
-    "4. NEVER edit built-in or bundled skills. Only user/agent-created ones.\n"
-    "5. If patch: provide the NEW full content (the fix), not a diff.\n"
-    "6. Skills MUST have YAML frontmatter (name, description) + markdown body.\n"
-    "7. If nothing worthwhile — return action='no_op' with a brief reason.\n"
-    "8. Be MINIMAL. The smallest edit that fixes the problem. No scope creep.\n"
-    "9. ALWAYS use exactly these fields: action (create|patch|no_op), kind (skill|memory), "
-    "name, content, category (optional), reason, evidence. "
-    "NEVER invent new field names (e.g. 'type') and never combine action+kind "
-    "into one value like 'create_memory'.\n"
-    "Example: {\"action\": \"create\", \"kind\": \"skill\", \"name\": \"my-tip\", "
-    "\"content\": \"---\\nname: my-tip\\ndescription: ...\\n---\\n\\n# Body\", "
-    "\"reason\": \"why\", \"evidence\": [\"quote\"]}\n"
+    "1. Return only one create, patch, or no_op proposal.\n"
+    "2. Never guess or duplicate an existing skill.\n"
+    "3. Never edit built-in or bundled skills.\n"
+    "4. For every skill create or patch, content is the COMPLETE SKILL.md, not a diff. "
+    "Preserve all useful current content when patching.\n"
+    "5. Skills require YAML frontmatter with name and description, then a Markdown body.\n"
+    "6. Return no_op when no worthwhile edit exists.\n"
+    "7. Use exactly: action, kind, name, content, category, reason, evidence, and optional "
+    "pattern_fingerprint. Never combine action and kind.\n"
 )
-
-# ── engine ──────────────────────────────────────────────────────────────────
 
 
 def _salvage_parsed(result: Any) -> Any:
-    """Return ``result.parsed``, or salvage a JSON object from raw text when
-    the provider's json_mode parsing failed (parsed is None/str)."""
     parsed = getattr(result, "parsed", None)
     if isinstance(parsed, dict):
         return parsed
     text = getattr(result, "text", "") or ""
-    if isinstance(parsed, str):
-        text = parsed if not text else text
+    if isinstance(parsed, str) and not text:
+        text = parsed
     if text:
-        m = re.search(r"\{.*\}", text, re.S)
-        if m:
+        match = re.search(r"\{.*\}", text, re.S)
+        if match:
             try:
-                return json.loads(m.group(0))
+                return json.loads(match.group(0))
             except json.JSONDecodeError:
                 pass
     return parsed
 
 
-def _propose_structured(llm: PluginLlm, instructions: str, input_blocks: List[PluginLlmInput]) -> Any:
-    """Call complete_structured, preferring json_schema and falling back to
-    json_mode for providers that reject ``response_format.type=json_schema``
-    (e.g. opencode-go "This response_format type is unavailable now").
-
-    Returns ``result.parsed`` (dict) or raises on final failure.
-    """
+def _propose_structured(
+    llm: PluginLlm, instructions: str, input_blocks: List[PluginLlmInput]
+) -> Any:
+    """Invoke the model only with recursively sanitized text inputs."""
+    safe_blocks: List[PluginLlmInput] = []
+    for block in input_blocks:
+        text = getattr(block, "text", None)
+        if text is None:
+            raise TypeError("Refine accepts only text model inputs")
+        safe_blocks.append(PluginLlmTextInput(text=scrub_text(str(text))))
     common = dict(
-        instructions=instructions,
-        input=input_blocks,
+        instructions=scrub_text(str(instructions)),
+        input=safe_blocks,
         schema_name="refine_proposal",
         purpose="refine",
         temperature=0.0,
-        max_tokens=2048,
+        max_tokens=4096,
     )
+    system_prompt = scrub_text(REFINE_SYSTEM_PROMPT)
     try:
         result = llm.complete_structured(
-            system_prompt=REFINE_SYSTEM_PROMPT, json_schema=REFINE_PROPOSAL_SCHEMA, **common
+            system_prompt=system_prompt,
+            json_schema=sanitize(REFINE_PROPOSAL_SCHEMA),
+            **common,
         )
         return _salvage_parsed(result)
     except PluginLlmTrustError:
         raise
     except Exception as first_exc:
         logger.warning(
-            "complete_structured(json_schema) failed (%s) — falling back to json_mode", first_exc
+            "json_schema proposal failed (%s); falling back to json_mode",
+            scrub_text(str(first_exc)),
         )
-        try:
-            result = llm.complete_structured(
-                system_prompt=REFINE_SYSTEM_PROMPT
-                + "\n\nReply with a single JSON object ONLY. No markdown fences, no commentary.",
-                json_mode=True,
-                **common,
-            )
-            return _salvage_parsed(result)
-        except Exception as exc2:
-            logger.error("json_mode fallback also failed: %s", exc2)
-            raise
+        result = llm.complete_structured(
+            system_prompt=system_prompt
+            + "\nReply with one JSON object only, without Markdown fences.",
+            json_mode=True,
+            **common,
+        )
+        return _salvage_parsed(result)
+
+
+def _ensure_dict(parsed: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(parsed, dict):
+        return sanitize(parsed)
+    if isinstance(parsed, str):
+        match = re.search(r"\{.*\}", parsed, re.S)
+        if match:
+            try:
+                value = json.loads(match.group(0))
+                return sanitize(value) if isinstance(value, dict) else None
+            except json.JSONDecodeError:
+                pass
+    return None
+
+
+def _normalize_fields(parsed: Dict[str, Any]) -> Tuple[str, str, str, str, str]:
+    action = str(parsed.get("action", "no_op")).strip().lower()
+    for verb in ("create", "patch"):
+        for candidate_kind in ("skill", "memory"):
+            if action == f"{verb}_{candidate_kind}":
+                parsed.setdefault("kind", candidate_kind)
+                action = verb
+    kind = str(parsed.get("kind") or parsed.get("type") or "").strip().lower()
+    name = str(parsed.get("name", "")).strip()
+    content = str(parsed.get("content", ""))
+    category = str(parsed.get("category", "")).strip()
+    if kind not in ("skill", "memory") and action == "create":
+        kind = (
+            "skill"
+            if re.search(r"^---\s*$", content[:300], re.M) and "name:" in content[:300]
+            else "memory"
+        )
+    if kind == "skill":
+        name = _normalize_skill_name(name)
+    return action, kind, name, content, category
+
+
+def _default_skill_loader(name: str) -> Optional[str]:
+    try:
+        from .journal import read_skill_content
+    except ImportError:
+        from journal import read_skill_content  # type: ignore
+    return read_skill_content(name)
+
+
+def _valid_fingerprint(value: Any) -> str:
+    candidate = str(value or "").strip().lower()
+    return candidate if re.fullmatch(r"[0-9a-f]{12}", candidate) else ""
 
 
 def propose(
@@ -158,125 +175,83 @@ def propose(
     user_corrections: Optional[List[str]] = None,
     unused_skills: Optional[List[str]] = None,
     purpose: str = "refine",
+    run_context: str = "",
+    skill_content_loader: Optional[Callable[[str], Optional[str]]] = None,
 ) -> Dict[str, Any]:
-    """Call the LLM to propose a refine edit.
-
-    Args:
-        llm: A ``PluginLlm`` instance (can be ``ctx.llm`` or a fresh one).
-        evidence_text: Recent trajectory content (truncated by caller).
-        existing_skills: List of current skill names (to avoid duplicates).
-        existing_memories: List of current memory entry short summaries.
-        error_patterns: Aggregated repeated failures from ``patterns.extract_patterns``.
-        user_corrections: Short quotes where the user corrected the agent.
-        unused_skills: Refine-created skills that were never used — negative examples.
-        purpose: Audit purpose string.
-
-    Returns:
-        A dict with shape ``{"action": str, "kind": str, "name": str,
-        "content": str, "category": str, "reason": str, "evidence": list}``,
-        or ``{"action": "no_op", "reason": "..."}`` on failure.
-    """
-    # Build instructions with context. The aggregated signal goes FIRST: a model
-    # reasons far better over pre-counted patterns than over a transcript it has
-    # to count through itself.
+    """Propose one edit; skill patches are regenerated from safe full content."""
     try:
         from . import patterns as _patterns
     except ImportError:
-        import patterns as _patterns  # noqa: F811 — standalone test
+        import patterns as _patterns  # type: ignore
 
-    skills_list = "\n".join(f"  - {s}" for s in sorted(existing_skills)[:50]) or "  (none)"
-    mems_list = "\n".join(f"  - {m[:100]}" for m in existing_memories[:30]) or "  (none)"
-    patterns_block = _patterns.format_patterns(error_patterns or [])
-    corrections_block = (
-        "\n".join(f"  - {c[:200]}" for c in (user_corrections or [])[:5]) or "  (none)"
-    )
+    # Sanitize independently at this final model boundary even when callers have
+    # already sanitized their evidence. This keeps every prompt piece safe.
+    evidence_text = scrub_text(str(evidence_text))
+    existing_skills = [scrub_text(str(item)) for item in existing_skills]
+    existing_memories = [scrub_text(str(item)) for item in existing_memories]
+    error_patterns = sanitize(error_patterns or [])
+    user_corrections = [scrub_text(str(item)) for item in (user_corrections or [])]
+    unused_skills = [scrub_text(str(item)) for item in (unused_skills or [])]
+    run_context = scrub_text(str(run_context))
+    del purpose  # The host purpose is fixed to the plugin's trusted purpose.
 
+    skills_list = "\n".join(
+        f"  - {name}" for name in sorted(existing_skills)[:50]
+    ) or "  (none)"
+    mems_list = "\n".join(
+        f"  - {item[:100]}" for item in existing_memories[:30]
+    ) or "  (none)"
+    corrections = "\n".join(
+        f"  - {item[:200]}" for item in user_corrections[:5]
+    ) or "  (none)"
     unused_block = ""
     if unused_skills:
         unused_block = (
-            "\n=== YOUR PREVIOUS SKILLS THAT WERE NEVER USED ===\n"
-            + "\n".join(f"  - {s}" for s in unused_skills[:10])
-            + "\nDo not create skills of this shape again. A skill must change what "
-            "the agent DOES in a specific situation, not merely record a fact.\n"
+            "\n=== PREVIOUS UNUSED SKILLS ===\n"
+            + "\n".join(f"  - {name}" for name in unused_skills[:10])
+            + "\nDo not create more skills of this ineffective shape.\n"
         )
-
+    context_block = run_context.strip() or "(none)"
     instructions = (
-        "Below is aggregated evidence from the agent's recent sessions. "
-        "Ground your proposal in ONE of the listed repeated failures or user "
-        "corrections and propose the smallest edit that would prevent it.\n\n"
-        "=== REPEATED FAILURES (aggregated, strongest first) ===\n"
-        f"{patterns_block}\n\n"
+        "Ground the proposal in one repeated failure or explicit correction.\n\n"
+        "=== RUN REQUEST / PRIOR PASS CONTEXT ===\n"
+        f"{context_block}\n\n"
+        "=== REPEATED FAILURES ===\n"
+        f"{_patterns.format_patterns(error_patterns)}\n\n"
         "=== USER CORRECTIONS ===\n"
-        f"{corrections_block}\n\n"
-        "=== EXISTING SKILLS (do NOT duplicate) ===\n"
+        f"{corrections}\n\n"
+        "=== EXISTING SKILLS ===\n"
         f"{skills_list}\n\n"
         "=== EXISTING MEMORIES ===\n"
         f"{mems_list}\n"
         f"{unused_block}\n"
-        "=== RECENT TRAJECTORY (context only — the signal is above) ===\n"
+        "=== RECENT TRAJECTORY ===\n"
         f"{evidence_text[-8000:]}\n\n"
-        "Return a single JSON object with your proposal. When your proposal "
-        "addresses a listed failure, set pattern_fingerprint to its fp value."
+        "Return one JSON object. Copy the full 12-character fp exactly when applicable."
     )
-
-    # Short imperative instruction goes to ``instructions=``; the full context
-    # is passed as the input block. Passing the same text in both places would
-    # double the tokens on every call.
-    short_instructions = "Propose one minimal skill or memory edit."
-    input_blocks: List[PluginLlmInput] = [
-        PluginLlmTextInput(text=instructions),
-    ]
+    short = "Propose one minimal skill or memory edit."
 
     try:
-        parsed = _propose_structured(llm, short_instructions, input_blocks)
-
-        if not isinstance(parsed, dict):
-            # Provider returned non-object (e.g. raw text) — try to salvage JSON.
-            if isinstance(parsed, str):
-                import re as _re
-                m = _re.search(r"\{.*\}", parsed, _re.S)
-                if m:
-                    try:
-                        parsed = json.loads(m.group(0))
-                    except json.JSONDecodeError:
-                        pass
-        if not isinstance(parsed, dict):
-            logger.warning("LLM returned non-dict parsed: %s", type(parsed))
+        parsed = _ensure_dict(
+            _propose_structured(llm, short, [PluginLlmTextInput(text=instructions)])
+        )
+        if parsed is None:
             return {"action": "no_op", "reason": "LLM returned non-object output"}
 
-        # Retry once if the model proposed create without content (a common
-        # json_mode miss) — nudge it to include the content field.
-        if (
-            str(parsed.get("action", "")).strip() == "create"
-            and not str(parsed.get("content") or "").strip()
-        ):
-            retry_instructions = (
-                instructions
-                + "\n\nIMPORTANT: action='create' REQUIRES a non-empty 'content' "
-                + "field containing the full SKILL.md or memory text. Include it."
+        action, kind, name, content, category = _normalize_fields(parsed)
+        if action == "create" and not content:
+            retry_text = instructions + "\n\nA create requires non-empty complete content. Return it now."
+            retry = _ensure_dict(
+                _propose_structured(llm, short, [PluginLlmTextInput(text=retry_text)])
             )
-            retry = _propose_structured(
-                llm, short_instructions, [PluginLlmTextInput(text=retry_instructions)]
-            )
-            if isinstance(retry, dict) and str(retry.get("content") or "").strip():
+            if retry is not None:
                 parsed = retry
-
-        # Validate + normalize
-        action = str(parsed.get("action", "no_op")).strip().lower()
-
-        # Normalize "<verb>_<kind>" style (create_memory, patch_skill, ...)
-        # that some models emit in json_mode instead of separate fields.
-        for _verb in ("create", "patch"):
-            for _kind in ("skill", "memory"):
-                if action == f"{_verb}_{_kind}":
-                    parsed.setdefault("kind", _kind)
-                    action = _verb
+                action, kind, name, content, category = _normalize_fields(parsed)
 
         if action not in ("create", "patch", "no_op"):
             return {"action": "no_op", "reason": f"Invalid action: {action}"}
-
         if action == "no_op":
-            return {
+            return sanitize({
                 "action": "no_op",
                 "kind": "",
                 "name": "",
@@ -284,65 +259,97 @@ def propose(
                 "category": "",
                 "reason": str(parsed.get("reason", "No actionable improvement found")),
                 "evidence": _ensure_list(parsed.get("evidence")),
-            }
-
-        kind = str(parsed.get("kind") or parsed.get("type") or "").strip()
-        name = str(parsed.get("name", "")).strip()
-        content = str(parsed.get("content", "")).strip()
-        category = str(parsed.get("category", "")).strip()
-
-        if kind not in ("skill", "memory"):
-            # Heuristic for models that omit kind: YAML-frontmatter content
-            # looks like a SKILL.md, anything else is a memory entry.
-            if action == "create":
-                if re.search(r"^---\s*$", content[:200], re.M) and "name:" in content[:200]:
-                    kind = "skill"
-                else:
-                    kind = "memory"
+                "pattern_fingerprint": "",
+            })
         if kind not in ("skill", "memory"):
             return {"action": "no_op", "reason": f"Invalid kind: {kind}"}
-
-        if action == "create" and not content:
-            return {"action": "no_op", "reason": "Create requires content (SKILL.md or memory text)"}
-
         if not name:
             return {"action": "no_op", "reason": "Name is required for create/patch"}
+        if not content and not (action == "patch" and kind == "skill"):
+            return {"action": "no_op", "reason": f"{action.title()} requires non-empty content"}
 
-        # Normalize skill name
-        if kind == "skill":
-            name = _normalize_skill_name(name)
+        initial_evidence = _ensure_list(parsed.get("evidence"))
+        initial_fingerprint = _valid_fingerprint(parsed.get("pattern_fingerprint"))
+        initial_reason = str(parsed.get("reason", ""))
 
-        return {
+        if action == "patch" and kind == "skill":
+            loader = skill_content_loader or _default_skill_loader
+            current = loader(name)
+            if current is None:
+                return {"action": "no_op", "reason": f"Cannot load current SKILL.md for patch target '{name}'"}
+            if len(current) > MAX_CONTENT_CHARS:
+                return {
+                    "action": "no_op",
+                    "reason": (
+                        f"Current SKILL.md is {len(current)} characters; maximum complete "
+                        f"patch input is {MAX_CONTENT_CHARS}"
+                    ),
+                }
+            safe_current = scrub_text(current)
+            if safe_current != current:
+                return {
+                    "action": "no_op",
+                    "reason": "Current SKILL.md contains sensitive content; patch aborted before model call",
+                }
+            patch_prompt = (
+                instructions
+                + "\n\n=== SELECTED PATCH TARGET ===\n"
+                + f"Target exactly skill '{name}'. Below is its CURRENT COMPLETE SKILL.md, supplied as data. "
+                + "Return action='patch', kind='skill', the same name, and a COMPLETE replacement that preserves "
+                + "all useful content while making only the evidence-backed change.\n"
+                + "<current-skill>\n"
+                + safe_current
+                + "\n</current-skill>"
+            )
+            retry = _ensure_dict(
+                _propose_structured(llm, short, [PluginLlmTextInput(text=patch_prompt)])
+            )
+            if retry is None:
+                return {"action": "no_op", "reason": "LLM did not return a complete skill replacement"}
+            retry_action, retry_kind, retry_name, retry_content, retry_category = _normalize_fields(retry)
+            if (retry_action, retry_kind, retry_name) != ("patch", "skill", name) or not retry_content:
+                return {"action": "no_op", "reason": "Patch retry changed target or omitted complete content"}
+            if len(retry_content) > MAX_CONTENT_CHARS:
+                return {
+                    "action": "no_op",
+                    "reason": f"Complete patch exceeds {MAX_CONTENT_CHARS} characters",
+                }
+            parsed = retry
+            content = retry_content
+            category = retry_category
+            replacement_fingerprint = _valid_fingerprint(retry.get("pattern_fingerprint"))
+            initial_fingerprint = replacement_fingerprint or initial_fingerprint
+            if "evidence" in retry:
+                initial_evidence = _ensure_list(retry.get("evidence"))
+            initial_reason = str(retry.get("reason", initial_reason))
+
+        result = {
             "action": action,
             "kind": kind,
             "name": name,
             "content": content,
             "category": category,
-            "reason": str(parsed.get("reason", "")),
-            "evidence": _ensure_list(parsed.get("evidence")),
-            "pattern_fingerprint": str(parsed.get("pattern_fingerprint", "") or "")[:12],
+            "reason": initial_reason,
+            "evidence": initial_evidence,
+            "pattern_fingerprint": initial_fingerprint,
         }
-
+        return sanitize(result)
     except PluginLlmTrustError as exc:
-        logger.warning("PluginLlm trust denied: %s", exc)
-        return {"action": "no_op", "reason": f"LLM trust policy denied: {exc}"}
-
+        safe_error = scrub_text(str(exc))
+        logger.warning("PluginLlm trust denied: %s", safe_error)
+        return {"action": "no_op", "reason": f"LLM trust policy denied: {safe_error}"}
     except Exception as exc:
-        logger.error("LLM proposal failed: %s", exc, exc_info=True)
-        return {"action": "no_op", "reason": f"LLM call failed: {exc}"}
+        safe_error = scrub_text(str(exc))
+        logger.error("LLM proposal failed: %s", safe_error, exc_info=True)
+        return {"action": "no_op", "reason": f"LLM call failed: {safe_error}"}
 
 
-def _ensure_list(val: Any) -> List[str]:
-    if isinstance(val, list):
-        return [str(v) for v in val[:10]]
-    return []
+def _ensure_list(value: Any) -> List[str]:
+    return [scrub_text(str(item)) for item in value[:10]] if isinstance(value, list) else []
 
 
 def _normalize_skill_name(name: str) -> str:
-    """Normalize to lowercase-hyphens, max 64 chars."""
-    import re
-    name = name.lower().strip()
+    name = scrub_text(name).lower().strip()
     name = re.sub(r"[^a-z0-9_-]+", "-", name)
     name = re.sub(r"-{2,}", "-", name)
-    name = name.strip("-")
-    return name[:64]
+    return name.strip("-")[:64]

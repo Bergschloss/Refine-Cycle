@@ -1,103 +1,48 @@
-"""Core refine logic: collect trajectory evidence, run guardrails, apply edits.
-
-This module does NOT import PluginContext — it receives a ``PluginLlm``
-and works standalone (testable without a live session).
-"""
+"""Core refine orchestration: evidence, guardrails, durable apply, rollback."""
 
 import json
 import logging
 import re
 import sqlite3
 import time
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.plugin_llm import PluginLlm
 
 try:
     from . import config, journal, ledger, llm as _llm, patterns
+    from .sanitization import sanitize, scrub_text
 except ImportError:
-    import config, journal, ledger, llm as _llm, patterns  # noqa: F811 — standalone test
+    import config, journal, ledger, llm as _llm, patterns  # noqa: F811
+    from sanitization import sanitize, scrub_text  # noqa: F811
 
 logger = logging.getLogger(__name__)
 
-# ── secret scrubbing ─────────────────────────────────────────────────────────
-# Trajectory fragments (tool outputs, user messages) may contain credentials.
-# Scrub them before anything leaves the machine: LLM calls AND the journal.
-
-_RED = '[REDACTED]'
-_B = 'Bearer'
-
-_SECRET_PATTERNS = [
-    (re.compile(r"github_pat_[A-Za-z0-9_]+"), "[REDACTED]"),
-    (re.compile(r"ghp_[A-Za-z0-9]{20,}"), "[REDACTED]"),
-    (re.compile(r"gho_[A-Za-z0-9]{20,}"), "[REDACTED]"),
-    (re.compile(r"sk-[A-Za-z0-9_\-]{20,}"), "[REDACTED]"),
-    (re.compile(r"AKIA[0-9A-Z]{16}"), "[REDACTED]"),
-    (re.compile(r"AIza[A-Za-z0-9_\-]{20,}"), "[REDACTED]"),
-    (re.compile(r"xox[baprs]-[A-Za-z0-9\-]{10,}"), "[REDACTED]"),
-    (re.compile(r"ntn_[A-Za-z0-9]{20,}"), "[REDACTED]"),
-    (re.compile(r"hf_[A-Za-z0-9]{20,}"), "[REDACTED]"),
-    (re.compile(r"glpat-[A-Za-z0-9_\-]{15,}"), "[REDACTED]"),
-    (re.compile(r"SG\.[A-Za-z0-9_\-]{15,}\.[A-Za-z0-9_\-]{15,}"), "[REDACTED]"),
-    (re.compile(r"dop_v1_[a-f0-9]{60,}"), "[REDACTED]"),
-    (re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"), "[REDACTED]"),
-    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S), "[REDACTED]"),
-    # Credentials embedded in a URL: https://user:pass@host
-    (re.compile(r"(https?://)[^/\s:@]+:[^/\s:@]+@"), r"\1[REDACTED]@"),
-    # .env-style line pasted into a message: FOO_API_KEY=value
-    (re.compile(r"(?m)^(\s*[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*\s*=\s*)\S+$"), r"\1[REDACTED]"),
-    # "Authorization: <B> <token>" / "<B> <token>" (space-separated value)
-    (re.compile(r"(?i)\bauthorization\s*:\s*bearer\s+[A-Za-z0-9_\-\.\/\+]{4,}"), "Authorization: " + _B + " " + _RED),
-    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9_\-\.\/\+]{8,}"), _B + " " + _RED),
-    # Generic key=value. Floor of 6 chars: shorter values are overwhelmingly
-    # literals like true/null/1234, and redacting those only destroys evidence.
-    (re.compile(r"(?i)(authorization|bearer|api[_-]?key|password|passwd|secret|token)\s*[:=]\s*[\"']?[A-Za-z0-9_\-\.\/\+]{6,}"), r"\1=[REDACTED]"),
-]
-
-
-def scrub_text(text: str) -> str:
-    """Replace known credential patterns with [REDACTED]."""
-    if not text:
-        return text
-    for pattern, repl in _SECRET_PATTERNS:
-        text = pattern.sub(repl, text)
-    return text
-
 
 def scrub_proposal(proposal: Dict[str, Any]) -> Dict[str, Any]:
-    """Scrub all string fields of a proposal dict before journaling."""
-    out = dict(proposal)
-    for key, val in list(out.items()):
-        if isinstance(val, str):
-            out[key] = scrub_text(val)
-        elif isinstance(val, list):
-            out[key] = [scrub_text(v) if isinstance(v, str) else v for v in val]
-    return out
+    """Compatibility wrapper for recursive shared sanitation."""
+    return sanitize(proposal)
 
-# ── trajectory collector ────────────────────────────────────────────────────
+
+# ── trajectory collection ──────────────────────────────────────────────────
 
 
 def _open_db() -> Optional[sqlite3.Connection]:
-    """Open state.db read-only. Returns None on failure."""
-    db_path = config.state_db_path()
-    if not db_path.is_file():
-        logger.warning("state.db not found at %s", db_path)
+    path = config.state_db_path()
+    if not path.is_file():
         return None
     try:
-        uri = f"file:{db_path}?mode=ro"
-        con = sqlite3.connect(uri, uri=True)
-        con.row_factory = sqlite3.Row
-        return con
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        connection.row_factory = sqlite3.Row
+        return connection
     except Exception as exc:
         logger.warning("Cannot open state.db: %s", exc)
         return None
 
 
-def _get_recent_session_id(con: sqlite3.Connection) -> Optional[str]:
-    """Get the most recently ended session id."""
+def _get_recent_session_id(connection: sqlite3.Connection) -> Optional[str]:
     try:
-        row = con.execute(
+        row = connection.execute(
             "SELECT id FROM sessions ORDER BY started_at DESC LIMIT 1"
         ).fetchone()
         return row["id"] if row else None
@@ -105,241 +50,238 @@ def _get_recent_session_id(con: sqlite3.Connection) -> Optional[str]:
         return None
 
 
-def collect_evidence(session_id: Optional[str] = None, limit: int = 60) -> Dict[str, Any]:
-    """Gather recent trajectory from state.db.
-
-    Returns dict with: messages, error_count, tool_errors, user_corrections, session_id.
-    """
-    con = _open_db()
-    if not con:
-        return {
-            "messages": [],
-            "error_count": 0,
-            "tool_errors": [],
-            "user_corrections": [],
-            "session_id": "",
-        }
-
+def _structured_error_status(content: str) -> Optional[bool]:
+    """Return a definitive structured status, or None when text is unstructured."""
     try:
-        if not session_id:
-            session_id = _get_recent_session_id(con)
+        value = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        value = None
+    if isinstance(value, dict):
+        exit_values = [
+            value[key]
+            for key in ("exit_code", "returncode", "return_code")
+            if key in value
+            and isinstance(value[key], (int, float))
+            and not isinstance(value[key], bool)
+        ]
+        if any(code != 0 for code in exit_values):
+            return True
+        error = value.get("error")
+        if error not in (None, "", False, [], {}):
+            return True
+        if value.get("success") is False or value.get("ok") is False:
+            return True
+        if exit_values and all(code == 0 for code in exit_values):
+            return False
+        if value.get("success") is True or value.get("ok") is True:
+            return False
 
-        if not session_id:
-            return {
-                "messages": [],
-                "error_count": 0,
-                "tool_errors": [],
-                "user_corrections": [],
-                "session_id": "",
-            }
-
-        rows = con.execute(
-            "SELECT role, content, tool_name, timestamp "
-            "FROM messages "
-            "WHERE session_id = ? AND active = 1 "
-            "ORDER BY timestamp DESC LIMIT ?",
-            (session_id, limit),
-        ).fetchall()
-
-        messages: List[Dict[str, Any]] = []
-        error_count = 0
-        tool_errors: List[Dict[str, Any]] = []
-        user_corrections: List[Dict[str, Any]] = []
-        error_items: List[Dict[str, Any]] = []
-
-        for row in reversed(rows):
-            role = row["role"] or ""
-            # Scrub at the single point where rows leave the DB — every
-            # downstream consumer (LLM evidence, journal, tool result echoed
-            # back into context) gets the redacted text automatically.
-            content = scrub_text(str(row["content"] or ""))[:3000]  # truncate long outputs
-            tool_name = row["tool_name"] or ""
-
-            entry: Dict[str, Any] = {
-                "role": role,
-                "content": content if len(content) <= 400 else content[:400] + "…",
-                "tool_name": tool_name,
-            }
-            messages.append(entry)
-
-            # Detect errors
-            if role == "tool" and _is_error_content(content):
-                error_count += 1
-                tool_errors.append({
-                    "tool": tool_name,
-                    "snippet": content[:300],
-                })
-                error_items.append({
-                    "tool": tool_name,
-                    "content": content,
-                    "session_id": session_id,
-                    "ts": row["timestamp"] or 0,
-                })
-
-            # Detect user corrections
-            if role == "user" and _is_correction(content):
-                user_corrections.append({
-                    "snippet": content[:300],
-                })
-
-        return {
-            "messages": messages[-limit:],
-            "error_count": error_count,
-            # tool_errors is the flat pre-aggregation view — kept for
-            # compatibility. error_patterns is what callers should read.
-            "tool_errors": tool_errors[-10:],
-            "error_patterns": patterns.extract_patterns(error_items),
-            "user_corrections": user_corrections[-5:],
-            "session_id": session_id,
-        }
-    finally:
-        con.close()
-
-
-def collect_cross_session_patterns(
-    days: Optional[int] = None,
-    max_rows: int = 4000,
-) -> List[Dict[str, Any]]:
-    """Aggregate error patterns across recent sessions.
-
-    A failure that recurs in several *different* sessions is a much stronger
-    signal than one repeated twice inside a single conversation, where it is
-    usually just a retry loop. Only tool rows are read, and the row cap is hard —
-    this runs in a background thread at session end and must not turn into a
-    full-history scan.
-    """
-    if not config.cross_session_enabled():
-        return []
-
-    window_days = days if days is not None else config.cross_session_days()
-    con = _open_db()
-    if not con:
-        return []
-
-    try:
-        since = time.time() - (window_days * 86400)
-        rows = con.execute(
-            "SELECT session_id, tool_name, content, timestamp "
-            "FROM messages "
-            "WHERE role = 'tool' AND active = 1 AND timestamp >= ? "
-            "ORDER BY timestamp DESC LIMIT ?",
-            (since, max_rows),
-        ).fetchall()
-    except Exception as exc:
-        logger.warning("Cross-session query failed: %s", exc)
-        return []
-    finally:
-        con.close()
-
-    items: List[Dict[str, Any]] = []
-    sessions_seen: set = set()
-    max_sessions = config.cross_session_max_sessions()
-
-    for row in rows:
-        sid = str(row["session_id"] or "")
-        if sid and sid not in sessions_seen:
-            if len(sessions_seen) >= max_sessions:
-                continue
-            sessions_seen.add(sid)
-        # Scrub here too: the choke-point rule applies to every path out of the DB.
-        content = scrub_text(str(row["content"] or ""))[:3000]
-        if not _is_error_content(content):
-            continue
-        items.append({
-            "tool": row["tool_name"] or "",
-            "content": content,
-            "session_id": sid,
-            "ts": row["timestamp"] or 0,
-        })
-
-    return patterns.extract_patterns(items)
-
-
-# A successful JSON tool result usually still contains the word "error" — as a
-# field name with a null value. Counting those as failures buries the real ones.
-_JSON_SUCCESS_MARKERS = (
-    '"success": true', '"success":true',
-    '"error": null', '"error":null',
-    '"error": ""', '"error":""',
-    '"ok": true', '"ok":true',
-)
+    codes = [
+        int(match)
+        for match in re.findall(
+            r"(?i)(?:\bexit[_ ]?code\b|\breturncode\b)\s*[:=]?\s*(-?\d+)",
+            content,
+        )
+    ]
+    if any(code != 0 for code in codes):
+        return True
+    return False if codes else None
 
 
 def _is_error_content(content: str) -> bool:
-    """Heuristic: does this look like a tool error?"""
-    if len(content) >= 2000:
-        return False  # error messages tend to be short
-
-    lower = content.lower()
-
-    # An explicit success marker outranks any incidental "error" keyword.
-    if any(marker in lower for marker in _JSON_SUCCESS_MARKERS):
+    """Classify structured status first, then bounded head/tail error text."""
+    if not content:
         return False
-
-    return any(
-        kw in content or kw in lower
-        for kw in ["Traceback", "exit_code", " error", "failed", "ERROR", "timeout"]
+    structured = _structured_error_status(content)
+    if structured is not None:
+        return structured
+    sample = (
+        content
+        if len(content) <= 4000
+        else content[:1000] + "\n…\n" + content[-3000:]
+    )
+    sample = re.sub(r'(?i)["\']?error["\']?\s*:\s*(?:null|""|\'\')', "", sample)
+    return bool(
+        re.search(
+            r"(?i)(?:^|[\s\[{(,:;])(?:traceback|error\b|failed\b|failure\b|timed?\s*out\b|timeout\b)",
+            sample,
+        )
     )
 
 
 def _is_correction(content: str) -> bool:
-    """Heuristic: is the user clearly correcting the agent?
-
-    Deliberately narrow — generic words like "no", "не", "use", "try" match
-    almost every message and produce noise. Only explicit correction phrasings
-    (plus a minimum length) count as a signal.
-    """
-    if len(content) < 15:
+    """Recognize explicit agent corrections, not routine instructions."""
+    if len(content.strip()) < 12:
         return False
-    lower = content.lower()
-    correction_phrases = [
-        "wrong", "неправильно", "не так", "not right", "fix it", "fix the",
-        "don't", "do not", "замість", "instead", "correct", "спробуй інакше",
-        "try again", "stop", "не треба", "не роби", "не використовуй",
-        "use the", "use this", "that's not", "that is not", "перероби",
-    ]
-    return any(ph in lower for ph in correction_phrases)
+    text = re.sub(r"\s+", " ", content.strip().lower())
+    strong = (
+        r"\b(?:that(?:'s| is) (?:wrong|not right)|you (?:are|were) wrong|wrong answer|incorrect)\b",
+        r"\b(?:неправильно|це не так|ти помилив|ви помилили)\b",
+        r"^(?:no|ні|нет)[,;:]\s+.{0,100}\b(?:wrong|not right|не так|неправильно|instead|замість)\b",
+        r"\b(?:you used|ти використав|ви використали)\b.{0,120}\b(?:use|instead|замість)\b",
+    )
+    return any(re.search(pattern, text) for pattern in strong)
 
 
-# ── existing skills / memories ──────────────────────────────────────────────
+def collect_evidence(session_id: Optional[str] = None, limit: int = 60) -> Dict[str, Any]:
+    connection = _open_db()
+    empty = {
+        "messages": [],
+        "error_count": 0,
+        "tool_errors": [],
+        "error_patterns": [],
+        "user_corrections": [],
+        "session_id": "",
+    }
+    if not connection:
+        return empty
+    try:
+        session_id = session_id or _get_recent_session_id(connection)
+        if not session_id:
+            return empty
+        rows = connection.execute(
+            "SELECT role, content, tool_name, timestamp FROM messages "
+            "WHERE session_id = ? AND active = 1 ORDER BY timestamp DESC LIMIT ?",
+            (session_id, limit),
+        ).fetchall()
+        messages: List[Dict[str, Any]] = []
+        tool_errors: List[Dict[str, Any]] = []
+        corrections: List[Dict[str, Any]] = []
+        error_items: List[Dict[str, Any]] = []
+        for row in reversed(rows):
+            role = str(row["role"] or "")
+            content = scrub_text(str(row["content"] or ""))
+            tool_name = str(row["tool_name"] or "")
+            shown = content[:400] + ("…" if len(content) > 400 else "")
+            messages.append({"role": role, "content": shown, "tool_name": tool_name})
+            if role == "tool" and _is_error_content(content):
+                bounded = (
+                    content
+                    if len(content) <= 4000
+                    else content[:1000] + "\n…\n" + content[-3000:]
+                )
+                tool_errors.append({"tool": tool_name, "snippet": bounded[:300]})
+                error_items.append({
+                    "tool": tool_name,
+                    "content": bounded,
+                    "session_id": session_id,
+                    "ts": row["timestamp"] or 0,
+                })
+            if role == "user" and _is_correction(content):
+                corrections.append({"snippet": content[:300]})
+        return {
+            "messages": messages[-limit:],
+            "error_count": len(tool_errors),
+            "tool_errors": tool_errors[-10:],
+            "error_patterns": patterns.extract_patterns(error_items),
+            "user_corrections": corrections[-5:],
+            "session_id": session_id,
+        }
+    finally:
+        connection.close()
+
+
+def collect_cross_session_patterns(
+    days: Optional[int] = None,
+    max_rows: Optional[int] = 4000,
+    *,
+    since_ts: Optional[float] = None,
+    max_sessions: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    if not config.cross_session_enabled():
+        return []
+    connection = _open_db()
+    if not connection:
+        return []
+    since = (
+        since_ts
+        if since_ts is not None
+        else time.time() - ((days or config.cross_session_days()) * 86400)
+    )
+    sql = (
+        "SELECT session_id, tool_name, content, timestamp FROM messages "
+        "WHERE role = 'tool' AND active = 1 AND timestamp >= ? ORDER BY timestamp DESC"
+    )
+    params: List[Any] = [since]
+    if max_rows is not None:
+        sql += " LIMIT ?"
+        params.append(max_rows)
+    try:
+        cursor = connection.execute(sql, tuple(params))
+        session_cap = (
+            config.cross_session_max_sessions()
+            if max_sessions is None and since_ts is None
+            else max_sessions
+        )
+        seen: set = set()
+
+        def iter_items():
+            for row in cursor:
+                sid = scrub_text(str(row["session_id"] or ""))
+                if sid and sid not in seen:
+                    if session_cap is not None and len(seen) >= session_cap:
+                        continue
+                    seen.add(sid)
+                content = scrub_text(str(row["content"] or ""))
+                if not _is_error_content(content):
+                    continue
+                bounded = (
+                    content
+                    if len(content) <= 4000
+                    else content[:1000] + "\n…\n" + content[-3000:]
+                )
+                yield {
+                    "tool": scrub_text(str(row["tool_name"] or "")),
+                    "content": bounded,
+                    "session_id": sid,
+                    "ts": row["timestamp"] or 0,
+                }
+
+        full_audit = since_ts is not None and max_rows is None and max_sessions is None
+        return patterns.extract_patterns(
+            iter_items(), limit=None if full_audit else 10
+        )
+    except Exception as exc:
+        logger.warning("Cross-session query failed: %s", scrub_text(str(exc)))
+        return []
+    finally:
+        connection.close()
+
+
+# ── host context ───────────────────────────────────────────────────────────
 
 
 def list_skill_names() -> List[str]:
-    """Return a list of all loaded skill names."""
     try:
         from tools.skills_tool import skills_list
+
         raw = skills_list()
-        # skills_list returns a JSON string — parse it (dict/list also handled).
-        if isinstance(raw, str):
-            result = json.loads(raw)
-        else:
-            result = raw
-        if isinstance(result, dict) and "skills" in result:
-            return [s.get("name", "") for s in result["skills"]]
-        if isinstance(result, list):
-            return [s.get("name", "") for s in result]
-    except Exception:
-        pass
-    return []
-
-
-def list_memory_snippets() -> List[str]:
-    """Return short memory snippets for context."""
-    try:
-        from tools.memory_tool import MemoryStore
-        store = MemoryStore()
-        store.load_from_disk()
-        entries = store.memory_entries + store.user_entries
-        return [e[:120] for e in entries[-20:]]
+        result = raw if not isinstance(raw, str) else json.loads(raw)
+        skills = result.get("skills", []) if isinstance(result, dict) else result
+        return [
+            scrub_text(str(item.get("name", "")))
+            for item in skills
+            if isinstance(item, dict)
+        ]
     except Exception:
         return []
 
 
-# ── guardrails ──────────────────────────────────────────────────────────────
+def list_memory_snippets() -> List[str]:
+    try:
+        from tools.memory_tool import MemoryStore
+
+        store = MemoryStore()
+        store.load_from_disk()
+        return [
+            scrub_text(str(entry))[:120]
+            for entry in (store.memory_entries + store.user_entries)[-20:]
+        ]
+    except Exception:
+        return []
 
 
 def _unused_skills_safe() -> List[str]:
-    """Never let ledger trouble break a refine run."""
     try:
         return ledger.unused_skills()
     except Exception as exc:
@@ -347,124 +289,138 @@ def _unused_skills_safe() -> List[str]:
         return []
 
 
+def _reconcile_pending() -> List[Dict[str, Any]]:
+    """Reconcile durable approval states and mirror transitions to the ledger."""
+    changed = journal.reconcile()
+    for entry in changed:
+        try:
+            ledger.record_journal_state(entry)
+        except Exception as exc:
+            logger.warning("Cannot mirror reconciled state in ledger: %s", scrub_text(str(exc)))
+    return changed
+
+
 def refine_audit() -> Dict[str, Any]:
-    """Read-only report: did the skills refine wrote actually help?"""
+    with journal.mutation_lock():
+        _reconcile_pending()
+    earliest = ledger.earliest_created_ts()
     try:
-        current = collect_cross_session_patterns()
+        current = (
+            collect_cross_session_patterns(
+                since_ts=earliest,
+                max_rows=None,
+                max_sessions=None,
+            )
+            if earliest
+            else []
+        )
     except Exception:
         current = []
     rows = ledger.audit(current)
     return {"success": True, "rows": rows, "report": ledger.format_audit(rows)}
 
 
-def _validate_proposal(proposal: Dict[str, Any]) -> Optional[str]:
-    """Check guardrails. Returns None if OK, or an error reason string."""
-    action = proposal.get("action", "no_op")
-    if action == "no_op":
-        return None  # not an error
+# ── proposal validation and apply ──────────────────────────────────────────
 
-    kind = proposal.get("kind", "")
-    name = proposal.get("name", "").strip()
 
-    if not name:
-        return "Proposal missing name"
-
-    # Size check
-    content = proposal.get("content", "")
-    if action == "create" and len(content) > 15000:
-        return f"Content too large ({len(content)} chars)"
-
-    if action == "patch" and len(content) > 15000:
-        return f"Content too large ({len(content)} chars)"
-
-    # Patch may only touch skills the agent itself created — never bundled
-    # or hub-installed. Create is protected separately by the already-exists
-    # check below (a fresh name can't be a bundled skill).
-    if kind == "skill" and action == "patch" and config.only_agent_created():
-        try:
-            from tools.skill_usage import is_agent_created
-            if not is_agent_created(name):
-                return (
-                    f"Skill '{name}' is bundled/hub-installed "
-                    "(denied by only_agent_created)"
-                )
-        except ImportError:
-            return "Cannot import skill_usage module"
-
-    # Create must target a NEW skill name — never overwrite an existing one
-    # (bundled, user, or agent-created). Existing skills are patched, not created.
-    if kind == "skill" and action == "create" and name in list_skill_names():
-        return f"Skill '{name}' already exists — use patch, not create"
-
-    # Refuse an edit identical to one already applied recently
-    if journal.was_applied_recently(proposal, config.dedup_window_days()):
-        return (
-            f"Identical edit already applied within "
-            f"{config.dedup_window_days()} day(s)"
-        )
-
-    # Don't delete anything
-    if action == "delete":
-        return "Delete action not allowed from refine"
-
-    # Don't touch skills that start with "hermes-" (reserved)
-    if kind == "skill" and name.startswith("hermes-"):
-        return f"Skill '{name}' has reserved prefix"
-
+def _skill_content_error(name: str, content: str) -> Optional[str]:
+    if not content.startswith("---"):
+        return "Skill content must start with YAML frontmatter"
+    match = re.match(r"^---\s*\n(.*?)\n---\s*(?:\n|$)", content, re.S)
+    if not match:
+        return "Skill content has incomplete YAML frontmatter"
+    frontmatter = match.group(1)
+    name_match = re.search(r"(?m)^name\s*:\s*[\"']?([^\n\"']+)", frontmatter)
+    if not name_match or name_match.group(1).strip() != name:
+        return "Skill frontmatter name must exactly match the target name"
+    if not re.search(r"(?m)^description\s*:\s*\S", frontmatter):
+        return "Skill frontmatter requires a non-empty description"
+    if not content[match.end():].strip():
+        return "Skill content requires a Markdown body"
     return None
 
 
-# ── apply ───────────────────────────────────────────────────────────────────
+def _validate_proposal(proposal: Dict[str, Any]) -> Optional[str]:
+    action = str(proposal.get("action", "no_op"))
+    if action == "no_op":
+        return None
+    if action not in ("create", "patch"):
+        return f"Unsupported action: {action}"
+    kind = str(proposal.get("kind", ""))
+    if kind not in ("skill", "memory"):
+        return f"Unsupported kind: {kind}"
+    name = str(proposal.get("name", "")).strip()
+    content = str(proposal.get("content", ""))
+    if not name:
+        return "Proposal missing name"
+    if not content.strip():
+        return f"{action.title()} requires non-empty content"
+    if len(content) > _llm.MAX_CONTENT_CHARS:
+        return f"Content too large ({len(content)} chars; max {_llm.MAX_CONTENT_CHARS})"
+    if kind == "skill":
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", name):
+            return "Skill name must use lowercase letters, digits, hyphens, or underscores"
+        format_error = _skill_content_error(name, content)
+        if format_error:
+            return format_error
+        if name.startswith("hermes-"):
+            return f"Skill '{name}' has reserved prefix"
+        if action == "create" and name in list_skill_names():
+            return f"Skill '{name}' already exists — use patch, not create"
+        if action == "patch" and config.only_agent_created():
+            try:
+                from tools.skill_usage import is_agent_created
+
+                if not is_agent_created(name):
+                    return f"Skill '{name}' is bundled/hub-installed (denied by only_agent_created)"
+            except ImportError:
+                return "Cannot import skill_usage module"
+    fingerprint = str(proposal.get("pattern_fingerprint", "") or "")
+    if fingerprint and not re.fullmatch(r"[0-9a-f]{12}", fingerprint):
+        return "pattern_fingerprint must be the complete 12-character fingerprint"
+    if journal.was_applied_recently(proposal, config.dedup_window_days()):
+        return f"Identical edit already applied within {config.dedup_window_days()} day(s)"
+    return None
 
 
 def _apply_skill(proposal: Dict[str, Any]) -> Dict[str, Any]:
-    """Apply a skill create/patch via skill_manage."""
-    action = proposal["action"]
-    name = proposal["name"]
-    content = proposal["content"]
-    category = proposal.get("category", "")
-
     from tools.skill_manager_tool import skill_manage
 
-    result_str = skill_manage(
+    action = "edit" if proposal["action"] == "patch" else proposal["action"]
+    raw = skill_manage(
         action=action,
-        name=name,
-        content=content if content else None,
-        category=category if category else None,
+        name=proposal["name"],
+        content=proposal["content"],
+        category=proposal.get("category") or None,
     )
+    if isinstance(raw, dict):
+        return raw
     try:
-        return json.loads(result_str)
-    except json.JSONDecodeError:
-        return {"success": False, "error": result_str}
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return {"success": False, "error": str(raw)}
 
 
 def _apply_memory(proposal: Dict[str, Any]) -> Dict[str, Any]:
-    """Apply a memory create/patch via memory_tool."""
-    action = proposal["action"]
-    content = proposal["content"]
-    kind = proposal.get("kind", "memory")
-    target = "user" if kind == "user" else "memory"
-
     from tools.memory_tool import MemoryStore
 
+    target = "user" if proposal.get("kind") == "user" else "memory"
+    if proposal.get("action") not in ("create", "patch"):
+        return {"success": False, "error": f"Unknown memory action: {proposal.get('action')}"}
     store = MemoryStore()
     store.load_from_disk()
-
-    if action == "create":
-        result = store.add(target, content)
-    elif action == "patch":
-        # For memory, a 'patch' means replace the oldest/whole entry.
-        # We treat the content as a new add (since memory is append-only by nature).
-        result = store.add(target, content)
-    else:
-        return {"success": False, "error": f"Unknown action '{action}' for memory"}
-
-    if result.get("success"):
+    result = store.add(target, proposal["content"])
+    if result.get("success") and not result.get("staged"):
         store.save_to_disk(target)
     return result
 
 
-# ── main entry ──────────────────────────────────────────────────────────────
+def _journal_nonmutation(**kwargs: Any) -> Optional[str]:
+    try:
+        return journal.log(**kwargs)
+    except Exception as exc:
+        logger.error("Cannot write refine journal: %s", exc)
+        return None
 
 
 def _refine_once(
@@ -474,22 +430,19 @@ def _refine_once(
     session_id: Optional[str] = None,
     auto: bool = False,
 ) -> Dict[str, Any]:
-    """Run a single refine pass (one proposal → one edit)."""
     trigger = "auto" if auto else "manual"
-    t_start = time.time()
+    started = time.time()
+    safe_reason = scrub_text(reason)
 
-    # 1. Daily limit check
     if journal.daily_limit_reached():
         return {
             "success": False,
             "message": f"Daily edit limit reached ({config.max_edits_per_day()}). "
-                       f"Edits today: {journal.count_today_applied()}.",
+            f"Applied/pending/prepared today: {journal.count_today_applied()}.",
         }
 
-    # 2. Collect evidence
     evidence = collect_evidence(session_id=session_id)
-    sid = evidence.get("session_id", "")
-
+    session = evidence.get("session_id", "")
     if len(evidence.get("messages", [])) < 3:
         return {
             "success": True,
@@ -497,190 +450,266 @@ def _refine_once(
             "evidence": evidence,
         }
 
-    # 3. Aggregate failures across this session and the recent window
     error_patterns = patterns.merge_patterns(
-        evidence.get("error_patterns", []),
-        collect_cross_session_patterns(),
+        evidence.get("error_patterns", []), collect_cross_session_patterns()
     )
     evidence["error_patterns"] = error_patterns
     corrections = evidence.get("user_corrections", [])
-
-    # 4. Signal gate — a single one-off error teaches nothing generalizable,
-    # so do not spend a model call on it.
     if config.min_signal_required() and not patterns.has_signal(
         error_patterns, corrections, min_count=config.min_pattern_count()
     ):
         proposal = {
             "action": "no_op",
-            "reason": (
-                f"No repeated failure (min {config.min_pattern_count()}x) and no user "
-                f"correction in the last {config.cross_session_days()} day(s)."
-            ),
+            "reason": f"No repeated failure (min {config.min_pattern_count()}x) and no explicit correction.",
         }
-        entry_id = journal.log(
+        entry_id = _journal_nonmutation(
             trigger=trigger,
-            reason=reason or proposal["reason"],
-            session_id=sid,
+            reason=safe_reason or proposal["reason"],
+            session_id=session,
             proposal=proposal,
             outcome="no_op",
         )
+        if not entry_id:
+            return {
+                "success": False,
+                "message": "No edit was needed, but the journal write failed.",
+                "evidence": evidence,
+            }
         return {
             "success": True,
             "message": f"No actionable improvement found. {proposal['reason']}",
             "journal_id": entry_id,
             "llm_called": False,
             "evidence": evidence,
+            "reversible": False,
         }
 
-    # 5. Get existing skills/memories for context
-    skills = list_skill_names()
-    memories = list_memory_snippets()
+    lines: List[str] = []
+    for message in evidence.get("messages", []):
+        tag = f"[{message['role']}]"
+        if message.get("tool_name"):
+            tag += f"({message['tool_name']})"
+        lines.append(f"{tag} {message['content'][:400]}")
 
-    # 6. Build evidence text for LLM
-    ev_lines: List[str] = []
-    for m in evidence.get("messages", []):
-        role_tag = f"[{m['role']}]"
-        if m.get("tool_name"):
-            role_tag += f"({m['tool_name']})"
-        ev_lines.append(f"{role_tag} {m['content'][:400]}")
-    evidence_text = "\n".join(ev_lines)
-
-    # 7. LLM proposal
     proposal = _llm.propose(
         llm=llm,
-        evidence_text=evidence_text,
-        existing_skills=skills,
-        existing_memories=memories,
+        evidence_text="\n".join(lines),
+        existing_skills=list_skill_names(),
+        existing_memories=list_memory_snippets(),
         error_patterns=error_patterns,
-        user_corrections=[c.get("snippet", "") for c in corrections],
+        user_corrections=[item.get("snippet", "") for item in corrections],
         unused_skills=_unused_skills_safe(),
         purpose="refine",
+        run_context=safe_reason,
+        skill_content_loader=journal.read_skill_content,
     )
+    proposal = sanitize(proposal)
 
-    # Scrub before journaling/returning — credentials must never persist.
-    proposal = scrub_proposal(proposal)
-
-    # 6. If no_op, log and return
     if proposal.get("action") == "no_op":
-        entry_id = journal.log(
+        entry_id = _journal_nonmutation(
             trigger=trigger,
-            reason=reason or proposal.get("reason", ""),
-            session_id=sid,
+            reason=safe_reason or proposal.get("reason", ""),
+            session_id=session,
             proposal=proposal,
             outcome="no_op",
         )
+        if not entry_id:
+            return {
+                "success": False,
+                "message": "Proposal was no_op, but the journal write failed.",
+                "proposal": proposal,
+            }
         return {
             "success": True,
             "message": f"No actionable improvement found. {proposal.get('reason', '')}",
             "journal_id": entry_id,
+            "proposal": proposal,
             "evidence": evidence,
+            "reversible": False,
         }
 
-    # 7. Guardrails
-    guardrail_err = _validate_proposal(proposal)
-    if guardrail_err:
-        entry_id = journal.log(
+    guardrail_error = _validate_proposal(proposal)
+    if guardrail_error:
+        entry_id = _journal_nonmutation(
             trigger=trigger,
-            reason=reason,
-            session_id=sid,
+            reason=safe_reason,
+            session_id=session,
             proposal=proposal,
             outcome="rejected",
-            error=guardrail_err,
+            error=guardrail_error,
         )
-        return {
+        result = {
             "success": False,
-            "message": f"Proposal rejected by guardrails: {guardrail_err}",
-            "journal_id": entry_id,
+            "message": f"Proposal rejected by guardrails: {guardrail_error}",
             "proposal": proposal,
+            "reversible": False,
         }
+        if entry_id:
+            result["record_id"] = entry_id
+        return result
 
-    # 8. Backup
+    kind = proposal["kind"]
+    action = proposal["action"]
+    name = proposal["name"]
     backup_path = ""
-    kind = proposal.get("kind", "skill")
-    name = proposal.get("name", "")
-    action = proposal.get("action", "")
-
+    recovery: Dict[str, Any] = {}
     if kind == "skill" and action == "patch":
-        bp = journal.backup_skill(name)
-        backup_path = str(bp) if bp else ""
-    elif kind == "memory":
-        mem_content = journal.backup_memory("memory")
-        if mem_content is not None:
-            bp = journal.backups_dir() / f"{int(time.time()*1000)}_memory.bak"
-            bp.write_text(mem_content, encoding="utf-8")
-            backup_path = str(bp)
+        backup = journal.backup_skill(name)
+        if backup is None:
+            error = f"Cannot create durable backup for skill '{name}'; mutation aborted"
+            _journal_nonmutation(
+                trigger=trigger,
+                reason=safe_reason,
+                session_id=session,
+                proposal=proposal,
+                outcome="error",
+                error=error,
+            )
+            return {
+                "success": False,
+                "message": error,
+                "proposal": proposal,
+                "reversible": False,
+            }
+        backup_path = str(backup)
+        recovery = {"type": "skill_patch", "name": name}
+    elif kind == "skill":
+        recovery = {"type": "skill_create", "name": name}
+    else:
+        target = "user" if kind == "user" else "memory"
+        memory_recovery = journal.memory_recovery(target, proposal["content"])
+        if memory_recovery is None:
+            error = f"Cannot capture {target} memory recovery state; mutation aborted"
+            _journal_nonmutation(
+                trigger=trigger,
+                reason=safe_reason,
+                session_id=session,
+                proposal=proposal,
+                outcome="error",
+                error=error,
+            )
+            return {
+                "success": False,
+                "message": error,
+                "proposal": proposal,
+                "reversible": False,
+            }
+        recovery = memory_recovery
 
-    # 9. Apply
     try:
-        if kind == "skill":
-            result = _apply_skill(proposal)
-        elif kind == "memory":
-            result = _apply_memory(proposal)
-        else:
-            result = {"success": False, "error": f"Unknown kind: {kind}"}
-    except Exception as exc:
-        entry_id = journal.log(
+        entry_id = journal.prepare(
             trigger=trigger,
-            reason=reason,
-            session_id=sid,
+            reason=safe_reason,
+            session_id=session,
             proposal=proposal,
-            outcome="error",
-            error=str(exc),
+            backup_path=backup_path,
+            recovery=recovery,
         )
+    except Exception as exc:
         return {
             "success": False,
-            "message": f"Apply failed: {exc}",
-            "journal_id": entry_id,
+            "message": f"Journal preparation failed; mutation aborted: {scrub_text(str(exc))}",
             "proposal": proposal,
+            "reversible": False,
         }
 
-    # 10. Journal
-    outcome = "applied" if result.get("success") else "error"
-    staged = result.get("staged", False)
-    if staged:
-        outcome = "pending_approval"
+    try:
+        apply_result = _apply_skill(proposal) if kind == "skill" else _apply_memory(proposal)
+    except Exception as exc:
+        apply_result = {"success": False, "error": scrub_text(str(exc))}
+    apply_result = sanitize(apply_result)
 
-    entry_id = journal.log(
-        trigger=trigger,
-        reason=reason,
-        session_id=sid,
-        proposal=proposal,
-        outcome=outcome,
-        backup_path=backup_path,
-        error=result.get("error", ""),
+    staged = bool(apply_result.get("success") and apply_result.get("staged"))
+    pending_id = scrub_text(str(apply_result.get("pending_id", ""))) if staged else ""
+    if staged and not pending_id:
+        apply_result = {
+            "success": False,
+            "error": "Host staged the mutation without a pending_id",
+        }
+        staged = False
+    if apply_result.get("success") and not staged:
+        prepared_entry = journal.get_entry(entry_id) or {
+            "proposal": proposal,
+            "recovery": recovery,
+            "backup_path": backup_path,
+        }
+        if not journal.target_matches_applied(prepared_entry):
+            apply_result = {
+                "success": False,
+                "error": "Host reported success but the target state does not match the proposal",
+            }
+    outcome = (
+        "pending_approval"
+        if staged
+        else ("applied" if apply_result.get("success") else "error")
     )
+    try:
+        finalized = journal.finalize(
+            entry_id,
+            outcome,
+            error=scrub_text(str(apply_result.get("error", ""))),
+            pending_id=pending_id if staged else None,
+        )
+    except Exception as exc:
+        if apply_result.get("success"):
+            return {
+                "success": False,
+                "message": f"Mutation completed but journal finalization failed; recovery id: {entry_id}. Error: {scrub_text(str(exc))}",
+                "journal_id": entry_id,
+                "proposal": proposal,
+                "result": sanitize(apply_result),
+                "backup_path": backup_path,
+                "reversible": not staged,
+            }
+        return {
+            "success": False,
+            "message": f"Apply failed and journal finalization also failed: {scrub_text(str(exc))}",
+            "proposal": proposal,
+            "result": sanitize(apply_result),
+            "reversible": False,
+        }
 
-    # Register in the usefulness ledger so /refine audit can judge it later.
     if outcome in ("applied", "pending_approval"):
         try:
-            ledger.record_edit(proposal, entry_id)
+            ledger.record_edit(
+                proposal,
+                entry_id,
+                outcome=outcome,
+                pending_id=pending_id,
+            )
         except Exception as exc:
             logger.warning("Cannot record edit in ledger: %s", exc)
 
-    elapsed = time.time() - t_start
-    msg_parts = [
-        f"done ({elapsed:.1f}s)",
-        f"action={proposal['action']} kind={kind} name={name}",
-        f"outcome={outcome}",
-    ]
-    if result.get("staged"):
-        msg_parts.append(f"pending_id={result.get('pending_id', '?')}")
-    if result.get("error"):
-        msg_parts.append(f"error={result['error'][:100]}")
+    message = (
+        f"done ({time.time() - started:.1f}s) | action={action} kind={kind} "
+        f"name={name} | outcome={outcome}"
+    )
+    if staged and pending_id:
+        message += f" | pending_id={pending_id}"
+    if apply_result.get("error"):
+        message += f" | error={scrub_text(str(apply_result['error']))[:100]}"
 
-    return {
-        "success": True,
-        "message": " | ".join(msg_parts),
-        "journal_id": entry_id,
+    success = bool(apply_result.get("success"))
+    response: Dict[str, Any] = {
+        "success": success,
+        "message": message,
         "proposal": proposal,
-        "result": result,
+        "result": sanitize(apply_result),
         "backup_path": backup_path,
+        "reversible": bool(
+            success and outcome == "applied" and journal.is_reversible(finalized)
+        ),
         "evidence": {
-            "session_id": sid,
+            "session_id": session,
             "messages": len(evidence.get("messages", [])),
             "errors": evidence.get("error_count", 0),
         },
     }
+    if success:
+        response["journal_id"] = entry_id
+    else:
+        response["record_id"] = entry_id
+    return response
 
 
 def refine_run(
@@ -690,66 +719,117 @@ def refine_run(
     session_id: Optional[str] = None,
     auto: bool = False,
 ) -> Dict[str, Any]:
-    """Run up to ``max_edits_per_run`` refine passes.
+    """Serialize a run, reconcile approvals, and preserve every recovery id."""
+    started = time.time()
+    with journal.mutation_lock():
+        _reconcile_pending()
+        runs: List[Dict[str, Any]] = []
+        max_runs = max(1, config.max_edits_per_run())
+        run_reason = scrub_text(reason)
+        for _ in range(max_runs):
+            if journal.daily_limit_reached():
+                break
+            result = _refine_once(
+                llm, reason=run_reason, session_id=session_id, auto=auto
+            )
+            runs.append(result)
+            action = result.get("proposal", {}).get("action")
+            accepted = bool(result.get("result", {}).get("success"))
+            if not result.get("success") or action in (None, "no_op") or not accepted:
+                break
+            done_name = scrub_text(str(result.get("proposal", {}).get("name", "")))
+            done_kind = scrub_text(str(result.get("proposal", {}).get("kind", "")))
+            note = (
+                f"Already completed or reserved {action} {done_kind} '{done_name}' in this run; "
+                "propose a different edit or no_op."
+            )
+            run_reason = f"{reason}\n{note}".strip() if reason else note
+            run_reason = scrub_text(run_reason)
 
-    Each pass proposes one edit; passes stop early on no_op/rejection/failure
-    or when the daily edit budget is exhausted. A single pass is returned
-    unchanged (backwards compatible); multiple passes are aggregated.
-    """
-    t_start = time.time()
-    runs: List[Dict[str, Any]] = []
-    max_runs = max(1, config.max_edits_per_run())
-    run_reason = reason
+        if not runs:
+            return {
+                "success": False,
+                "message": f"Daily edit limit reached ({config.max_edits_per_day()}).",
+                "reversible": False,
+            }
+        if len(runs) == 1:
+            return runs[0]
 
-    for _ in range(max_runs):
-        if journal.daily_limit_reached():
-            break
-        result = _refine_once(llm, reason=run_reason, session_id=session_id, auto=auto)
-        runs.append(result)
-        action = result.get("proposal", {}).get("action")
-        applied = bool(result.get("result", {}).get("success"))
-        if not result.get("success") or action in (None, "no_op") or not applied:
-            break
-        # Tell the next pass what was already done in this run so it doesn't
-        # re-propose the same edit (saves a wasted LLM call).
-        done_name = result.get("proposal", {}).get("name", "")
-        done_kind = result.get("proposal", {}).get("kind", "")
-        note = f"Already {action}d {done_kind} '{done_name}' in this run — propose something else or no_op."
-        run_reason = f"{reason}\n{note}".strip() if reason else note
+        recoveries: List[Dict[str, Any]] = []
+        for item in runs:
+            journal_id = item.get("journal_id")
+            if not journal_id or not item.get("result", {}).get("success"):
+                continue
+            durable = journal.get_entry(str(journal_id)) or {}
+            recovery_item: Dict[str, Any] = {
+                "journal_id": str(journal_id),
+                "outcome": durable.get("outcome", "unknown"),
+                "reversible": bool(item.get("reversible")),
+            }
+            if item.get("reversible"):
+                recovery_item["rollback_command"] = f"/refine rollback {journal_id}"
+            recoveries.append(recovery_item)
 
-    if not runs:
-        return {
-            "success": False,
-            "message": f"Daily edit limit reached ({config.max_edits_per_day()}).",
+        failed_after_success = bool(
+            recoveries and any(not item.get("success") for item in runs[1:])
+        )
+        last = runs[-1]
+        if failed_after_success:
+            message = (
+                f"PARTIAL SUCCESS: {len(recoveries)} earlier edit(s) were applied or reserved, "
+                "but a later pass failed. Use the recovery IDs listed below."
+            )
+            outcome = "partial_success"
+            success = False
+        else:
+            message = (
+                f"{len(runs)} pass(es), {len(recoveries)} edit(s) applied or reserved "
+                f"({time.time() - started:.1f}s)"
+            )
+            outcome = "completed"
+            success = all(item.get("success") for item in runs)
+        response: Dict[str, Any] = {
+            "success": success,
+            "outcome": outcome,
+            "message": message,
+            "proposal": last.get("proposal", runs[0].get("proposal", {})),
+            "results": runs,
+            "recoveries": recoveries,
+            "journal_ids": [item["journal_id"] for item in recoveries],
+            "evidence": runs[0].get("evidence", {}),
+            "reversible": any(item.get("reversible") for item in recoveries),
         }
-
-    if len(runs) == 1:
-        return runs[0]
-
-    applied_count = sum(1 for r in runs if r.get("result", {}).get("success"))
-    last = runs[-1]
-    return {
-        "success": any(r.get("success") for r in runs),
-        "message": f"{len(runs)} pass(es), {applied_count} edit(s) applied ({time.time() - t_start:.1f}s)",
-        "journal_id": last.get("journal_id", runs[0].get("journal_id", "")),
-        "proposal": last.get("proposal", runs[0].get("proposal", {})),
-        "results": runs,
-        "evidence": runs[0].get("evidence", {}),
-    }
+        return response
 
 
 def refine_rollback(entry_id: str) -> Dict[str, Any]:
-    """Rollback a previous refine edit by journal id."""
-    entry = journal.get_entry(entry_id)
-    if not entry:
-        return {"success": False, "error": f"Entry {entry_id} not found"}
-
-    proposal = entry.get("proposal", {})
-    kind = proposal.get("kind", "skill")
-
-    if kind == "skill":
-        return journal.rollback_skill(entry_id)
-    elif kind == "memory":
-        return journal.rollback_memory(entry_id)
-    else:
-        return {"success": False, "error": f"Unknown kind for rollback: {kind}"}
+    with journal.mutation_lock():
+        _reconcile_pending()
+        entry = journal.get_entry(entry_id)
+        if not entry:
+            return {"success": False, "error": f"Entry {entry_id} not found"}
+        if entry.get("outcome") == "rolled_back":
+            return {"success": True, "message": f"Entry {entry_id} is already rolled back"}
+        if entry.get("outcome") == "pending_rollback":
+            return {
+                "success": True,
+                "staged": True,
+                "pending_id": entry.get("pending_id", ""),
+                "message": "Rollback is still pending approval; target is unchanged",
+            }
+        if not journal.is_reversible(entry):
+            return {"success": False, "error": f"Entry {entry_id} is not reversible"}
+        kind = entry.get("proposal", {}).get("kind", "skill")
+        if kind == "skill":
+            result = journal.rollback_skill(entry_id)
+        elif kind in ("memory", "user"):
+            result = journal.rollback_memory(entry_id)
+        else:
+            return {"success": False, "error": f"Unknown kind for rollback: {kind}"}
+        latest = journal.get_entry(entry_id)
+        if latest:
+            try:
+                ledger.record_journal_state(latest)
+            except Exception as exc:
+                logger.warning("Cannot mirror rollback state in ledger: %s", scrub_text(str(exc)))
+        return sanitize(result)
