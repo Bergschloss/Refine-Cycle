@@ -85,22 +85,29 @@ def _auto_refine_allowed(assistant_turns: int, *, require_turn_interval: bool) -
 
 
 def _run_auto_refine(
-    session_id: str, assistant_turns: int, *, require_turn_interval: bool
+    session_id: str,
+    assistant_turns: int,
+    *,
+    require_turn_interval: bool,
+    cleanup_session_notes: bool = False,
 ) -> None:
     """Run one guarded automatic pass after its worker thread has started."""
     try:
         if not _auto_refine_allowed(
             assistant_turns, require_turn_interval=require_turn_interval
         ):
+            if cleanup_session_notes:
+                _clear_session_prompt_notes(session_id)
             return
         with journal.try_mutation_lock() as acquired:
-            if not acquired or not _cooldown_elapsed():
-                return
-            core.refine_run(
-                llm=_REGISTERED_LLM or PluginLlm(plugin_id="refine"),
-                session_id=session_id,
-                auto=True,
-            )
+            if acquired and _cooldown_elapsed():
+                core.refine_run(
+                    llm=_REGISTERED_LLM or PluginLlm(plugin_id="refine"),
+                    session_id=session_id,
+                    auto=True,
+                )
+            if cleanup_session_notes:
+                _clear_session_prompt_notes(session_id)
     except Exception:
         logger.exception("refine auto hook failed")
     finally:
@@ -164,31 +171,17 @@ def _on_pre_llm_call(**kwargs) -> Optional[dict]:
     return None
 
 
-def _schedule_session_note_cleanup(session_id: str) -> None:
-    """Eventually clear plugin-owned session notes without blocking a host hook."""
-    safe_session_id = journal.normalize_prompt_note_session_id(session_id)
-    if not safe_session_id:
-        return
-
-    def clear_notes() -> None:
-        try:
-            journal.clear_session_prompt_notes(safe_session_id)
-        except Exception:
-            logger.debug("refine session prompt-note cleanup failed", exc_info=True)
-
+def _clear_session_prompt_notes(session_id: str) -> None:
+    """Clear plugin-owned session notes before releasing the session worker."""
     try:
-        threading.Thread(
-            target=clear_notes,
-            daemon=True,
-            name="refine-session-note-cleanup",
-        ).start()
+        journal.clear_session_prompt_notes(session_id)
     except Exception:
-        logger.debug("refine session prompt-note cleanup thread could not start", exc_info=True)
+        logger.debug("refine session prompt-note cleanup failed", exc_info=True)
 
 
 def _on_session_reset(session_id: str = "", **kwargs) -> None:
     """Expire only notes owned by the session Hermes reset."""
-    _schedule_session_note_cleanup(session_id)
+    _clear_session_prompt_notes(session_id)
 
 
 def _on_post_llm_call(
@@ -279,7 +272,7 @@ def _on_session_end(
 ) -> None:
     """Run the session-end fallback without blocking or dropping it behind a turn run."""
     if not config.auto_enabled() or interrupted:
-        _schedule_session_note_cleanup(session_id)
+        _clear_session_prompt_notes(session_id)
         return
     if not _AUTO_THREAD_GUARD.acquire(blocking=False):
         _defer_session_end(session_id)
@@ -298,13 +291,14 @@ def _on_session_end(
                 session_id,
                 _assistant_turn_count(messages),
                 require_turn_interval=False,
+                cleanup_session_notes=True,
             )
         except Exception:
             logger.exception("refine auto session-end hook failed")
         finally:
             if not handed_off:
+                _clear_session_prompt_notes(session_id)
                 _finish_auto_worker()
-            _schedule_session_note_cleanup(session_id)
 
     try:
         threading.Thread(
