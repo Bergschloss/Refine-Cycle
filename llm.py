@@ -13,8 +13,10 @@ from agent.plugin_llm import (
 )
 
 try:
+    from . import config
     from .sanitization import sanitize, scrub_text
 except ImportError:
+    import config  # type: ignore
     from sanitization import sanitize, scrub_text  # type: ignore
 
 logger = logging.getLogger(__name__)
@@ -353,11 +355,78 @@ def _valid_fingerprint(value: Any) -> str:
     return candidate if re.fullmatch(r"[0-9a-f]{12}", candidate) else ""
 
 
+def _overview_text(value: Any) -> str:
+    """Sanitize untrusted host metadata into one physical prompt-line value."""
+    return re.sub(r"[\x00-\x1f\x7f]+", " ", scrub_text(str(value))).strip()
+
+
+def _truncate_overview_line(value: str, limit: int) -> str:
+    """Keep a bounded line readable without leaving an incomplete escape."""
+    if len(value) <= limit:
+        return value
+    if limit <= 1:
+        return "…"
+    prefix = value[:limit - 1]
+    last_escape = prefix.rfind("\\")
+    if last_escape >= 0:
+        escape = prefix[last_escape:]
+        if escape == "\\" or (escape.startswith("\\u") and len(escape) < 6):
+            prefix = prefix[:last_escape]
+    return prefix + "…"
+
+
+def _render_overview(
+    entries: List[Any], *, entry_kind: str, max_entries: int, max_chars: int
+) -> str:
+    """Render safe, bounded existing-context entries for the proposal prompt."""
+    indent = "  " if max_chars > 2 else ""
+    text_limit = max_chars - len(indent)
+    lines: List[str] = []
+    for entry in entries[:max_entries]:
+        if entry_kind == "skill":
+            if isinstance(entry, dict):
+                name = _overview_text(entry.get("name", ""))
+                description = _overview_text(entry.get("description", ""))
+                category = _overview_text(entry.get("category", ""))
+                version = entry.get("version")
+            else:
+                name = _overview_text(entry)
+                description = ""
+                category = ""
+                version = None
+            if not name:
+                continue
+            details = [category] if category else []
+            if isinstance(version, int) and version >= 1:
+                details.append(f"v{version}")
+            line = f"[skill:{name}]"
+            if description:
+                line += f" {description}"
+            if details:
+                line += f" ({', '.join(details)})"
+        else:
+            if isinstance(entry, dict):
+                raw_snippet = entry.get("snippet", entry.get("content", ""))
+            else:
+                raw_snippet = entry
+            snippet = _overview_text(raw_snippet)
+            if not snippet:
+                continue
+            line = f"[memory] {snippet}"
+        lines.append(indent + _truncate_overview_line(line, text_limit))
+    remaining = max(0, len(entries) - max_entries)
+    if remaining:
+        lines.append(indent + _truncate_overview_line(f"… +{remaining} more", text_limit))
+    if lines:
+        return "\n".join(lines)
+    return indent + _truncate_overview_line("(none)", text_limit)
+
+
 def propose(
     llm: PluginLlm,
     evidence_text: str,
-    existing_skills: List[str],
-    existing_memories: List[str],
+    existing_skills: List[Any],
+    existing_memories: List[Any],
     *,
     error_patterns: Optional[List[Dict[str, Any]]] = None,
     user_corrections: Optional[List[str]] = None,
@@ -375,20 +444,28 @@ def propose(
     # Sanitize independently at this final model boundary even when callers have
     # already sanitized their evidence. This keeps every prompt piece safe.
     evidence_text = scrub_text(str(evidence_text))
-    existing_skills = [scrub_text(str(item)) for item in existing_skills]
-    existing_memories = [scrub_text(str(item)) for item in existing_memories]
+    existing_skills = list(existing_skills or [])
+    existing_memories = list(existing_memories or [])
     error_patterns = sanitize(error_patterns or [])
     user_corrections = [scrub_text(str(item)) for item in (user_corrections or [])]
     unused_skills = [scrub_text(str(item)) for item in (unused_skills or [])]
     run_context = scrub_text(str(run_context))
+    overview_max_entries = config.overview_max_entries()
+    overview_max_chars = config.overview_max_chars()
     del purpose  # The host purpose is fixed to the plugin's trusted purpose.
 
-    skills_list = "\n".join(
-        f"  - {name}" for name in sorted(existing_skills)[:50]
-    ) or "  (none)"
-    mems_list = "\n".join(
-        f"  - {item[:100]}" for item in existing_memories[:30]
-    ) or "  (none)"
+    skills_list = _render_overview(
+        existing_skills,
+        entry_kind="skill",
+        max_entries=overview_max_entries,
+        max_chars=overview_max_chars,
+    )
+    mems_list = _render_overview(
+        existing_memories,
+        entry_kind="memory",
+        max_entries=overview_max_entries,
+        max_chars=overview_max_chars,
+    )
     corrections = "\n".join(
         f"  - {item[:200]}" for item in user_corrections[:5]
     ) or "  (none)"

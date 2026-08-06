@@ -157,6 +157,16 @@ def dedup_window_days() -> int:
     return get_int("dedup_window_days", 7, min_val=1)
 
 
+def overview_max_entries() -> int:
+    """Maximum existing entries of each kind included in a proposal prompt."""
+    return get_int("overview_max_entries", 40, min_val=1)
+
+
+def overview_max_chars() -> int:
+    """Maximum characters in each structured overview line."""
+    return get_int("overview_max_chars", 240, min_val=1)
+
+
 def journal_dir() -> Path:
     default = hermes_home() / "plugins" / "refine"
     return Path(get_str("journal_dir", str(default)))
