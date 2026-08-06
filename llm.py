@@ -37,13 +37,18 @@ def _pinned_target() -> Dict[str, str]:
     Omitted keys leave resolution to Hermes, which prefers the live main model.
     A pinned value makes the target deterministic instead; the host's trust
     gate still decides whether the request is honored.
+
+    This function filters the effective target through trust flags so that a
+    plugin installation without ``allow_model_override`` silently falls back to
+    the host default instead of causing PluginLlmTrustError on every call.
     """
+    effective = config.effective_llm_target()
     target: Dict[str, str] = {}
-    provider = config.llm_provider()
-    model = config.llm_model()
-    if provider:
+    provider = effective.get("provider", "")
+    model = effective.get("model", "")
+    if provider and config.llm_allow_provider_override():
         target["provider"] = provider
-    if model:
+    if model and config.llm_allow_model_override():
         target["model"] = model
     return target
 

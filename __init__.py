@@ -238,6 +238,71 @@ def _on_post_llm_call(
     _start_auto_refine(session_id, _assistant_turn_count(conversation_history))
 
 
+_MODEL_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9._:\-]{1,120}$")
+
+
+def _handle_model_subcommand(remainder: str) -> str:
+    """Handle /refine model [auto | <provider/model> | <model>]."""
+    if not remainder:
+        # Show current effective target
+        effective = config.effective_llm_target()
+        model = effective.get("model") or "(host default)"
+        provider = effective.get("provider") or "(host default)"
+        source = effective["source"]
+        trust_model = config.llm_allow_model_override()
+        trust_prov = config.llm_allow_provider_override()
+        lines = [
+            f"model: {model}",
+            f"provider: {provider}",
+            f"source: {source}",
+            f"trust: model={'allowed' if trust_model else 'denied'}, "
+            f"provider={'allowed' if trust_prov else 'denied'}",
+        ]
+        if not trust_model and source in ("command", "config", "live"):
+            lines.append(
+                "⚠ Model is set but host trust denies overrides. "
+                "Enable plugins.entries.refine.llm.allow_model_override to apply it."
+            )
+        return core.scrub_text("\n".join(lines))
+
+    if remainder == "auto":
+        journal.clear_model_override()
+        effective = config.effective_llm_target()
+        return core.scrub_text(
+            f"Override removed. Effective model: {effective.get('model') or '(host default)'} "
+            f"(source: {effective['source']})"
+        )
+
+    # Parse provider/model or bare model
+    provider = ""
+    model = remainder
+    if "/" in remainder:
+        parts = remainder.split("/", 1)
+        provider = parts[0]
+        model = parts[1]
+
+    if not _MODEL_IDENTIFIER_PATTERN.fullmatch(model):
+        return f"Invalid model identifier: {model!r}"
+    if provider and not _MODEL_IDENTIFIER_PATTERN.fullmatch(provider):
+        return f"Invalid provider identifier: {provider!r}"
+
+    journal.write_model_override(provider, model)
+    trust_model = config.llm_allow_model_override()
+    trust_prov = config.llm_allow_provider_override()
+    lines = [f"Override set: model={model}" + (f" provider={provider}" if provider else "")]
+    if not trust_model:
+        lines.append(
+            "⚠ Host trust denies model overrides. The value is saved but will not "
+            "be sent until plugins.entries.refine.llm.allow_model_override is true."
+        )
+    if provider and not trust_prov:
+        lines.append(
+            "⚠ Host trust denies provider overrides. The provider value is saved but "
+            "will not be sent until plugins.entries.refine.llm.allow_provider_override is true."
+        )
+    return core.scrub_text("\n".join(lines))
+
+
 def _handle_refine_command(raw_args: str) -> Optional[str]:
     """Handle exact audit/rollback subcommands; all other text is a reason."""
     args = raw_args.strip()
@@ -276,6 +341,20 @@ def _handle_refine_command(raw_args: str) -> Optional[str]:
             lines.append("warnings:")
             lines.extend(f"  ⚠ {item['message']}" for item in status["warnings"])
         return core.scrub_text("\n".join(lines))
+
+    if args == "model" or args.startswith("model "):
+        remainder = args[5:].strip()
+        # Only treat as a subcommand when:
+        # - no remainder (show current)
+        # - remainder is "auto"
+        # - remainder is a valid model identifier (possibly with one slash)
+        # Anything else ("model of gmail failures") is a free-form reason.
+        if not remainder or remainder == "auto":
+            return _handle_model_subcommand(remainder)
+        parts = remainder.split("/", 1)
+        if all(_MODEL_IDENTIFIER_PATTERN.fullmatch(p) for p in parts if p):
+            return _handle_model_subcommand(remainder)
+        # Fall through to the proposal path below
 
     if args == "rollback":
         return (

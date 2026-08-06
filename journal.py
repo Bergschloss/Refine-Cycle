@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 _BACKUPS_DIR_NAME = "backups"
 _JOURNAL_FILE_NAME = "refine_journal.jsonl"
 _PROMPT_NOTES_FILE_NAME = "prompt_notes.json"
+_MODEL_OVERRIDE_FILE_NAME = "model_override.json"
 _LOCK_FILE_NAME = ".mutation.lock"
 _LOCK_STALE_SECONDS = 300
 _THREAD_LOCK = threading.RLock()
@@ -63,6 +64,49 @@ def prompt_notes_path() -> Path:
 def prompt_notes_read_path() -> Path:
     """Prompt-note store for readers, without creating anything."""
     return journal_dir() / _PROMPT_NOTES_FILE_NAME
+
+
+def model_override_read_path() -> Path:
+    """Model override store for readers, without creating anything."""
+    return journal_dir() / _MODEL_OVERRIDE_FILE_NAME
+
+
+def read_model_override() -> Optional[Dict[str, str]]:
+    """Return the user's command-set model override, or None when absent/corrupt."""
+    path = model_override_read_path()
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return None
+        model = str(data.get("model", "") or "").strip()
+        provider = str(data.get("provider", "") or "").strip()
+        if not model and not provider:
+            return None
+        return {"model": model, "provider": provider}
+    except Exception:
+        return None
+
+
+def write_model_override(provider: str, model: str) -> None:
+    """Persist the model override atomically."""
+    import time as _time
+
+    payload = json.dumps(
+        {"provider": provider, "model": model, "set_ts": _time.time()},
+        ensure_ascii=False,
+    )
+    _atomic_write_text(ensure_dirs() / _MODEL_OVERRIDE_FILE_NAME, payload)
+
+
+def clear_model_override() -> None:
+    """Remove the model override file."""
+    path = journal_dir() / _MODEL_OVERRIDE_FILE_NAME
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def normalize_prompt_note_session_id(session_id: Any) -> str:
