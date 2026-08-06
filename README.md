@@ -52,7 +52,7 @@ trajectory (state.db) → scrub → fingerprint + aggregate → signal gate
 | **4. LLM proposal** | Requests one structured `create`, `patch`, or `no_op` proposal with an optional one-sentence, falsifiable `expected_outcome`. Kinds are `skill`, `memory`, and `prompt`. A proposal may instead carry an `edits` array of inseparable edits under one shared reason, `expected_outcome`, and `summary`. Every model-bound field is sanitized. The proposal output budget is derived locally from the shared 15,000-character content limit and scales with `max_edits_per_proposal`; the reviewer remains separately capped at 300 tokens. A cut-off, malformed, or reasoning-only reply is journaled as `llm_incomplete` rather than presented as a normal `no_op`. Skill patches receive the current complete `SKILL.md` only when it is unchanged by scrubbing and no larger than 15,000 characters. |
 | **5. Guardrails** | Enforces agent-created patch targets, fresh create names, content/frontmatter, prompt-note policy shape, size limits, daily budget, and recent-duplicate rejection. Every check runs per edit, so a later edit of a transaction is measured against the edits already applied before it. |
 | **6. Prepare** | Captures a skill's pre-edit content as both a journal snapshot and a readable `.bak` file, or memory/prompt-note recovery metadata, then appends and `fsync`s a `prepared` journal record before mutation. |
-| **7. Apply and reconcile** | Runs the standard host API for skills/memory (`patch` maps to host `edit`) or atomically writes the plugin-owned prompt-note store. It proves target state and records `applied`, `pending_approval`, or `error`. Host pending approvals reconcile lazily before later runs, audit, or rollback. |
+| **7. Apply and reconcile** | Runs the standard host API for skills/memory (`patch` maps to host `edit`) or atomically writes the plugin-owned prompt-note store. It proves target state and records `applied`, `pending_approval`, `conflict`, or `error`. A `conflict` occurs when a skill patch was planned against content that changed before apply, disappeared, or can no longer be read reliably; the budget is not consumed and the edit is not advertised as reversible. Host pending approvals reconcile lazily before later runs, audit, or rollback. |
 | **8. Rollback** | Journals `rollback_prepared` before a rollback side effect. A rollback is finalized only after target-state proof; staged host rollbacks remain `pending_rollback` until approval reconciliation. |
 
 ### Why fingerprinting
@@ -84,6 +84,13 @@ on Linux and macOS, and `%LOCALAPPDATA%\hermes\plugins\refine\` on Windows.
 Under a Hermes profile it follows that profile; the plugin resolves the location
 through `hermes_constants.get_hermes_home()`.
 
+> **Data safety:** the default `journal_dir` resolves to the plugin install
+> directory itself. If you already have runtime data (`refine_journal.jsonl`,
+> `backups/`, `skill_stats.json`, `prompt_notes.json`) there, move them to a
+> separate path **before** running `hermes plugins install --force`, which
+> deletes the target directory. Set `plugins.entries.refine.journal_dir` to
+> point at the new location. `/refine status` warns when this collision exists.
+
 1. Add to Hermes `config.yaml`:
 
 ```yaml
@@ -92,6 +99,7 @@ plugins:
     - refine
   entries:
     refine:
+      journal_dir: "<HERMES_HOME>/refine-data"   # keep data separate from plugin source
       llm:
         allow_model_override: false
         allow_provider_override: false
@@ -108,6 +116,8 @@ hermes gateway restart
 ```
 hermes plugins list
 # refine  0.1.0  Self-improvement loop ...  user  enabled
+/refine status
+# auto: on, blockers: none — auto-refine is active
 ```
 
 ---
@@ -120,14 +130,21 @@ hermes plugins list
 /refine
 /refine focus on Gmail API failures
 /refine audit
+/refine status
 /refine rollback 1f2a3b4c5d6e
 ```
 
-`audit` and `rollback <12-character-id>` are exact subcommands. Other text,
-including reasons beginning with those words, is passed to the proposal model as
-the manual reason.
+`audit` and `rollback <12-character-id>` are exact subcommands. `status`
+reports whether automatic refinement is active, what blocks it, and whether
+the journal directory is safe. Other text, including reasons beginning with
+those words, is passed to the proposal model as the manual reason.
 
 ### Automatic refinement
+
+Automatic refinement is **enabled by default** (`auto_enabled: true`). After
+installation, the plugin begins analyzing sessions and proposing improvements
+without additional configuration. To disable it, set `auto_enabled: false` in
+`plugins.entries.refine`.
 
 `post_llm_call` counts the assistant messages in the history Hermes supplies and
 starts at most one background refinement attempt once that count has grown by
@@ -258,11 +275,13 @@ Candidates for removal:
 ```
 
 The audit deletes nothing. It prints a rollback command only for recorded
-candidates. Every row shows the model's sanitized expected outcome (`—` when
-omitted) alongside its observed result. Later edits of the same entry advance a
-version; version 3 or later is labelled `churning` only when the normal verdict
-would otherwise be `unclear`. Skills that remain unused are fed into later
-proposals as negative examples.
+candidates. Skill rows keep their plain names; memory and prompt-note rows use
+`memory:` / `prompt:` prefixes so same-named entries remain distinguishable.
+Every row shows the model's sanitized expected outcome (`—` when omitted)
+alongside its observed result. Later edits of the same entry advance a version;
+version 3 or later is labelled `churning` only when the normal verdict would
+otherwise be `unclear`. Skills that remain unused are fed into later proposals
+as negative examples.
 
 ### Agent-invocable tool
 
@@ -478,6 +497,19 @@ must be manually initiated.
 
 - **Credential scrubbing** covers evidence, reasons, proposals, reviewer
   verdicts, host errors, prompt notes, and recursively nested journal fields.
+- **Stale-plan guard** — a skill patch proposal carries a SHA-256 baseline
+  digest captured at planning time. Before backup, and again against the
+  recovery snapshot captured for rollback, the plugin re-reads the live host
+  state and refuses the edit with a non-budget-consuming `conflict` journal
+  outcome when the literal content has already changed, disappeared, or cannot
+  be read reliably. Host preprocessing is disabled for these reads so inline
+  shell directives are not executed and cannot alter the baseline. Transaction
+  preflight applies zero edits when any target is stale at that point.
+  Proposals without a baseline (manually assembled or legacy) bypass this check
+  unchanged. Hermes does not expose an atomic compare-and-write operation:
+  another process can still race the final check and host write, and an approved
+  staged write can race changes made while approval is pending. A transaction
+  can therefore become partial if a target changes after preflight.
 - **Signal gate and reviewer** reject one-off noise; reviewer failures and
   malformed output decline safely without a proposal call.
 - **Incomplete model replies are visible:** a malformed, token-limited, or

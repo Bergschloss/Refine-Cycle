@@ -2,10 +2,12 @@
 
 import json
 import logging
+import os
 import re
 import sqlite3
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.plugin_llm import PluginLlm
@@ -341,6 +343,74 @@ def _reconcile_pending() -> List[Dict[str, Any]]:
     return changed
 
 
+def refine_status() -> Dict[str, Any]:
+    """Report why automatic refinement will or will not run. Read-only."""
+    auto = config.auto_enabled()
+    interval = config.auto_turn_interval()
+    min_msgs = config.auto_min_messages()
+    cooldown_minutes = config.auto_cooldown_minutes()
+    max_edits = config.max_edits_per_day()
+    edits_today = journal.count_today_applied()
+    last_ts = journal.last_attempt_ts()
+    jdir = config.journal_dir()
+
+    cooldown_remaining = 0.0
+    if last_ts is not None:
+        elapsed = time.time() - last_ts
+        remaining = cooldown_minutes * 60 - elapsed
+        if remaining > 0:
+            cooldown_remaining = remaining / 60
+
+    jdir_writable = False
+    try:
+        jdir.mkdir(parents=True, exist_ok=True)
+        jdir_writable = os.access(str(jdir), os.W_OK)
+    except Exception:
+        pass
+
+    jdir_is_plugin_source = False
+    try:
+        plugin_yaml = jdir / "plugin.yaml"
+        jdir_is_plugin_source = plugin_yaml.is_file()
+    except Exception:
+        pass
+
+    blockers: List[str] = []
+    if not auto:
+        blockers.append("Автоматичний режим вимкнений у налаштуваннях")
+    if interval <= 0:
+        blockers.append("Тригер за ходами вимкнений (interval=0)")
+    if edits_today >= max_edits:
+        blockers.append("Денний ліміт правок уже використаний")
+    if cooldown_remaining > 0:
+        blockers.append(f"Ще діє пауза між спробами ({cooldown_remaining:.0f} хв)")
+    if not jdir_writable:
+        blockers.append("Немає доступу до папки журналу")
+
+    warnings: List[str] = []
+    if jdir_is_plugin_source:
+        warnings.append(
+            "Папка журналу збігається з папкою коду плагіна — "
+            "hermes plugins install --force може видалити журнал"
+        )
+
+    return {
+        "auto_enabled": auto,
+        "auto_turn_interval": interval,
+        "auto_min_messages": min_msgs,
+        "auto_cooldown_minutes": cooldown_minutes,
+        "last_attempt_ts": last_ts,
+        "cooldown_remaining_minutes": round(cooldown_remaining, 1),
+        "edits_today": edits_today,
+        "max_edits_per_day": max_edits,
+        "journal_dir": str(jdir),
+        "journal_dir_writable": jdir_writable,
+        "journal_dir_is_plugin_source": jdir_is_plugin_source,
+        "blockers": blockers,
+        "warnings": warnings,
+    }
+
+
 def refine_audit() -> Dict[str, Any]:
     with journal.mutation_lock():
         _reconcile_pending()
@@ -507,6 +577,60 @@ def _apply_memory(proposal: Dict[str, Any]) -> Dict[str, Any]:
 def _apply_prompt_note(note: Dict[str, str]) -> Dict[str, Any]:
     """Persist a plugin-owned prompt note; no host write or approval is involved."""
     return journal.add_prompt_note(note)
+
+
+def _skill_baseline_conflict(
+    proposal: Dict[str, Any], observed_sha: str = ""
+) -> Optional[str]:
+    """Return a conflict message when the patch target no longer matches planning.
+
+    Returns None (no conflict) when:
+      - baseline is absent or not a dict (legacy proposal without baseline);
+      - baseline has invalid structure (logged but not treated as conflict).
+
+    Returns an error string when the current state diverges from the planning
+    baseline, meaning the model's replacement was built from stale content.
+    """
+    import re as _re
+
+    baseline = proposal.get("refine_baseline")
+    if not isinstance(baseline, dict):
+        return None  # Legacy proposal without baseline — today's behaviour unchanged.
+    exists = baseline.get("exists")
+    sha = str(baseline.get("sha256", ""))
+    if exists is not True or not _re.fullmatch(r"[0-9a-f]{64}", sha):
+        logger.warning(
+            "Ignoring malformed refine_baseline in proposal for '%s'",
+            proposal.get("name", ""),
+        )
+        return None
+    name = str(proposal.get("name", ""))
+    if observed_sha:
+        # Check B: compare against the sha from prepare_skill_recovery snapshot.
+        if observed_sha != sha:
+            return (
+                f"Skill '{name}': entry changed during refinement planning "
+                f"(baseline {sha[:12]}… vs current {observed_sha[:12]}…)"
+            )
+        return None
+    # Check A: read current state from host before backup.
+    current = journal.skill_baseline(name)
+    if current is None:
+        return (
+            f"Skill '{name}': entry changed during refinement planning "
+            "(cannot confirm target state)"
+        )
+    if not current.get("exists"):
+        return (
+            f"Skill '{name}': entry changed during refinement planning "
+            "(target was deleted after planning)"
+        )
+    if current["sha256"] != sha:
+        return (
+            f"Skill '{name}': entry changed during refinement planning "
+            f"(baseline {sha[:12]}… vs current {current['sha256'][:12]}…)"
+        )
+    return None
 
 
 def _journal_nonmutation(**kwargs: Any) -> Optional[str]:
@@ -798,6 +922,28 @@ def _apply_edit(
     recovery: Dict[str, Any] = {}
     prompt_note: Optional[Dict[str, str]] = None
     if kind == "skill" and action == "patch":
+        # Check A: refuse before backup if planning baseline is stale.
+        conflict_a = _skill_baseline_conflict(proposal)
+        if conflict_a:
+            entry_id = _journal_nonmutation(
+                trigger=trigger,
+                reason=safe_reason,
+                session_id=session,
+                proposal=proposal,
+                outcome="conflict",
+                error=conflict_a,
+                group=group,
+            )
+            result = {
+                "success": False,
+                "message": conflict_a,
+                "proposal": proposal,
+                "reversible": False,
+                "edits_applied": 0,
+            }
+            if entry_id:
+                result["record_id"] = entry_id
+            return result
         captured = journal.prepare_skill_recovery(name)
         if captured is None:
             error = f"Cannot create durable backup for skill '{name}'; mutation aborted"
@@ -817,6 +963,45 @@ def _apply_edit(
                 "reversible": False,
                 "edits_applied": 0,
             }
+        # Check B: verify the backup snapshot came from the planning baseline.
+        conflict_b = _skill_baseline_conflict(
+            proposal, observed_sha=captured["snapshot"]["before_sha256"]
+        )
+        if conflict_b:
+            # The recovery capture wrote a raw backup before discovering the
+            # conflict. A conflict is never reversible, so remove that copy;
+            # if cleanup fails, retain its path in the journal for auditability.
+            conflict_backup = Path(str(captured["backup_path"]))
+            retained_backup_path = ""
+            try:
+                conflict_backup.unlink(missing_ok=True)
+            except OSError as exc:
+                retained_backup_path = str(conflict_backup)
+                logger.warning(
+                    "Cannot remove unused conflict backup for skill '%s': %s",
+                    name,
+                    scrub_text(str(exc)),
+                )
+            entry_id = _journal_nonmutation(
+                trigger=trigger,
+                reason=safe_reason,
+                session_id=session,
+                proposal=proposal,
+                outcome="conflict",
+                backup_path=retained_backup_path,
+                error=conflict_b,
+                group=group,
+            )
+            result = {
+                "success": False,
+                "message": conflict_b,
+                "proposal": proposal,
+                "reversible": False,
+                "edits_applied": 0,
+            }
+            if entry_id:
+                result["record_id"] = entry_id
+            return result
         backup_path = str(captured["backup_path"])
         snapshot = captured["snapshot"]
         recovery = {"type": "skill_patch", "name": name}
@@ -1094,6 +1279,60 @@ def _apply_transaction(
 
     results: List[Dict[str, Any]] = []
     stop_reason = ""
+
+    # ── Stale-plan preflight: reject the entire transaction if any skill patch
+    # was built from content that no longer matches the live host state. This
+    # prevents a partial apply where edit #1 succeeds but edit #2 would conflict.
+    stale_edits: List[int] = []
+    for index, edit in enumerate(edits):
+        normalized = edit_proposal(edit)
+        if (
+            normalized.get("kind") == "skill"
+            and normalized.get("action") == "patch"
+            and isinstance(normalized.get("refine_baseline"), dict)
+        ):
+            conflict = _skill_baseline_conflict(normalized)
+            if conflict:
+                stale_edits.append(index)
+    if stale_edits:
+        conflict_msg = (
+            f"Transaction rejected: entry changed during refinement planning "
+            f"(stale edit(s) at index {stale_edits})"
+        )
+        for index, edit in enumerate(edits):
+            normalized = edit_proposal(edit)
+            if index in stale_edits:
+                _journal_nonmutation(
+                    trigger=trigger,
+                    reason=safe_reason,
+                    session_id=session,
+                    proposal=normalized,
+                    outcome="conflict",
+                    error=conflict_msg,
+                    group=edit_group(index),
+                )
+            else:
+                _journal_nonmutation(
+                    trigger=trigger,
+                    reason=safe_reason,
+                    session_id=session,
+                    proposal=normalized,
+                    outcome="rejected",
+                    error=conflict_msg,
+                    group=edit_group(index),
+                )
+        return {
+            "success": False,
+            "outcome": "failed",
+            "message": conflict_msg,
+            "proposal": proposal,
+            "results": [],
+            "recoveries": [],
+            "journal_ids": [],
+            "reversible": False,
+            "edits_applied": 0,
+        }
+
     for index, edit in enumerate(edits):
         # Re-read the durable budget between edits: it counts edits, so a long
         # transaction can legitimately exhaust it part way through.

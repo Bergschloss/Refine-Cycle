@@ -673,7 +673,10 @@ def _read_skill_state(name: str) -> tuple:
     from tools.skills_tool import skill_view
 
     try:
-        raw = skill_view(name)
+        # Baselines and backups must use literal SKILL.md bytes. The host's
+        # default preprocessing can render inline shell directives, producing
+        # changing content and executing commands on every guard read.
+        raw = skill_view(name, preprocess=False)
         result = raw if isinstance(raw, dict) else json.loads(raw)
     except Exception as exc:
         logger.warning("Cannot view skill '%s': %s", name, scrub_text(str(exc)))
@@ -713,6 +716,27 @@ def read_skill_content(name: str) -> Optional[str]:
 
 def _content_digest(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8", "replace")).hexdigest()
+
+
+def content_digest(content: str) -> str:
+    """Public wrapper over the internal digest used by planning baseline capture."""
+    return _content_digest(content)
+
+
+def skill_baseline(name: str) -> Optional[Dict[str, Any]]:
+    """Return the current skill identity for planning-baseline comparison.
+
+    Returns:
+        None — host state is unknown (read error); cannot confirm or deny.
+        {"exists": False, "sha256": ""} — skill definitively does not exist.
+        {"exists": True, "sha256": "<hex>"} — skill exists with this content digest.
+    """
+    known, content = _read_skill_state(name)
+    if not known:
+        return None
+    if content is None:
+        return {"exists": False, "sha256": ""}
+    return {"exists": True, "sha256": _content_digest(content)}
 
 
 def prepare_skill_recovery(name: str) -> Optional[Dict[str, Any]]:

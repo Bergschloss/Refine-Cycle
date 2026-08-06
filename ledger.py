@@ -75,6 +75,17 @@ def record_edit(
     key = name if kind == "skill" else f"{kind}:{name}"
     with journal.mutation_lock():
         stats = load_stats()
+        # Before kind-qualified keys existed, every entry used its bare name.
+        # Move a legacy non-skill row out of the skill namespace before any
+        # write, including a same-named skill write, so history and versions
+        # survive the upgrade instead of becoming a duplicate audit row.
+        legacy = stats.get(name)
+        if isinstance(legacy, dict):
+            legacy_kind = str(legacy.get("kind", "skill") or "skill")
+            if legacy_kind != "skill":
+                legacy_key = f"{legacy_kind}:{name}"
+                stats.setdefault(legacy_key, legacy)
+                del stats[name]
         previous = stats.get(key, {})
         now = time.time()
         same_edit = previous.get("journal_id") == journal_id
@@ -287,8 +298,11 @@ def format_audit(rows: List[Dict[str, Any]]) -> str:
         else:
             uses = str(row["uses"])
         recurred = {True: "yes", False: "no", None: "—"}[row["pattern_recurred"]]
+        kind = str(row.get("kind", "skill") or "skill")
+        name = str(row.get("name", ""))
+        display_name = name if kind == "skill" else f"{kind}:{name}"
         lines.append(
-            f"  {row['name'][:28]:<28} {str(row['age_days']) + 'd':>5}  "
+            f"  {display_name[:28]:<28} {str(row['age_days']) + 'd':>5}  "
             f"{'v' + str(row.get('version', 1)):>3}  {uses:>7}  "
             f"{recurred:>8}  {row['verdict']}"
         )
@@ -299,7 +313,12 @@ def format_audit(rows: List[Dict[str, Any]]) -> str:
     if candidates:
         lines.extend(["", "Candidates for removal:"])
         for row in candidates:
-            lines.append(f"  {row['name']} — /refine rollback {row['journal_id']}")
+            kind = str(row.get("kind", "skill") or "skill")
+            name = str(row.get("name", ""))
+            display_name = name if kind == "skill" else f"{kind}:{name}"
+            lines.append(
+                f"  {display_name} — /refine rollback {row['journal_id']}"
+            )
         lines.extend(["", "Nothing was deleted. Run the command yourself if you agree."])
     lines.extend([
         "",

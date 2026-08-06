@@ -205,7 +205,7 @@ def install_fake_host():
         "skills": [{"name": name} for name in sorted(FakeHost.skills)]
     })
 
-    def skill_view(name):
+    def skill_view(name, preprocess=True):
         if name not in FakeHost.skills:
             return json.dumps({"success": False, "error": "not found"})
         return json.dumps({
@@ -1751,7 +1751,7 @@ class RefineTests(unittest.TestCase):
         self.assertIn("Daily edit limit reached", skipped["error"])
         self.assertEqual(skipped["group"]["index"], 1)
 
-    def test_transaction_edits_are_capped_and_duplicate_targets_collapse(self):
+    def test_transaction_edits_are_capped_and_duplicate_targets_are_reported(self):
         reply = {
             "action": "create", "reason": "Repeated failure",
             "expected_outcome": "The repeated failure stops.",
@@ -1768,10 +1768,13 @@ class RefineTests(unittest.TestCase):
         }
         FakeHost.entry_config()["max_edits_per_proposal"] = 2
         capped = llm.propose(MockLlm(reply), "evidence", [], [])
-        # The duplicate target is dropped and the third edit is past the cap, so a
-        # transaction of one collapses back to the ordinary single-edit shape.
-        self.assertNotIn("edits", capped)
-        self.assertEqual((capped["action"], capped["name"]), ("create", "capped-one"))
+        # The duplicate target is dropped and the third edit is past the cap.
+        # Preserve that loss so applying the remaining edit reports a partial
+        # transaction instead of silently claiming the inseparable set landed.
+        self.assertEqual(capped["action"], "multi")
+        self.assertEqual(len(capped["edits"]), 1)
+        self.assertEqual(capped["edits"][0]["name"], "capped-one")
+        self.assertEqual(capped["dropped_edits"], 2)
         self.assertEqual(capped["expected_outcome"], "The repeated failure stops.")
 
         FakeHost.entry_config()["max_edits_per_proposal"] = 3
@@ -1936,7 +1939,7 @@ class RefineTests(unittest.TestCase):
             ["create", "create"],
         )
 
-    def test_transaction_drops_a_create_edit_that_omits_content(self):
+    def test_transaction_reports_a_create_edit_dropped_for_missing_content(self):
         FakeHost.entry_config()["max_edits_per_day"] = 5
         reply = {
             "action": "create", "reason": "Repeated failure",
@@ -1947,10 +1950,19 @@ class RefineTests(unittest.TestCase):
             ],
         }
         model = MockLlm(reply)
-        result = llm.propose(model, "evidence", [], [])
-        self.assertNotIn("edits", result)
-        self.assertEqual(result["name"], "kept-edit")
+        proposal = llm.propose(model, "evidence", [], [])
+        self.assertEqual(proposal["action"], "multi")
+        self.assertEqual(len(proposal["edits"]), 1)
+        self.assertEqual(proposal["edits"][0]["name"], "kept-edit")
+        self.assertEqual(proposal["dropped_edits"], 1)
         self.assertEqual(len(model.calls), 1)
+
+        result = self.run_proposal(proposal)
+        self.assertFalse(result["success"])
+        self.assertEqual(result["outcome"], "partial_success")
+        self.assertEqual(result["edits_applied"], 1)
+        self.assertIn("discarded before apply", result["message"])
+        self.assertEqual(grouped_entries()[0]["group"]["dropped"], 1)
 
     def test_patch_selection_without_content_reaches_complete_replacement(self):
         name = "contentless-patch"
@@ -2764,7 +2776,7 @@ def skills_list():
     if skills_root.is_dir():
         values = [{"name": child.name} for child in skills_root.iterdir() if child.is_dir()]
     return json.dumps({"skills": values})
-def skill_view(skill_name):
+def skill_view(skill_name, preprocess=True):
     path = skill_path(skill_name)
     if not path.is_file():
         return json.dumps({"success": False, "error": "not found"})
@@ -2868,6 +2880,450 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
         self.assertEqual(
             len(list((self.root / "driver-skills").glob("*/SKILL.md"))), 1
         )
+
+
+    # ── Phase 1: skill_baseline tests ─────────────────────────────────────────
+
+    def test_skill_baseline_existing_skill_returns_digest(self):
+        name = "baseline-existing"
+        body = skill_content(name, "# Current guidance\n\nSome text.")
+        FakeHost.add_skill(name, body)
+        result = journal.skill_baseline(name)
+        self.assertIsNotNone(result)
+        self.assertTrue(result["exists"])
+        import hashlib
+        expected_sha = hashlib.sha256(body.encode("utf-8", "replace")).hexdigest()
+        self.assertEqual(result["sha256"], expected_sha)
+
+    def test_skill_state_reads_disable_host_preprocessing(self):
+        name = "baseline-raw"
+        raw_content = skill_content(name, "# Literal !`dynamic command`")
+        rendered_content = raw_content + "\n\nrendered-at-a-different-time"
+        preprocess_values = []
+
+        def dynamic_skill_view(skill_name, preprocess=True):
+            self.assertEqual(skill_name, name)
+            preprocess_values.append(preprocess)
+            return json.dumps({
+                "success": True,
+                "content": rendered_content if preprocess else raw_content,
+            })
+
+        skills_module = sys.modules["tools.skills_tool"]
+        with patch.object(skills_module, "skill_view", side_effect=dynamic_skill_view):
+            self.assertEqual(journal.read_skill_content(name), raw_content)
+            baseline = journal.skill_baseline(name)
+
+        import hashlib
+        expected_sha = hashlib.sha256(
+            raw_content.encode("utf-8", "replace")
+        ).hexdigest()
+        self.assertEqual(baseline, {"exists": True, "sha256": expected_sha})
+        self.assertEqual(preprocess_values, [False, False])
+
+    def test_skill_baseline_absent_skill_returns_exists_false(self):
+        result = journal.skill_baseline("nonexistent-skill")
+        self.assertIsNotNone(result)
+        self.assertFalse(result["exists"])
+        self.assertEqual(result["sha256"], "")
+
+    def test_skill_baseline_host_failure_returns_none(self):
+        skills_module = sys.modules["tools.skills_tool"]
+        with patch.object(skills_module, "skill_view", side_effect=OSError("host down")):
+            result = journal.skill_baseline("any-skill")
+        self.assertIsNone(result)
+
+    # ── Phase 2: planning baseline capture tests ───────────────────────────────
+
+    def test_skill_patch_proposal_carries_planning_baseline(self):
+        name = "baseline-patch"
+        current = skill_content(name, "# Existing\n\nKeep this.")
+        replacement = skill_content(name, "# Existing\n\nKeep this.\n\nNew fix.")
+        FakeHost.add_skill(name, current)
+        initial = {
+            "action": "patch", "kind": "skill", "name": name,
+            "content": "stub", "reason": "failure", "evidence": [],
+        }
+        model = MockLlm(initial, dict(initial, content=replacement))
+        result = llm.propose(
+            model, "evidence", [name], [], skill_content_loader=journal.read_skill_content
+        )
+        self.assertIn("refine_baseline", result)
+        import hashlib
+        expected_sha = hashlib.sha256(current.encode("utf-8", "replace")).hexdigest()
+        self.assertEqual(result["refine_baseline"]["sha256"], expected_sha)
+        self.assertTrue(result["refine_baseline"]["exists"])
+
+    def test_model_cannot_inject_fake_baseline(self):
+        name = "tamper-baseline"
+        current = skill_content(name, "# Real content")
+        replacement = skill_content(name, "# Real content\n\nFixed.")
+        FakeHost.add_skill(name, current)
+        fake_baseline = {"exists": True, "sha256": "0" * 64}
+        initial = {
+            "action": "patch", "kind": "skill", "name": name,
+            "content": "stub", "reason": "failure", "evidence": [],
+            "refine_baseline": fake_baseline,
+        }
+        retry_with_fake = dict(initial, content=replacement, refine_baseline=fake_baseline)
+        model = MockLlm(initial, retry_with_fake)
+        result = llm.propose(
+            model, "evidence", [name], [], skill_content_loader=journal.read_skill_content
+        )
+        import hashlib
+        expected_sha = hashlib.sha256(current.encode("utf-8", "replace")).hexdigest()
+        self.assertEqual(result["refine_baseline"]["sha256"], expected_sha)
+        self.assertNotEqual(result["refine_baseline"]["sha256"], "0" * 64)
+
+    def test_create_and_memory_have_no_baseline(self):
+        result_create = llm._finalize_edit(
+            MockLlm(), "short", "instructions",
+            {"action": "create", "kind": "skill", "name": "new-skill",
+             "content": skill_content("new-skill"), "reason": "r", "evidence": []},
+            skill_content_loader=journal.read_skill_content,
+        )
+        self.assertNotIn("refine_baseline", result_create)
+        result_memory = llm._finalize_edit(
+            MockLlm(), "short", "instructions",
+            {"action": "create", "kind": "memory", "name": "lesson",
+             "content": "Remember this", "reason": "r", "evidence": []},
+            skill_content_loader=journal.read_skill_content,
+        )
+        self.assertNotIn("refine_baseline", result_memory)
+
+    def test_multi_proposal_each_patch_has_own_baseline(self):
+        name_a = "multi-base-a"
+        name_b = "multi-base-b"
+        body_a = skill_content(name_a, "# A content")
+        body_b = skill_content(name_b, "# B content")
+        FakeHost.add_skill(name_a, body_a)
+        FakeHost.add_skill(name_b, body_b)
+        replacement_a = skill_content(name_a, "# A content\n\nFix A.")
+        replacement_b = skill_content(name_b, "# B content\n\nFix B.")
+        edits = [
+            {"action": "patch", "kind": "skill", "name": name_a, "content": replacement_a},
+            {"action": "patch", "kind": "skill", "name": name_b, "content": replacement_b},
+        ]
+        multi = {
+            "action": "multi", "kind": "", "name": "", "content": "",
+            "summary": "Fix both", "reason": "failure", "evidence": [],
+            "edits": edits,
+        }
+        # _finalize_edit for each patch sub-calls the model to get the full replacement
+        patch_reply_a = {"action": "patch", "kind": "skill", "name": name_a, "content": replacement_a, "reason": "failure", "evidence": []}
+        patch_reply_b = {"action": "patch", "kind": "skill", "name": name_b, "content": replacement_b, "reason": "failure", "evidence": []}
+        model = MockLlm(multi, patch_reply_a, patch_reply_b)
+        result = llm.propose(
+            model, "evidence", [name_a, name_b], [],
+            skill_content_loader=journal.read_skill_content
+        )
+        self.assertEqual(result["action"], "multi")
+        import hashlib
+        sha_a = hashlib.sha256(body_a.encode("utf-8", "replace")).hexdigest()
+        sha_b = hashlib.sha256(body_b.encode("utf-8", "replace")).hexdigest()
+        self.assertEqual(result["edits"][0]["refine_baseline"]["sha256"], sha_a)
+        self.assertEqual(result["edits"][1]["refine_baseline"]["sha256"], sha_b)
+
+    # ── Phase 3: stale-plan conflict detection tests ───────────────────────────
+
+    def test_external_change_between_planning_and_apply_is_conflict(self):
+        name = "conflict-ext"
+        original = skill_content(name, "# Original guidance")
+        replacement = skill_content(name, "# Original guidance\n\nFix.")
+        FakeHost.add_skill(name, original)
+        # Build a proposal with baseline via llm.propose
+        initial = {
+            "action": "patch", "kind": "skill", "name": name,
+            "content": "stub", "reason": "failure", "evidence": [],
+            "pattern_fingerprint": "deadbeef1234",
+        }
+        model = MockLlm(initial, dict(initial, content=replacement))
+        proposal = llm.propose(
+            model, "evidence", [name], [],
+            skill_content_loader=journal.read_skill_content
+        )
+        self.assertIn("refine_baseline", proposal)
+        # Simulate external edit between planning and apply
+        external_content = skill_content(name, "# Externally modified")
+        FakeHost.add_skill(name, external_content)
+        result = core._apply_edit(
+            proposal, trigger="manual", safe_reason="test",
+            session="session", started=time.time()
+        )
+        self.assertFalse(result["success"])
+        self.assertIn("entry changed during refinement planning", result["message"])
+        # Host skill was NOT overwritten
+        self.assertEqual(FakeHost.skills[name], external_content)
+        # No edit action reached the host
+        edit_actions = [a for a in FakeHost.actions if a["action"] == "edit"]
+        self.assertEqual(len(edit_actions), 0)
+        # Journal has a conflict record
+        entries = journal.entries()
+        conflict_entries = [e for e in entries if e.get("outcome") == "conflict"]
+        self.assertEqual(len(conflict_entries), 1)
+        # Budget NOT consumed
+        self.assertEqual(journal.count_today_applied(), 0)
+
+    def test_conflict_after_backup_removes_backup(self):
+        name = "conflict-after-backup"
+        original = skill_content(name, "# Original guidance")
+        replacement = skill_content(name, "# Original guidance\n\nFix.")
+        external_content = skill_content(name, "# Externally modified")
+        FakeHost.add_skill(name, original)
+        initial = {
+            "action": "patch", "kind": "skill", "name": name,
+            "content": "stub", "reason": "failure", "evidence": [],
+            "pattern_fingerprint": "deadbeef1234",
+        }
+        proposal = llm.propose(
+            MockLlm(initial, dict(initial, content=replacement)),
+            "evidence", [name], [],
+            skill_content_loader=journal.read_skill_content,
+        )
+        real_prepare = journal.prepare_skill_recovery
+
+        def prepare_after_external_change(skill_name):
+            FakeHost.add_skill(skill_name, external_content)
+            return real_prepare(skill_name)
+
+        with patch.object(
+            journal,
+            "prepare_skill_recovery",
+            side_effect=prepare_after_external_change,
+        ):
+            result = core._apply_edit(
+                proposal, trigger="manual", safe_reason="test",
+                session="session", started=time.time()
+            )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(FakeHost.skills[name], external_content)
+        conflict = next(
+            entry for entry in journal.entries()
+            if entry.get("outcome") == "conflict"
+        )
+        retained_path = conflict.get("backup_path", "")
+        self.assertFalse(retained_path and Path(retained_path).exists())
+        self.assertEqual(list(journal.backups_dir().glob("*.bak")), [])
+
+    def test_external_deletion_is_conflict_not_backup_failure(self):
+        name = "conflict-del"
+        original = skill_content(name, "# Will be deleted")
+        replacement = skill_content(name, "# Will be deleted\n\nFix.")
+        FakeHost.add_skill(name, original)
+        initial = {
+            "action": "patch", "kind": "skill", "name": name,
+            "content": "stub", "reason": "failure", "evidence": [],
+            "pattern_fingerprint": "deadbeef1234",
+        }
+        model = MockLlm(initial, dict(initial, content=replacement))
+        proposal = llm.propose(
+            model, "evidence", [name], [],
+            skill_content_loader=journal.read_skill_content
+        )
+        # Delete the skill externally
+        del FakeHost.skills[name]
+        import shutil
+        shutil.rmtree(self.root / "skills" / name, ignore_errors=True)
+        result = core._apply_edit(
+            proposal, trigger="manual", safe_reason="test",
+            session="session", started=time.time()
+        )
+        self.assertFalse(result["success"])
+        self.assertIn("entry changed during refinement planning", result["message"])
+        # Must say deletion, not "Cannot create durable backup"
+        self.assertNotIn("Cannot create durable backup", result["message"])
+
+    def test_unchanged_target_applies_normally(self):
+        name = "conflict-ok"
+        original = skill_content(name, "# Unchanged guidance")
+        replacement = skill_content(name, "# Unchanged guidance\n\nFix.")
+        FakeHost.add_skill(name, original)
+        initial = {
+            "action": "patch", "kind": "skill", "name": name,
+            "content": "stub", "reason": "failure", "evidence": [],
+            "pattern_fingerprint": "deadbeef1234",
+        }
+        model = MockLlm(initial, dict(initial, content=replacement))
+        proposal = llm.propose(
+            model, "evidence", [name], [],
+            skill_content_loader=journal.read_skill_content
+        )
+        result = core._apply_edit(
+            proposal, trigger="manual", safe_reason="test",
+            session="session", started=time.time()
+        )
+        self.assertTrue(result["success"])
+        self.assertEqual(FakeHost.actions[-1]["action"], "edit")
+        self.assertEqual(FakeHost.skills[name], replacement)
+
+    def test_transaction_with_one_stale_edit_applies_zero(self):
+        name_a = "txn-ok"
+        name_b = "txn-stale"
+        body_a = skill_content(name_a, "# A ok")
+        body_b = skill_content(name_b, "# B ok")
+        FakeHost.add_skill(name_a, body_a)
+        FakeHost.add_skill(name_b, body_b)
+        replacement_a = skill_content(name_a, "# A ok\n\nFix A.")
+        replacement_b = skill_content(name_b, "# B ok\n\nFix B.")
+        edits = [
+            {"action": "patch", "kind": "skill", "name": name_a, "content": replacement_a},
+            {"action": "patch", "kind": "skill", "name": name_b, "content": replacement_b},
+        ]
+        multi = {
+            "action": "multi", "kind": "", "name": "", "content": "",
+            "summary": "Fix both", "reason": "failure", "evidence": [],
+            "edits": edits,
+        }
+        patch_reply_a = {"action": "patch", "kind": "skill", "name": name_a, "content": replacement_a, "reason": "failure", "evidence": []}
+        patch_reply_b = {"action": "patch", "kind": "skill", "name": name_b, "content": replacement_b, "reason": "failure", "evidence": []}
+        model = MockLlm(multi, patch_reply_a, patch_reply_b)
+        proposal = llm.propose(
+            model, "evidence", [name_a, name_b], [],
+            skill_content_loader=journal.read_skill_content
+        )
+        # Externally modify B only
+        FakeHost.add_skill(name_b, skill_content(name_b, "# B externally changed"))
+        result = core._apply_transaction(
+            proposal, trigger="manual", safe_reason="test",
+            session="session", started=time.time()
+        )
+        self.assertFalse(result["success"])
+        self.assertEqual(result["edits_applied"], 0)
+        # A was not touched
+        self.assertEqual(FakeHost.skills[name_a], body_a)
+        # Journal has conflict and rejected entries with groups
+        entries = journal.entries()
+        conflict_entries = [e for e in entries if e.get("outcome") == "conflict"]
+        rejected_entries = [e for e in entries if e.get("outcome") == "rejected"]
+        self.assertGreaterEqual(len(conflict_entries), 1)
+        self.assertGreaterEqual(len(rejected_entries), 1)
+
+    def test_legacy_proposal_without_baseline_applies_normally(self):
+        name = "legacy-no-base"
+        original = skill_content(name, "# Legacy content")
+        replacement = skill_content(name, "# Legacy content\n\nFix.")
+        FakeHost.add_skill(name, original)
+        # Manually assembled proposal without refine_baseline (as existing tests do)
+        proposal = {
+            "action": "patch", "kind": "skill", "name": name,
+            "content": replacement, "reason": "Repeated failure",
+            "evidence": ["request failed"], "pattern_fingerprint": "deadbeef1234",
+            "expected_outcome": "The failure stops.",
+        }
+        result = core._apply_edit(
+            proposal, trigger="manual", safe_reason="test",
+            session="session", started=time.time()
+        )
+        self.assertTrue(result["success"])
+        self.assertEqual(FakeHost.skills[name], replacement)
+
+    def test_full_path_conflict_through_refine_run(self):
+        name = "full-path"
+        original = skill_content(name, "# Original for full path")
+        replacement = skill_content(name, "# Original for full path\n\nFix.")
+        FakeHost.add_skill(name, original)
+        initial = {
+            "action": "patch", "kind": "skill", "name": name,
+            "content": "stub", "reason": "Repeated failure",
+            "evidence": ["request failed"],
+            "pattern_fingerprint": "deadbeef1234",
+        }
+        retry = dict(initial, content=replacement)
+
+        class ConflictInjectingLlm(MockLlm):
+            """After the second call (patch content), mutate FakeHost to simulate conflict."""
+            def complete_structured(self, **kwargs):
+                result = super().complete_structured(**kwargs)
+                if len(self.calls) == 2:
+                    # Simulate external change after model saw the content
+                    FakeHost.add_skill(name, skill_content(name, "# Externally changed"))
+                return result
+
+        model = ConflictInjectingLlm(initial, retry)
+        result = core.refine_run(model)
+        self.assertFalse(result["success"])
+        self.assertIn("entry changed during refinement planning", result["message"])
+
+    # ── Autostart / status tests ──────────────────────────────────────────────
+
+    def test_status_reports_blockers_when_auto_disabled(self):
+        with patch.object(config, "auto_enabled", return_value=False):
+            status = core.refine_status()
+        self.assertFalse(status["auto_enabled"])
+        self.assertTrue(any("вимкнений" in b for b in status["blockers"]))
+
+    def test_status_reports_no_blockers_when_ready(self):
+        status = core.refine_status()
+        self.assertTrue(status["auto_enabled"])
+        # Fresh journal, no cooldown, budget free → no blockers
+        self.assertEqual(status["blockers"], [])
+
+    def test_status_reports_budget_exhausted(self):
+        # Temporarily lower budget to 1 and exhaust it
+        FakeHost.entry_config()["max_edits_per_day"] = 1
+        result = self.run_proposal(skill_proposal("status-budget-test"))
+        self.assertTrue(result["success"])
+        status = core.refine_status()
+        self.assertEqual(status["edits_today"], 1)
+        self.assertGreater(len(status["blockers"]), 0)
+
+    def test_status_does_not_create_journal_entries(self):
+        before = len(journal.entries())
+        core.refine_status()
+        self.assertEqual(len(journal.entries()), before)
+
+    def test_status_does_not_call_model(self):
+        with patch.object(core, "refine_run", side_effect=AssertionError("model called")):
+            core.refine_status()  # should not raise
+
+    def test_status_command_returns_text_not_dict(self):
+        result = plugin_init._handle_refine_command("status")
+        self.assertIsInstance(result, str)
+        self.assertIn("auto:", result)
+
+    def test_status_as_reason_word_goes_to_proposal(self):
+        with patch.object(plugin_init.core, "refine_run", return_value={
+            "success": True, "message": "done", "outcome": "no_op",
+        }) as run:
+            plugin_init._handle_refine_command("status of gmail failures")
+        run.assert_called_once()
+        self.assertEqual(run.call_args.kwargs["reason"], "status of gmail failures")
+
+    def test_journal_dir_collision_warning(self):
+        # Place a plugin.yaml in journal_dir to simulate collision
+        jdir = Path(config.journal_dir())
+        jdir.mkdir(parents=True, exist_ok=True)
+        (jdir / "plugin.yaml").write_text("name: refine\n", encoding="utf-8")
+        status = core.refine_status()
+        self.assertTrue(status["journal_dir_is_plugin_source"])
+        self.assertTrue(len(status["warnings"]) > 0)
+
+    def test_register_warns_on_collision(self):
+        jdir = Path(config.journal_dir())
+        jdir.mkdir(parents=True, exist_ok=True)
+        (jdir / "plugin.yaml").write_text("name: refine\n", encoding="utf-8")
+        plugin_init._REGISTER_WARNED = False
+        # The logger name when imported directly is __init__
+        with self.assertLogs(level="WARNING") as cm:
+            plugin_init._warn_on_register()
+        self.assertTrue(any("journal_dir" in msg for msg in cm.output))
+        # Second call does not warn again due to the flag
+        self.assertTrue(plugin_init._REGISTER_WARNED)
+
+    def test_register_does_not_warn_without_collision(self):
+        plugin_init._REGISTER_WARNED = False
+        # No plugin.yaml in journal_dir — should not log a warning at our level
+        try:
+            with self.assertLogs(level="WARNING"):
+                plugin_init._warn_on_register()
+            self.fail("Should not have logged a warning without collision")
+        except AssertionError as exc:
+            if "no logs" not in str(exc).lower():
+                raise
+
+    def test_auto_enabled_defaults_to_true(self):
+        self.assertTrue(config.auto_enabled())
 
 
 if __name__ == "__main__":

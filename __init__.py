@@ -231,6 +231,38 @@ def _handle_refine_command(raw_args: str) -> Optional[str]:
             logger.exception("refine audit failed")
             return f"❌ Audit failed: {exc}"
 
+    if args == "status":
+        try:
+            from .sanitization import scrub_text as _scrub
+        except ImportError:
+            from sanitization import scrub_text as _scrub
+        try:
+            status = core.refine_status()
+        except Exception as exc:
+            logger.exception("refine status failed")
+            return f"❌ Status failed: {exc}"
+        lines = [
+            f"auto: {'on' if status['auto_enabled'] else 'off'}",
+            f"turn interval: {status['auto_turn_interval']}",
+            f"min messages: {status['auto_min_messages']}",
+            f"cooldown: {status['auto_cooldown_minutes']} min",
+            f"edits today: {status['edits_today']}/{status['max_edits_per_day']}",
+            f"journal: {status['journal_dir']}",
+        ]
+        if status.get("cooldown_remaining_minutes"):
+            lines.append(f"cooldown remaining: {status['cooldown_remaining_minutes']} min")
+        if status["blockers"]:
+            lines.append("blockers:")
+            for b in status["blockers"]:
+                lines.append(f"  • {b}")
+        else:
+            lines.append("blockers: none — auto-refine is active")
+        if status["warnings"]:
+            lines.append("warnings:")
+            for w in status["warnings"]:
+                lines.append(f"  ⚠ {w}")
+        return _scrub("\n".join(lines))
+
     if args == "rollback":
         return (
             "Usage: /refine rollback <12-character journal_id>\n"
@@ -372,8 +404,8 @@ def register(ctx) -> None:
     ctx.register_command(
         "refine",
         _handle_refine_command,
-        description="Self-improve skills/memory. Usage: /refine [reason|audit|rollback <id>]",
-        args_hint="[reason | audit | rollback <id>]",
+        description="Self-improve skills/memory. Usage: /refine [reason|audit|status|rollback <id>]",
+        args_hint="[reason | audit | status | rollback <id>]",
     )
     ctx.register_tool(
         "refine_run",
@@ -387,3 +419,26 @@ def register(ctx) -> None:
     ctx.register_hook("post_llm_call", _on_post_llm_call)
     ctx.register_hook("on_session_end", _on_session_end)
     ctx.register_hook("on_session_reset", _on_session_reset)
+    _warn_on_register()
+
+
+_REGISTER_WARNED = False
+
+
+def _warn_on_register() -> None:
+    """Log once-per-process warnings about configuration issues."""
+    global _REGISTER_WARNED
+    if _REGISTER_WARNED:
+        return
+    _REGISTER_WARNED = True
+    jdir = config.journal_dir()
+    try:
+        if (jdir / "plugin.yaml").is_file():
+            logger.warning(
+                "Refine journal_dir (%s) contains plugin source code. "
+                "A forced reinstall may delete runtime data (journal, backups, ledger). "
+                "Set plugins.entries.refine.journal_dir to a separate path.",
+                jdir,
+            )
+    except Exception:
+        pass

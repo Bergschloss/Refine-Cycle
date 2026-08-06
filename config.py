@@ -86,7 +86,7 @@ def get_str(key: str, default: str = "") -> str:
 
 # Convenience accessors
 def auto_enabled() -> bool:
-    return get_bool("auto_enabled", False)
+    return get_bool("auto_enabled", True)
 
 
 def auto_min_messages() -> int:
