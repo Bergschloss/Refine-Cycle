@@ -127,6 +127,40 @@ def _start_auto_refine(
         logger.exception("refine auto thread could not start")
 
 
+def _on_pre_llm_call(**kwargs) -> Optional[dict]:
+    """Inject bounded plugin-owned notes without reading or changing the base prompt."""
+    del kwargs
+    try:
+        if not config.prompt_notes_enabled():
+            return None
+        with journal.try_mutation_lock() as acquired:
+            if not acquired:
+                return None
+            notes = journal.load_prompt_notes()
+        if not notes:
+            return None
+        selected = []
+        for note in notes:
+            content = core.scrub_text(note["content"]).strip()
+            if not content or core._prompt_note_content_error(content, check_rendered_size=False):
+                continue
+            selected.append({"id": note["id"], "content": content})
+        if not selected:
+            return None
+        selected = selected[-config.prompt_notes_max_count():]
+        while selected:
+            rendered = "Refine notes:\n" + "\n".join(
+                f"- {note['content']}" for note in selected
+            )
+            safe_rendered = core.scrub_text(rendered)
+            if len(safe_rendered) <= config.prompt_notes_max_chars():
+                return {"context": safe_rendered}
+            selected = selected[1:]
+    except Exception:
+        logger.debug("refine prompt-note hook failed", exc_info=True)
+    return None
+
+
 def _on_post_llm_call(
     session_id: str = "", conversation_history: Any = None, **kwargs
 ) -> None:
@@ -285,5 +319,6 @@ def register(ctx) -> None:
         description="Run one self-improvement pass over trajectory",
         emoji="🧠",
     )
+    ctx.register_hook("pre_llm_call", _on_pre_llm_call)
     ctx.register_hook("post_llm_call", _on_post_llm_call)
     ctx.register_hook("on_session_end", _on_session_end)

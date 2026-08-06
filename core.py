@@ -340,6 +340,33 @@ def _skill_content_error(name: str, content: str) -> Optional[str]:
     return None
 
 
+def _prompt_note_content_error(
+    content: str, *, check_rendered_size: bool = True
+) -> Optional[str]:
+    """Keep globally injected notes narrow, declarative, and renderable as one block."""
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    if not 1 <= len(lines) <= 2:
+        return "Prompt note must contain one or two non-empty policy lines"
+    if any(
+        line.startswith(("-", "*", "#")) or re.match(r"^\d+[.)]\s", line)
+        for line in lines
+    ):
+        return "Prompt note must be a policy, not a list or procedure"
+    first_line = lines[0]
+    if not re.match(r"(?i)^when\s+[^,\n]{3,200},\s+\S", first_line):
+        return "Prompt note must use 'When <specific condition>, <one action>.'"
+    blocked_terms = r"(?i)\b(?:always|never|ignore|system prompt|instruction|any user|all users|every request|first|then|finally)\b"
+    if any(re.search(blocked_terms, line) for line in lines):
+        return "Prompt note must be a narrow conditional policy, not a global or procedural instruction"
+    rendered = "Refine notes:\n- " + content
+    if check_rendered_size and len(rendered) > config.prompt_notes_max_chars():
+        return (
+            f"Prompt note is too large for its rendered context ({len(rendered)} chars; max "
+            f"{config.prompt_notes_max_chars()})"
+        )
+    return None
+
+
 def _validate_proposal(proposal: Dict[str, Any]) -> Optional[str]:
     action = str(proposal.get("action", "no_op"))
     if action == "no_op":
@@ -347,16 +374,30 @@ def _validate_proposal(proposal: Dict[str, Any]) -> Optional[str]:
     if action not in ("create", "patch"):
         return f"Unsupported action: {action}"
     kind = str(proposal.get("kind", ""))
-    if kind not in ("skill", "memory"):
+    if kind not in ("skill", "memory", "prompt"):
         return f"Unsupported kind: {kind}"
     name = str(proposal.get("name", "")).strip()
     content = str(proposal.get("content", ""))
-    if not name:
-        return "Proposal missing name"
     if not content.strip():
         return f"{action.title()} requires non-empty content"
     if len(content) > _llm.MAX_CONTENT_CHARS:
         return f"Content too large ({len(content)} chars; max {_llm.MAX_CONTENT_CHARS})"
+    if kind == "prompt":
+        if not config.prompt_notes_enabled():
+            return "Prompt notes are disabled"
+        if action != "create":
+            return "Prompt notes support create only"
+        content_error = _prompt_note_content_error(content)
+        if content_error:
+            return content_error
+        duplicate = journal.prompt_note_content_exists(content)
+        if duplicate is None:
+            return "Prompt-note store is unavailable"
+        if duplicate:
+            return "Identical active prompt note already exists"
+    else:
+        if not name:
+            return "Proposal missing name"
     if kind == "skill":
         if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", name):
             return "Skill name must use lowercase letters, digits, hyphens, or underscores"
@@ -413,6 +454,11 @@ def _apply_memory(proposal: Dict[str, Any]) -> Dict[str, Any]:
     if result.get("success") and not result.get("staged"):
         store.save_to_disk(target)
     return result
+
+
+def _apply_prompt_note(note: Dict[str, str]) -> Dict[str, Any]:
+    """Persist a plugin-owned prompt note; no host write or approval is involved."""
+    return journal.add_prompt_note(note)
 
 
 def _journal_nonmutation(**kwargs: Any) -> Optional[str]:
@@ -559,6 +605,11 @@ def _refine_once(
         skill_content_loader=journal.read_skill_content,
     )
     proposal = sanitize(proposal)
+    if proposal.get("kind") == "prompt":
+        proposal = dict(
+            proposal,
+            content=journal.normalize_prompt_note_content(proposal.get("content", "")),
+        )
 
     if proposal.get("action") == "no_op":
         entry_id = _journal_nonmutation(
@@ -605,9 +656,10 @@ def _refine_once(
 
     kind = proposal["kind"]
     action = proposal["action"]
-    name = proposal["name"]
+    name = proposal.get("name", "")
     backup_path = ""
     recovery: Dict[str, Any] = {}
+    prompt_note: Optional[Dict[str, str]] = None
     if kind == "skill" and action == "patch":
         backup = journal.backup_skill(name)
         if backup is None:
@@ -630,6 +682,27 @@ def _refine_once(
         recovery = {"type": "skill_patch", "name": name}
     elif kind == "skill":
         recovery = {"type": "skill_create", "name": name}
+    elif kind == "prompt":
+        prompt_note = journal.new_prompt_note(proposal["content"])
+        if prompt_note is None:
+            error = "Cannot access plugin-owned prompt-note storage; mutation aborted"
+            _journal_nonmutation(
+                trigger=trigger,
+                reason=safe_reason,
+                session_id=session,
+                proposal=proposal,
+                outcome="error",
+                error=error,
+            )
+            return {
+                "success": False,
+                "message": error,
+                "proposal": proposal,
+                "reversible": False,
+            }
+        proposal = dict(proposal, name=prompt_note["id"], note_id=prompt_note["id"])
+        name = prompt_note["id"]
+        recovery = {"type": "prompt_note", "note_id": prompt_note["id"]}
     else:
         target = "user" if kind == "user" else "memory"
         memory_recovery = journal.memory_recovery(target, proposal["content"])
@@ -669,7 +742,12 @@ def _refine_once(
         }
 
     try:
-        apply_result = _apply_skill(proposal) if kind == "skill" else _apply_memory(proposal)
+        if kind == "skill":
+            apply_result = _apply_skill(proposal)
+        elif kind == "prompt":
+            apply_result = _apply_prompt_note(prompt_note or {})
+        else:
+            apply_result = _apply_memory(proposal)
     except Exception as exc:
         apply_result = {"success": False, "error": scrub_text(str(exc))}
     apply_result = sanitize(apply_result)
@@ -879,6 +957,8 @@ def refine_rollback(entry_id: str) -> Dict[str, Any]:
             result = journal.rollback_skill(entry_id)
         elif kind in ("memory", "user"):
             result = journal.rollback_memory(entry_id)
+        elif kind == "prompt":
+            result = journal.rollback_prompt_note(entry_id)
         else:
             return {"success": False, "error": f"Unknown kind for rollback: {kind}"}
         latest = journal.get_entry(entry_id)

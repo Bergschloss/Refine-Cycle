@@ -160,3 +160,18 @@ def dedup_window_days() -> int:
 def journal_dir() -> Path:
     default = hermes_home() / "plugins" / "refine"
     return Path(get_str("journal_dir", str(default)))
+
+
+def prompt_notes_enabled() -> bool:
+    """Whether refine may persist and inject plugin-owned prompt notes."""
+    return get_bool("prompt_notes_enabled", True)
+
+
+def prompt_notes_max_count() -> int:
+    """Maximum prompt notes injected into one LLM call."""
+    return get_int("prompt_notes_max_count", 5, min_val=1)
+
+
+def prompt_notes_max_chars() -> int:
+    """Maximum characters for one complete rendered prompt-note block."""
+    return get_int("prompt_notes_max_chars", 600, min_val=1)
