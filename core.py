@@ -544,7 +544,11 @@ def _refine_once(
                 trigger="reviewer",
                 reason=reviewer_reason,
                 session_id=session,
-                proposal={"action": "no_op", "reason": reviewer_reason},
+                proposal={
+                    "action": "no_op",
+                    "reason": reviewer_reason,
+                    "expected_outcome": "",
+                },
                 outcome="no_op",
             )
             if not reviewer_entry_id:
@@ -557,7 +561,11 @@ def _refine_once(
                     "reversible": False,
                 }
             if not reviewer.get("should_refine"):
-                proposal = {"action": "no_op", "reason": reviewer_reason}
+                proposal = {
+                    "action": "no_op",
+                    "reason": reviewer_reason,
+                    "expected_outcome": "",
+                }
                 return {
                     "success": True,
                     "message": f"No actionable improvement found. {reviewer_reason}",
@@ -576,6 +584,7 @@ def _refine_once(
             proposal = {
                 "action": "no_op",
                 "reason": f"No repeated failure (min {config.min_pattern_count()}x) and no explicit correction.",
+                "expected_outcome": "",
             }
             entry_id = _journal_nonmutation(
                 trigger=trigger,
@@ -612,6 +621,12 @@ def _refine_once(
         skill_content_loader=journal.read_skill_content,
     )
     proposal = sanitize(proposal)
+    proposal = dict(
+        proposal,
+        expected_outcome=_llm.normalize_expected_outcome(
+            proposal.get("expected_outcome")
+        ),
+    )
     failure = scrub_text(str(proposal.get("failure", "")).strip())
     if failure:
         failure_messages = {
