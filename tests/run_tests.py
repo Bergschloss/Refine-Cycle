@@ -43,10 +43,18 @@ class PluginLlmTextInput(PluginLlmInput):
         self.text = text
 
 
+class MockUsage:
+    def __init__(self, output_tokens=0):
+        self.output_tokens = output_tokens
+
+
 class MockResult:
-    def __init__(self, parsed):
+    def __init__(self, parsed=None, *, text="", output_tokens=None, model="test-model"):
         self.parsed = parsed
-        self.text = ""
+        self.text = text
+        self.model = model
+        if output_tokens is not None:
+            self.usage = MockUsage(output_tokens)
 
 
 class PluginLlm:
@@ -67,6 +75,8 @@ class MockLlm:
         response = self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]
         if isinstance(response, Exception):
             raise response
+        if isinstance(response, MockResult):
+            return response
         return MockResult(response)
 
 
@@ -457,6 +467,51 @@ class RefineTests(unittest.TestCase):
         self.assertEqual(
             reviewer_model.calls[0]["max_tokens"], llm.REVIEWER_MAX_TOKENS
         )
+
+    def test_incomplete_reply_is_journaled_distinctly_and_stops_the_run(self):
+        FakeHost.entry_config()["max_edits_per_run"] = 2
+        raw = json.dumps(skill_proposal("cut-off-proposal"))
+        model = MockLlm(MockResult(None, text=raw[:-12]))
+        result = core.refine_run(model)
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["failure"], "truncated")
+        self.assertIn("cut off", result["message"].lower())
+        self.assertEqual(len(model.calls), 1)
+        self.assertFalse(FakeHost.actions)
+        self.assertEqual(journal.count_today_applied(), 0)
+        entry = journal.get_entry(result["journal_id"])
+        self.assertEqual(entry["outcome"], "llm_incomplete")
+        self.assertEqual(entry["proposal"]["failure"], "truncated")
+        self.assertFalse(journal.is_reversible(entry))
+        with patch.object(plugin_init.core, "refine_run", return_value=result):
+            self.assertIn("cut off", plugin_init._handle_refine_command("").lower())
+
+    def test_reply_parse_failures_are_not_disguised_as_noop(self):
+        malformed = core.refine_run(MockLlm(MockResult(
+            None, text='{"action":"no_op","reason": invalid}'
+        )))
+        self.assertFalse(malformed["success"])
+        self.assertEqual(malformed["failure"], "malformed")
+        self.assertEqual(
+            journal.get_entry(malformed["journal_id"])["outcome"], "llm_incomplete"
+        )
+
+        limit_hit = llm.propose(MockLlm(MockResult(
+            None,
+            text='{"action":"create"',
+            output_tokens=llm.PROPOSAL_MAX_TOKENS,
+        )), "evidence", [], [])
+        self.assertEqual(limit_hit["failure"], "truncated")
+
+        no_usage = llm.propose(MockLlm(MockResult(
+            None, text='{"action": invalid}'
+        )), "evidence", [], [])
+        self.assertEqual(no_usage["failure"], "malformed")
+
+        genuine_noop = core.refine_run(MockLlm({"action": "no_op", "reason": "none"}))
+        self.assertTrue(genuine_noop["success"])
+        self.assertEqual(journal.get_entry(genuine_noop["journal_id"])["outcome"], "no_op")
 
     def test_skill_patch_gets_current_complete_content(self):
         name = "existing-skill"
