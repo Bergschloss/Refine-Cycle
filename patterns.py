@@ -21,9 +21,9 @@ _NORMALIZERS = [
     # ISO-ish timestamps and clock times
     (re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?"), "T"),
     (re.compile(r"\b\d{2}:\d{2}:\d{2}\b"), "T"),
-    # Quoted literals — usually the volatile part of a message
-    (re.compile(r"'[^']*'"), "S"),
-    (re.compile(r'"[^"]*"'), "S"),
+    # Single-quoted literals: keep the contents for the same reason as above
+    # (``KeyError: 'user_id'`` is identified by the name, not by the quotes).
+    (re.compile(r"'([^']*)'"), r"\1"),
     # URLs before paths (a URL contains slashes)
     (re.compile(r"https?://\S+"), "URL"),
     # Filesystem paths, POSIX and Windows
@@ -31,11 +31,32 @@ _NORMALIZERS = [
     # UUIDs, then any long hex run (ids, hashes, object addresses)
     (re.compile(r"\b[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}\b"), "X"),
     (re.compile(r"\b(?:0x)?[0-9a-fA-F]{8,}\b"), "X"),
+    # Durations and sizes: a timeout after 10s and after 15s are one failure.
+    (re.compile(r"(?i)\b\d+(?:\.\d+)?\s*(?:ms|s|m|h|kb|mb|gb)\b"), "N"),
     # Whatever integers survive
     (re.compile(r"\b\d+\b"), "N"),
 ]
 
 _TRACEBACK_MARKERS = ("Traceback (most recent call last)", 'File "', "  at ")
+
+# A complete double-quoted token, honouring backslash escapes.
+_DOUBLE_QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"')
+
+
+def _strip_quotes(text: str) -> str:
+    """Drop quote characters but keep what is inside them.
+
+    Blanking quoted strings wholesale looks tempting — they usually hold the
+    volatile part — but the error *message* is also a quoted value, and it is
+    the single most identifying thing about a failure. Blanking it makes
+    "rate limited" and "permission denied" the same pattern, which defeats the
+    entire purpose. The volatile pieces inside (ids, paths, timestamps) are
+    already handled by the rules below, so keeping the words costs nothing.
+
+    Tokenizing matters: a naive ``"[^"]*"`` regex matches from the closing quote
+    of one JSON key to the opening quote of the next, mangling the boundary.
+    """
+    return _DOUBLE_QUOTED.sub(lambda m: m.group(0)[1:-1], text)
 
 
 def normalize_error(content: str) -> str:
@@ -55,6 +76,8 @@ def normalize_error(content: str) -> str:
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         if lines:
             text = lines[-1]
+
+    text = _strip_quotes(text)
 
     for pattern, repl in _NORMALIZERS:
         text = pattern.sub(repl, text)
