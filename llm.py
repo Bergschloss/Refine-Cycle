@@ -56,6 +56,24 @@ REFINE_SYSTEM_PROMPT = (
     "pattern_fingerprint. Never combine action and kind.\n"
 )
 
+REVIEWER_FALLBACK_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "shouldRefine": {"type": "boolean"},
+        "rationale": {"type": "string"},
+        "instructions": {"type": "string"},
+    },
+    "required": ["shouldRefine", "rationale", "instructions"],
+}
+
+REVIEWER_FALLBACK_SYSTEM_PROMPT = (
+    "You are a conservative reviewer for an AI agent's self-improvement system. "
+    "Decide only whether the provided trajectory contains one durable lesson worth persisting. "
+    "Aggressively reject one-off noise, transient tool output, and vague ideas. "
+    "Do not propose an edit. Return shouldRefine=false unless there is a narrow, "
+    "evidence-grounded lesson. When true, instructions must state that lesson briefly."
+)
+
 
 def _salvage_parsed(result: Any) -> Any:
     parsed = getattr(result, "parsed", None)
@@ -128,6 +146,57 @@ def _ensure_dict(parsed: Any) -> Optional[Dict[str, Any]]:
             except json.JSONDecodeError:
                 pass
     return None
+
+
+def review_fallback(llm: PluginLlm, evidence_text: str) -> Dict[str, Any]:
+    """Return one conservative reviewer verdict; all failures decline safely."""
+    safe_evidence = scrub_text(str(evidence_text))
+    instructions = (
+        "Assess this trajectory only for a durable lesson worth persisting. "
+        "Return the required JSON object.\n\n=== RECENT TRAJECTORY ===\n"
+        f"{safe_evidence[-8000:]}"
+    )
+    try:
+        result = llm.complete_structured(
+            system_prompt=scrub_text(REVIEWER_FALLBACK_SYSTEM_PROMPT),
+            input=[PluginLlmTextInput(text=scrub_text(instructions))],
+            json_schema=sanitize(REVIEWER_FALLBACK_SCHEMA),
+            schema_name="refine_reviewer",
+            purpose="refine",
+            temperature=0.0,
+            max_tokens=300,
+        )
+        parsed = _ensure_dict(_salvage_parsed(result))
+    except Exception as exc:
+        logger.warning("Reviewer fallback failed: %s", scrub_text(str(exc)))
+        parsed = None
+    if not parsed or not isinstance(parsed.get("shouldRefine"), bool):
+        return {
+            "should_refine": False,
+            "rationale": "Reviewer unavailable or returned invalid output.",
+            "instructions": "",
+        }
+    raw_rationale = parsed.get("rationale")
+    raw_instructions = parsed.get("instructions")
+    if not isinstance(raw_rationale, str) or not isinstance(raw_instructions, str):
+        return {
+            "should_refine": False,
+            "rationale": "Reviewer returned an incomplete verdict.",
+            "instructions": "",
+        }
+    rationale = scrub_text(raw_rationale).strip()
+    instructions = scrub_text(raw_instructions).strip()
+    if not rationale or (parsed["shouldRefine"] and not instructions):
+        return {
+            "should_refine": False,
+            "rationale": "Reviewer returned an incomplete verdict.",
+            "instructions": "",
+        }
+    return {
+        "should_refine": parsed["shouldRefine"],
+        "rationale": rationale[:1000],
+        "instructions": instructions[:2000],
+    }
 
 
 def _normalize_fields(parsed: Dict[str, Any]) -> Tuple[str, str, str, str, str]:

@@ -1196,6 +1196,154 @@ class RefineTests(unittest.TestCase):
         refine.assert_not_called()
         self.assertFalse(FakeHost.actions)
         self.assertFalse(plugin_init._AUTO_THREAD_GUARD.locked())
+    def test_reviewer_approval_reaches_proposal_with_instructions(self):
+        now = time.time()
+        FakeHost.make_db([
+            ("session", "user", f"Routine context {index}", "", now - index, 1)
+            for index in range(20)
+        ])
+        FakeHost.entry_config().update({
+            "min_signal_required": True,
+            "reviewer_fallback_enabled": True,
+            "reviewer_min_messages": 20,
+        })
+        reviewer_instructions = "Persist the narrow retry lesson for this durable workflow."
+        model = MockLlm(
+            {
+                "shouldRefine": True,
+                "rationale": "The repeated workflow has a durable recovery lesson.",
+                "instructions": reviewer_instructions,
+            },
+            skill_proposal("reviewer-approved"),
+        )
+        result = core.refine_run(model)
+        self.assertTrue(result["success"])
+        self.assertEqual(len(model.calls), 2)
+        self.assertEqual(len(FakeHost.actions), 1)
+        self.assertIn(reviewer_instructions, model.calls[1]["input"][0].text)
+        reviewer_records = [entry for entry in journal.entries() if entry["trigger"] == "reviewer"]
+        self.assertEqual(len(reviewer_records), 1)
+        self.assertIn("Reviewer approved", reviewer_records[0]["reason"])
+
+    def test_reviewer_decline_is_a_sanitized_no_op_without_application(self):
+        now = time.time()
+        FakeHost.make_db([
+            ("session", "user", f"Routine context {index}", "", now - index, 1)
+            for index in range(20)
+        ])
+        FakeHost.entry_config().update({
+            "min_signal_required": True,
+            "reviewer_fallback_enabled": True,
+            "reviewer_min_messages": 20,
+        })
+        secret = "ghp_" + "Z" * 36
+        model = MockLlm({
+            "shouldRefine": False,
+            "rationale": f'One-off noise; api_key="{secret}" must not persist.',
+            "instructions": "",
+        })
+        result = core.refine_run(model)
+        self.assertTrue(result["success"])
+        self.assertTrue(result["llm_called"])
+        self.assertEqual(result["reviewer"], "declined")
+        self.assertEqual(len(model.calls), 1)
+        self.assertFalse(FakeHost.actions)
+        raw = journal.journal_path().read_text(encoding="utf-8")
+        self.assertNotIn(secret, raw)
+        self.assertIn("Reviewer declined", journal.get_entry(result["journal_id"])["reason"])
+
+    def test_reviewer_skips_short_disabled_and_cooled_down_sessions(self):
+        now = time.time()
+        short_rows = [
+            ("session", "user", f"Routine context {index}", "", now - index, 1)
+            for index in range(4)
+        ]
+        FakeHost.make_db(short_rows)
+        FakeHost.entry_config().update({
+            "min_signal_required": True,
+            "reviewer_fallback_enabled": True,
+            "reviewer_min_messages": 20,
+        })
+        short_model = MockLlm()
+        self.assertFalse(core.refine_run(short_model).get("llm_called"))
+        self.assertFalse(short_model.calls)
+
+        FakeHost.make_db([
+            ("session", "user", f"Routine context {index}", "", now - index, 1)
+            for index in range(20)
+        ])
+        FakeHost.entry_config()["reviewer_fallback_enabled"] = False
+        disabled_model = MockLlm()
+        self.assertFalse(core.refine_run(disabled_model).get("llm_called"))
+        self.assertFalse(disabled_model.calls)
+
+        FakeHost.entry_config()["reviewer_fallback_enabled"] = True
+        journal.log(
+            trigger="reviewer", reason="recent reviewer decision", session_id="session",
+            proposal={"action": "no_op"}, outcome="no_op",
+        )
+        cooled_model = MockLlm()
+        self.assertFalse(core.refine_run(cooled_model).get("llm_called"))
+        self.assertFalse(cooled_model.calls)
+
+    def test_reviewer_garbage_or_failure_declines_without_proposal(self):
+        now = time.time()
+        FakeHost.make_db([
+            ("session", "user", f"Routine context {index}", "", now - index, 1)
+            for index in range(20)
+        ])
+        FakeHost.entry_config().update({
+            "min_signal_required": True,
+            "reviewer_fallback_enabled": True,
+            "reviewer_min_messages": 20,
+        })
+        garbage_model = MockLlm("not a verdict")
+        result = core.refine_run(garbage_model)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["reviewer"], "declined")
+        self.assertEqual(len(garbage_model.calls), 1)
+        self.assertFalse(FakeHost.actions)
+
+        failed = llm.review_fallback(MockLlm(RuntimeError("reviewer timeout")), "evidence")
+        self.assertFalse(failed["should_refine"])
+    def test_reviewer_incomplete_approval_declines_without_proposal(self):
+        now = time.time()
+        FakeHost.make_db([
+            ("session", "user", f"Routine context {index}", "", now - index, 1)
+            for index in range(20)
+        ])
+        FakeHost.entry_config().update({
+            "min_signal_required": True,
+            "reviewer_fallback_enabled": True,
+            "reviewer_min_messages": 20,
+        })
+        model = MockLlm({"shouldRefine": True, "rationale": "Missing instructions"})
+        result = core.refine_run(model)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["reviewer"], "declined")
+        self.assertEqual(len(model.calls), 1)
+        self.assertFalse(FakeHost.actions)
+
+    def test_reviewer_honors_a_threshold_above_default_evidence_limit(self):
+        now = time.time()
+        FakeHost.make_db([
+            ("session", "user", f"Routine context {index}", "", now - index, 1)
+            for index in range(61)
+        ])
+        FakeHost.entry_config().update({
+            "min_signal_required": True,
+            "reviewer_fallback_enabled": True,
+            "reviewer_min_messages": 61,
+        })
+        model = MockLlm({
+            "shouldRefine": False,
+            "rationale": "The routine context is not worth persisting.",
+            "instructions": "",
+        })
+        result = core.refine_run(model)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["reviewer"], "declined")
+        self.assertEqual(len(model.calls), 1)
 
 
 if __name__ == "__main__":

@@ -125,6 +125,21 @@ def min_signal_required() -> bool:
     return get_bool("min_signal_required", True)
 
 
+def reviewer_fallback_enabled() -> bool:
+    """Allow a small reviewer call when the mechanical signal gate finds nothing."""
+    return get_bool("reviewer_fallback_enabled", True)
+
+
+def reviewer_min_messages() -> int:
+    """Minimum session size before a reviewer fallback may run."""
+    return get_int("reviewer_min_messages", 20, min_val=3)
+
+
+def reviewer_cooldown_minutes() -> int:
+    """Minimum gap between durable reviewer decisions."""
+    return get_int("reviewer_cooldown_minutes", 60)
+
+
 def cross_session_enabled() -> bool:
     return get_bool("cross_session_enabled", True)
 
