@@ -13,8 +13,40 @@ backups/
 # Secrets / local config
 .env
 .env.*
+.envrc
 *.pem
 *.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.secret
+*.token
+*token*.txt
+*token*.json
+*credentials*.json
+*credential*.json
+*oauth*.json
+*secrets*.yaml
+*secrets*.yml
+*secrets*.json
+config.local.*
+*.local.yaml
+*.local.yml
+*.local.json
+hosts.yml
+id_rsa
+id_ed25519
+id_dsa
+id_ecdsa
+
+# Auth / token directories
+.auth/
+.aws/
+.gcloud/
+.ssh/
+credentials/
+secrets/
 
 # OS / editors
 .DS_Store
