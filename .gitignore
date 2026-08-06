@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Runtime data (may contain trajectory/session data)
+refine_journal.jsonl
+backups/
+*.bak
+
+# Secrets / local config
+.env
+.env.*
+*.pem
+*.key
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
