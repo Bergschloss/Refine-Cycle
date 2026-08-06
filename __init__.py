@@ -60,6 +60,21 @@ def _get_llm(ctx) -> PluginLlm:
     return PluginLlm(plugin_id="refine")
 
 
+def _session_llm() -> PluginLlm:
+    """Return the host-provided client, falling back to a fresh one.
+
+    Reusing the host-provided facade keeps every path on one client instead of
+    building a new one per invocation. It does **not** change which model is
+    used: ``ctx.llm`` is itself a ``PluginLlm(plugin_id=...)``, and Hermes
+    resolves provider and model inside its own ``call_llm``. A model switched
+    during a chat session is not visible to plugins; pin
+    ``plugins.entries.refine.llm.model`` to steer refine's own calls.
+    """
+    return _REGISTERED_LLM if _REGISTERED_LLM is not None else PluginLlm(
+        plugin_id="refine"
+    )
+
+
 def _assistant_turn_count(conversation_history: Any) -> int:
     """Count assistant messages in host callback history without assuming its shape.
 
@@ -77,10 +92,8 @@ def _assistant_turn_count(conversation_history: Any) -> int:
 
 
 def _cooldown_elapsed() -> bool:
-    last_attempt = journal.last_attempt_ts()
-    if last_attempt is None:
-        return True
-    return time.time() - last_attempt >= config.auto_cooldown_minutes() * 60
+    # One owner for the arithmetic, so the gate and /refine status cannot drift.
+    return core.auto_cooldown_remaining_minutes() <= 0
 
 
 def _turn_interval_reached(session_id: str, assistant_turns: int) -> bool:
@@ -123,7 +136,7 @@ def _run_auto_refine(session_id: str, *, cleanup_session_notes: bool = False) ->
         with journal.try_mutation_lock() as acquired:
             if acquired and _cooldown_elapsed():
                 core.refine_run(
-                    llm=_REGISTERED_LLM or PluginLlm(plugin_id="refine"),
+                    llm=_session_llm(),
                     session_id=session_id,
                     auto=True,
                 )
@@ -164,6 +177,11 @@ def _on_pre_llm_call(**kwargs) -> Optional[dict]:
         if not config.prompt_notes_enabled():
             return None
         session_id = journal.normalize_prompt_note_session_id(kwargs.get("session_id", ""))
+        # With no store there is nothing to inject, and taking the lock would
+        # create journal_dir on a path that may simply be mistyped. This hook
+        # runs every turn, so it must stay strictly read-only.
+        if not journal.prompt_notes_read_path().is_file():
+            return None
         # Prefer reading under the lock, but never drop notes for a whole turn
         # just because a refine pass owns it: the store is only ever replaced
         # atomically, so a lock-free read still sees one complete generation.
@@ -233,35 +251,32 @@ def _handle_refine_command(raw_args: str) -> Optional[str]:
 
     if args == "status":
         try:
-            from .sanitization import scrub_text as _scrub
-        except ImportError:
-            from sanitization import scrub_text as _scrub
-        try:
             status = core.refine_status()
         except Exception as exc:
             logger.exception("refine status failed")
-            return f"❌ Status failed: {exc}"
+            return f"❌ Status failed: {core.scrub_text(str(exc))}"
         lines = [
             f"auto: {'on' if status['auto_enabled'] else 'off'}",
-            f"turn interval: {status['auto_turn_interval']}",
+            f"turn interval: {status['auto_turn_interval']}"
+            + ("" if status["turn_trigger_enabled"] else " (turn trigger off)"),
             f"min messages: {status['auto_min_messages']}",
             f"cooldown: {status['auto_cooldown_minutes']} min",
             f"edits today: {status['edits_today']}/{status['max_edits_per_day']}",
-            f"journal: {status['journal_dir']}",
+            f"journal: {status['journal_dir']} ({status['journal_dir_state_text']})",
         ]
-        if status.get("cooldown_remaining_minutes"):
-            lines.append(f"cooldown remaining: {status['cooldown_remaining_minutes']} min")
+        if status["cooldown_remaining_minutes"] > 0:
+            lines.append(
+                f"cooldown remaining: {status['cooldown_remaining_minutes']} min"
+            )
         if status["blockers"]:
             lines.append("blockers:")
-            for b in status["blockers"]:
-                lines.append(f"  • {b}")
+            lines.extend(f"  • {item['message']}" for item in status["blockers"])
         else:
-            lines.append("blockers: none — auto-refine is active")
+            lines.append("blockers: none — automatic refinement is active")
         if status["warnings"]:
             lines.append("warnings:")
-            for w in status["warnings"]:
-                lines.append(f"  ⚠ {w}")
-        return _scrub("\n".join(lines))
+            lines.extend(f"  ⚠ {item['message']}" for item in status["warnings"])
+        return core.scrub_text("\n".join(lines))
 
     if args == "rollback":
         return (
@@ -277,9 +292,7 @@ def _handle_refine_command(raw_args: str) -> Optional[str]:
         return f"❌ Rollback failed: {result.get('error', 'unknown error')}"
 
     try:
-        result = core.refine_run(
-            llm=PluginLlm(plugin_id="refine"), reason=args, auto=False
-        )
+        result = core.refine_run(llm=_session_llm(), reason=args, auto=False)
     except Exception as exc:
         logger.exception("refine command failed")
         return f"❌ Refine failed: {exc}"
@@ -328,9 +341,7 @@ def _handle_refine_command(raw_args: str) -> Optional[str]:
 def _handle_refine_run(args: dict, **kw) -> str:
     reason = args.get("reason", "") if isinstance(args, dict) else ""
     try:
-        result = core.refine_run(
-            llm=PluginLlm(plugin_id="refine"), reason=reason, auto=False
-        )
+        result = core.refine_run(llm=_session_llm(), reason=reason, auto=False)
     except Exception as exc:
         logger.exception("refine_run tool failed")
         return json.dumps({"success": False, "error": str(exc)})
@@ -426,19 +437,22 @@ _REGISTER_WARNED = False
 
 
 def _warn_on_register() -> None:
-    """Log once-per-process warnings about configuration issues."""
+    """Warn once per process that runtime data sits in the plugin directory."""
     global _REGISTER_WARNED
     if _REGISTER_WARNED:
         return
-    _REGISTER_WARNED = True
-    jdir = config.journal_dir()
     try:
-        if (jdir / "plugin.yaml").is_file():
-            logger.warning(
-                "Refine journal_dir (%s) contains plugin source code. "
-                "A forced reinstall may delete runtime data (journal, backups, ledger). "
-                "Set plugins.entries.refine.journal_dir to a separate path.",
-                jdir,
-            )
+        jdir = config.journal_dir()
+        if not (jdir / "plugin.yaml").is_file():
+            return
     except Exception:
-        pass
+        return
+    # Set only after the condition held, so a warning is never skipped because
+    # an earlier call returned before there was anything to report.
+    _REGISTER_WARNED = True
+    logger.warning(
+        "Refine journal_dir (%s) contains plugin source code. "
+        "A forced reinstall may delete runtime data (journal, backups, ledger). "
+        "Set plugins.entries.refine.journal_dir to a separate path.",
+        jdir,
+    )

@@ -343,71 +343,187 @@ def _reconcile_pending() -> List[Dict[str, Any]]:
     return changed
 
 
+def auto_cooldown_remaining_minutes() -> float:
+    """Minutes left on the automatic-attempt cooldown; ``0.0`` when elapsed.
+
+    Single owner of this arithmetic so the hook gate and the status report can
+    never disagree about whether the cooldown has passed.
+    """
+    last_attempt = journal.last_attempt_ts()
+    if last_attempt is None:
+        return 0.0
+    remaining = config.auto_cooldown_minutes() * 60 - (time.time() - last_attempt)
+    return remaining / 60 if remaining > 0 else 0.0
+
+
+_JOURNAL_DIR_STATE_TEXT = {
+    "ok": "usable",
+    "missing_creatable": "does not exist yet, will be created on first write",
+    "not_a_directory": "path exists but is not a directory",
+    "unwritable": "not writable",
+    "unknown": "could not be inspected",
+}
+
+
+def _journal_dir_state(directory: Path) -> str:
+    """Classify the journal directory without creating or writing anything.
+
+    ``missing_creatable`` walks up to the nearest existing ancestor, because a
+    configured path several levels deep is still creatable on first use.
+    """
+    try:
+        if directory.is_dir():
+            return "ok" if os.access(str(directory), os.W_OK) else "unwritable"
+        if directory.exists():
+            return "not_a_directory"
+        for ancestor in directory.parents:
+            if not ancestor.exists():
+                continue
+            if not ancestor.is_dir():
+                return "not_a_directory"
+            return (
+                "missing_creatable"
+                if os.access(str(ancestor), os.W_OK)
+                else "unwritable"
+            )
+        return "unwritable"
+    except Exception:
+        return "unknown"
+
+
 def refine_status() -> Dict[str, Any]:
-    """Report why automatic refinement will or will not run. Read-only."""
+    """Report why automatic refinement will or will not run.
+
+    Strictly read-only: it creates no directory, writes no journal record,
+    consumes no daily budget, and never calls a model. It also does not
+    reconcile pending approvals, so an unresolved staged edit still counts
+    toward the budget it reports.
+    """
+    config_readable = config.config_available()
     auto = config.auto_enabled()
     interval = config.auto_turn_interval()
-    min_msgs = config.auto_min_messages()
-    cooldown_minutes = config.auto_cooldown_minutes()
     max_edits = config.max_edits_per_day()
-    edits_today = journal.count_today_applied()
-    last_ts = journal.last_attempt_ts()
     jdir = config.journal_dir()
+    jdir_state = _journal_dir_state(jdir)
 
+    # Read journal-derived numbers only when a journal actually exists, so a
+    # mistyped journal_dir is reported rather than silently created.
+    journal_present = False
+    journal_readable = True
+    edits_today = 0
+    last_ts: Optional[float] = None
     cooldown_remaining = 0.0
-    if last_ts is not None:
-        elapsed = time.time() - last_ts
-        remaining = cooldown_minutes * 60 - elapsed
-        if remaining > 0:
-            cooldown_remaining = remaining / 60
-
-    jdir_writable = False
     try:
-        jdir.mkdir(parents=True, exist_ok=True)
-        jdir_writable = os.access(str(jdir), os.W_OK)
-    except Exception:
-        pass
+        journal_path = journal.journal_read_path()
+        journal_present = journal_path.is_file()
+        if journal_present:
+            # An unparseable journal yields no entries rather than an error, so
+            # probe readability explicitly: silently reporting "0 edits today"
+            # would also report the cooldown as elapsed and let automatic passes
+            # run unthrottled against a journal nobody can read.
+            journal_path.read_text(encoding="utf-8")
+            edits_today = journal.count_today_applied()
+            last_ts = journal.last_attempt_ts()
+            cooldown_remaining = auto_cooldown_remaining_minutes()
+    except Exception as exc:
+        journal_readable = False
+        logger.warning("Cannot read refine journal for status: %s", scrub_text(str(exc)))
 
-    jdir_is_plugin_source = False
-    try:
-        plugin_yaml = jdir / "plugin.yaml"
-        jdir_is_plugin_source = plugin_yaml.is_file()
-    except Exception:
-        pass
-
-    blockers: List[str] = []
-    if not auto:
-        blockers.append("Автоматичний режим вимкнений у налаштуваннях")
-    if interval <= 0:
-        blockers.append("Тригер за ходами вимкнений (interval=0)")
+    blockers: List[Dict[str, str]] = []
+    if not config_readable:
+        blockers.append({
+            "code": "config_unreadable",
+            "message": (
+                "Hermes config could not be read, so automatic refinement stays "
+                "off rather than overriding a setting that cannot be confirmed"
+            ),
+        })
+    elif not auto:
+        blockers.append({
+            "code": "auto_disabled",
+            "message": "Automatic refinement is disabled in the config",
+        })
     if edits_today >= max_edits:
-        blockers.append("Денний ліміт правок уже використаний")
+        blockers.append({
+            "code": "budget_exhausted",
+            "message": f"Daily edit budget is used up ({edits_today}/{max_edits})",
+        })
+    cooldown_shown = round(cooldown_remaining, 1)
     if cooldown_remaining > 0:
-        blockers.append(f"Ще діє пауза між спробами ({cooldown_remaining:.0f} хв)")
-    if not jdir_writable:
-        blockers.append("Немає доступу до папки журналу")
+        blockers.append({
+            "code": "cooldown_active",
+            # Reuse the rounded value the report prints, so the blocker and the
+            # cooldown line can never contradict each other.
+            "message": f"Cooldown still active ({cooldown_shown} min left)",
+        })
+    if jdir_state in ("unwritable", "not_a_directory"):
+        blockers.append({
+            "code": "journal_dir_unusable",
+            "message": (
+                "Journal directory is not usable "
+                f"({_JOURNAL_DIR_STATE_TEXT.get(jdir_state, jdir_state)})"
+            ),
+        })
+    if not journal_readable:
+        blockers.append({
+            "code": "journal_unreadable",
+            "message": "The journal exists but could not be read",
+        })
 
-    warnings: List[str] = []
-    if jdir_is_plugin_source:
-        warnings.append(
-            "Папка журналу збігається з папкою коду плагіна — "
-            "hermes plugins install --force може видалити журнал"
-        )
+    warnings: List[Dict[str, str]] = []
+    plugin_source_collision = False
+    try:
+        plugin_source_collision = (jdir / "plugin.yaml").is_file()
+    except Exception:
+        pass
+    if plugin_source_collision:
+        warnings.append({
+            "code": "journal_dir_is_plugin_source",
+            "message": (
+                "Journal directory holds the plugin source; "
+                "'hermes plugins install --force' would delete runtime data"
+            ),
+        })
+    if not interval:
+        warnings.append({
+            "code": "turn_trigger_disabled",
+            "message": (
+                "Turn trigger is off (auto_turn_interval=0); the session-end "
+                "fallback still runs"
+            ),
+        })
+    if jdir_state == "unknown":
+        warnings.append({
+            "code": "journal_dir_unknown",
+            "message": (
+                "The journal directory could not be inspected, so this report "
+                "cannot confirm refinement is able to run"
+            ),
+        })
 
     return {
+        "config_readable": config_readable,
         "auto_enabled": auto,
         "auto_turn_interval": interval,
-        "auto_min_messages": min_msgs,
-        "auto_cooldown_minutes": cooldown_minutes,
+        "turn_trigger_enabled": bool(interval),
+        "auto_min_messages": config.auto_min_messages(),
+        "auto_cooldown_minutes": config.auto_cooldown_minutes(),
         "last_attempt_ts": last_ts,
-        "cooldown_remaining_minutes": round(cooldown_remaining, 1),
+        "cooldown_remaining_minutes": cooldown_shown,
         "edits_today": edits_today,
         "max_edits_per_day": max_edits,
+        "journal_present": journal_present,
+        "journal_readable": journal_readable,
+        # The real path, because the report tells the user to move files in and
+        # out of it. Truncating it to a tilde made it unusable in a shell.
         "journal_dir": str(jdir),
-        "journal_dir_writable": jdir_writable,
-        "journal_dir_is_plugin_source": jdir_is_plugin_source,
+        "journal_dir_state": jdir_state,
+        "journal_dir_state_text": _JOURNAL_DIR_STATE_TEXT.get(jdir_state, jdir_state),
+        "journal_dir_is_plugin_source": plugin_source_collision,
         "blockers": blockers,
+        "blocker_codes": [b["code"] for b in blockers],
         "warnings": warnings,
+        "warning_codes": [w["code"] for w in warnings],
     }
 
 

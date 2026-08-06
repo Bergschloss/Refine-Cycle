@@ -42,6 +42,15 @@ def journal_path() -> Path:
     return ensure_dirs() / _JOURNAL_FILE_NAME
 
 
+def journal_read_path() -> Path:
+    """Journal location for readers, without creating anything.
+
+    Readers must not materialize a mistyped ``journal_dir``: a diagnostic that
+    creates the directory it is meant to inspect destroys its own evidence.
+    """
+    return journal_dir() / _JOURNAL_FILE_NAME
+
+
 def backups_dir() -> Path:
     return ensure_dirs() / _BACKUPS_DIR_NAME
 
@@ -49,6 +58,11 @@ def backups_dir() -> Path:
 def prompt_notes_path() -> Path:
     """Return the plugin-owned prompt-note store; never a host memory path."""
     return ensure_dirs() / _PROMPT_NOTES_FILE_NAME
+
+
+def prompt_notes_read_path() -> Path:
+    """Prompt-note store for readers, without creating anything."""
+    return journal_dir() / _PROMPT_NOTES_FILE_NAME
 
 
 def normalize_prompt_note_session_id(session_id: Any) -> str:
@@ -86,7 +100,10 @@ def _normalize_prompt_note(note: Any) -> Optional[Dict[str, str]]:
 
 def _load_prompt_notes() -> Optional[List[Dict[str, str]]]:
     """Return validated prompt notes, [] when absent, or None when unavailable."""
-    path = prompt_notes_path()
+    # A reader must not create journal_dir: this runs on the pre_llm_call path
+    # of every turn, and materializing a mistyped path there would erase the
+    # very evidence /refine status exists to report.
+    path = prompt_notes_read_path()
     if not path.exists():
         return []
     if not path.is_file():
@@ -380,7 +397,7 @@ def _atomic_write_text(path: Path, content: str) -> None:
 
 def _load_entries() -> List[Dict[str, Any]]:
     """Stream journal state, skipping corrupt lines and collapsing updates by id."""
-    path = journal_path()
+    path = journal_read_path()
     if not path.is_file():
         return []
     latest: Dict[str, Dict[str, Any]] = {}

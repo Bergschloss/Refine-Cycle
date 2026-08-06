@@ -31,6 +31,25 @@ _CHARS_PER_TOKEN = 3
 _PROPOSAL_ENVELOPE_TOKENS = 1024
 
 
+def _pinned_target() -> Dict[str, str]:
+    """Provider/model to request, when the config pins them.
+
+    Hermes resolves the model inside its own ``call_llm`` and gives plugins no
+    access to the model a session switched to, so an explicitly pinned target
+    is the only way to control which model refine uses. Omitted keys leave the
+    host default in place; the host's trust gate still decides whether a
+    request is honored.
+    """
+    target: Dict[str, str] = {}
+    provider = config.llm_provider()
+    model = config.llm_model()
+    if provider:
+        target["provider"] = provider
+    if model:
+        target["model"] = model
+    return target
+
+
 def proposal_max_tokens(edit_count: int = 1) -> int:
     """Budget output for the largest reply the content guardrail actually permits.
 
@@ -254,6 +273,7 @@ def _propose_structured(
         purpose="refine",
         temperature=0.0,
         max_tokens=max_tokens,
+        **_pinned_target(),
     )
     system_prompt = scrub_text(REFINE_SYSTEM_PROMPT)
     try:
@@ -312,6 +332,7 @@ def review_fallback(llm: PluginLlm, evidence_text: str) -> Dict[str, Any]:
             purpose="refine",
             temperature=0.0,
             max_tokens=REVIEWER_MAX_TOKENS,
+            **_pinned_target(),
         )
         reply = _salvage_parsed(result, requested_max_tokens=REVIEWER_MAX_TOKENS)
         if reply.failure:
