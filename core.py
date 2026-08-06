@@ -80,7 +80,7 @@ def scrub_proposal(proposal: Dict[str, Any]) -> Dict[str, Any]:
 
 def _open_db() -> Optional[sqlite3.Connection]:
     """Open state.db read-only. Returns None on failure."""
-    db_path = Path.home() / ".hermes" / "state.db"
+    db_path = config.state_db_path()
     if not db_path.is_file():
         logger.warning("state.db not found at %s", db_path)
         return None
@@ -255,14 +255,31 @@ def collect_cross_session_patterns(
     return patterns.extract_patterns(items)
 
 
+# A successful JSON tool result usually still contains the word "error" — as a
+# field name with a null value. Counting those as failures buries the real ones.
+_JSON_SUCCESS_MARKERS = (
+    '"success": true', '"success":true',
+    '"error": null', '"error":null',
+    '"error": ""', '"error":""',
+    '"ok": true', '"ok":true',
+)
+
+
 def _is_error_content(content: str) -> bool:
     """Heuristic: does this look like a tool error?"""
+    if len(content) >= 2000:
+        return False  # error messages tend to be short
+
     lower = content.lower()
-    any_hit = any(
+
+    # An explicit success marker outranks any incidental "error" keyword.
+    if any(marker in lower for marker in _JSON_SUCCESS_MARKERS):
+        return False
+
+    return any(
         kw in content or kw in lower
         for kw in ["Traceback", "exit_code", " error", "failed", "ERROR", "timeout"]
     )
-    return any_hit and len(content) < 2000  # error messages tend to be short
 
 
 def _is_correction(content: str) -> bool:

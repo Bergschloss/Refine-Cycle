@@ -5,10 +5,30 @@ All values have sensible defaults — config.yaml only provides overrides.
 """
 
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def hermes_home() -> Path:
+    """Resolve the Hermes data directory the way Hermes itself does.
+
+    Hardcoding ``~/.hermes`` is wrong on Windows, where the data lives in
+    ``%LOCALAPPDATA%\\hermes``, and wrong under profiles. Getting it wrong is
+    not loud: the plugin simply finds no trajectory and returns no_op forever
+    without ever explaining why.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+        return Path(get_hermes_home())
+    except Exception:
+        return Path(os.path.expanduser("~/.hermes"))
+
+
+def state_db_path() -> Path:
+    return hermes_home() / "state.db"
 
 
 def _load_raw_config() -> Optional[Dict[str, Any]]:
@@ -113,5 +133,5 @@ def dedup_window_days() -> int:
 
 
 def journal_dir() -> Path:
-    default = Path.home() / ".hermes" / "plugins" / "refine"
+    default = hermes_home() / "plugins" / "refine"
     return Path(get_str("journal_dir", str(default)))

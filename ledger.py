@@ -22,9 +22,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
-    from .config import journal_dir
+    from .config import journal_dir, state_db_path
 except ImportError:
-    from config import journal_dir  # noqa: F811 — standalone test
+    from config import journal_dir, state_db_path  # noqa: F811 — standalone test
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +104,7 @@ def count_uses(name: str, since_ts: float) -> Optional[int]:
     try:
         import sqlite3
 
-        db_path = Path.home() / ".hermes" / "state.db"
+        db_path = state_db_path()
         if not db_path.is_file():
             return None
         con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
