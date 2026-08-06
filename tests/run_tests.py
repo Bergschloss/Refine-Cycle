@@ -3370,7 +3370,10 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
         self.assertIn(status["journal_dir_state_text"], plugin_init._handle_refine_command("status"))
 
     def test_pinned_provider_and_model_reach_the_host_call(self):
-        FakeHost.entry_config()["llm"] = {"provider": "opencode-go", "model": "deepseek-v4"}
+        FakeHost.entry_config()["llm"] = {
+            "provider": "opencode-go", "model": "deepseek-v4",
+            "allow_model_override": True, "allow_provider_override": True,
+        }
         model = MockLlm({
             "action": "no_op", "reason": "nothing", "evidence": [],
             "kind": "", "name": "", "content": "",
@@ -3387,6 +3390,132 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
         llm.propose(model, "evidence", [], [])
         self.assertNotIn("provider", model.calls[0])
         self.assertNotIn("model", model.calls[0])
+
+    # ── Model selection tests ─────────────────────────────────────────────────
+
+    def test_effective_target_no_sources_is_host_default(self):
+        target = config.effective_llm_target()
+        self.assertEqual(target["source"], "host_default")
+        self.assertEqual(target["model"], "")
+        self.assertEqual(target["provider"], "")
+
+    def test_effective_target_config_wins_over_host_default(self):
+        FakeHost.entry_config()["llm"] = {"model": "from-config"}
+        target = config.effective_llm_target()
+        self.assertEqual(target["source"], "config")
+        self.assertEqual(target["model"], "from-config")
+
+    def test_effective_target_command_wins_over_config(self):
+        FakeHost.entry_config()["llm"] = {"model": "from-config"}
+        journal.write_model_override("", "from-command")
+        target = config.effective_llm_target()
+        self.assertEqual(target["source"], "command")
+        self.assertEqual(target["model"], "from-command")
+
+    def test_effective_target_live_when_no_override_or_config(self):
+        with patch.object(config, "live_main_target", return_value={"model": "live-model", "provider": "live-prov"}):
+            target = config.effective_llm_target()
+        self.assertEqual(target["source"], "live")
+        self.assertEqual(target["model"], "live-model")
+        self.assertEqual(target["provider"], "live-prov")
+
+    def test_live_main_target_failure_returns_empty(self):
+        with patch.dict("sys.modules", {"agent.auxiliary_client": None}):
+            result = config.live_main_target()
+        self.assertEqual(result, {})
+
+    def test_corrupt_override_file_treated_as_absent(self):
+        path = journal.model_override_read_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("not json!", encoding="utf-8")
+        self.assertIsNone(journal.read_model_override())
+        target = config.effective_llm_target()
+        self.assertNotEqual(target["source"], "command")
+
+    def test_trust_gate_blocks_model_without_allow_flag(self):
+        journal.write_model_override("blocked-prov", "blocked-model")
+        # No allow_model_override/allow_provider_override in config
+        model = MockLlm({
+            "action": "no_op", "reason": "nothing", "evidence": [],
+            "kind": "", "name": "", "content": "",
+        })
+        llm.propose(model, "evidence", [], [])
+        self.assertNotIn("model", model.calls[0])
+        self.assertNotIn("provider", model.calls[0])
+
+    def test_trust_gate_passes_model_with_allow_flag(self):
+        journal.write_model_override("allowed-prov", "allowed-model")
+        FakeHost.entry_config()["llm"] = {
+            "allow_model_override": True,
+            "allow_provider_override": True,
+        }
+        model = MockLlm({
+            "action": "no_op", "reason": "nothing", "evidence": [],
+            "kind": "", "name": "", "content": "",
+        })
+        llm.propose(model, "evidence", [], [])
+        self.assertEqual(model.calls[0]["model"], "allowed-model")
+        self.assertEqual(model.calls[0]["provider"], "allowed-prov")
+
+    def test_clear_override_removes_the_file(self):
+        journal.write_model_override("p", "m")
+        self.assertIsNotNone(journal.read_model_override())
+        journal.clear_model_override()
+        self.assertIsNone(journal.read_model_override())
+
+    # ── /refine model command tests ───────────────────────────────────────────
+
+    def test_model_command_show_effective_target(self):
+        result = plugin_init._handle_refine_command("model")
+        self.assertIn("model:", result)
+        self.assertIn("source:", result)
+
+    def test_model_command_set_override(self):
+        result = plugin_init._handle_refine_command("model deepseek-v4-flash")
+        self.assertIn("Override set", result)
+        override = journal.read_model_override()
+        self.assertEqual(override["model"], "deepseek-v4-flash")
+        self.assertEqual(override["provider"], "")
+
+    def test_model_command_set_provider_and_model(self):
+        result = plugin_init._handle_refine_command("model opencode-go/deepseek-v4")
+        self.assertIn("Override set", result)
+        override = journal.read_model_override()
+        self.assertEqual(override["model"], "deepseek-v4")
+        self.assertEqual(override["provider"], "opencode-go")
+
+    def test_model_command_auto_removes_override(self):
+        journal.write_model_override("p", "m")
+        result = plugin_init._handle_refine_command("model auto")
+        self.assertIn("removed", result.lower())
+        self.assertIsNone(journal.read_model_override())
+
+    def test_model_command_invalid_identifier_goes_as_reason(self):
+        # "model !!!" is not a valid identifier, so it falls through to a proposal reason.
+        with patch.object(plugin_init.core, "refine_run", return_value={
+            "success": True, "message": "done", "outcome": "no_op",
+        }) as run:
+            plugin_init._handle_refine_command("model !!!")
+        run.assert_called_once()
+        self.assertIsNone(journal.read_model_override())
+
+    def test_model_as_reason_word_goes_to_proposal(self):
+        with patch.object(plugin_init.core, "refine_run", return_value={
+            "success": True, "message": "done", "outcome": "no_op",
+        }) as run:
+            plugin_init._handle_refine_command("model of gmail failures")
+        run.assert_called_once()
+        self.assertEqual(run.call_args.kwargs["reason"], "model of gmail failures")
+
+    def test_model_command_warns_when_trust_denies(self):
+        result = plugin_init._handle_refine_command("model blocked-model")
+        self.assertIn("trust denies", result.lower())
+
+    def test_model_command_does_not_write_journal(self):
+        before = len(journal.entries())
+        plugin_init._handle_refine_command("model test-m")
+        plugin_init._handle_refine_command("model auto")
+        self.assertEqual(len(journal.entries()), before)
 
     def test_status_command_returns_text_not_dict(self):
         result = plugin_init._handle_refine_command("status")

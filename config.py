@@ -222,6 +222,88 @@ def llm_model() -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+def llm_allow_model_override() -> bool:
+    """Whether the trust policy allows refine to request a specific model."""
+    return bool(_llm_entry().get("allow_model_override", False))
+
+
+def llm_allow_provider_override() -> bool:
+    """Whether the trust policy allows refine to request a specific provider."""
+    return bool(_llm_entry().get("allow_provider_override", False))
+
+
+def live_main_target() -> Dict[str, str]:
+    """Best-effort read of the host's live main provider/model.
+
+    Uses an internal Hermes API (``_read_main_provider`` / ``_read_main_model``
+    in ``agent.auxiliary_client``). When unavailable — import fails, function
+    removed — returns ``{}`` silently. The caller must not treat a failure
+    here as an error; it merely means no live model information is available.
+    """
+    try:
+        from agent.auxiliary_client import _read_main_provider, _read_main_model
+
+        provider = _read_main_provider()
+        model = _read_main_model()
+        result: Dict[str, str] = {}
+        if provider:
+            result["provider"] = provider
+        if model:
+            result["model"] = model
+        return result
+    except Exception:
+        return {}
+
+
+def effective_llm_target() -> Dict[str, str]:
+    """Resolve one effective model/provider target for refine.
+
+    Priority:
+      1. Command override (``/refine model <target>``)
+      2. Config (``plugins.entries.refine.llm.model`` / ``.provider``)
+      3. Live Hermes main model (best-effort, internal API)
+      4. Nothing — let the host decide
+
+    Returns ``{"provider": ..., "model": ..., "source": ...}``.
+    Provider/model may be empty strings; source is always set.
+    """
+    try:
+        from . import journal
+    except ImportError:
+        import journal  # type: ignore
+
+    # 1. Command override
+    override = journal.read_model_override()
+    if override:
+        return {
+            "provider": override.get("provider", ""),
+            "model": override.get("model", ""),
+            "source": "command",
+        }
+
+    # 2. Config
+    cfg_provider = llm_provider()
+    cfg_model = llm_model()
+    if cfg_provider or cfg_model:
+        return {
+            "provider": cfg_provider,
+            "model": cfg_model,
+            "source": "config",
+        }
+
+    # 3. Live Hermes main model
+    live = live_main_target()
+    if live.get("model") or live.get("provider"):
+        return {
+            "provider": live.get("provider", ""),
+            "model": live.get("model", ""),
+            "source": "live",
+        }
+
+    # 4. Nothing
+    return {"provider": "", "model": "", "source": "host_default"}
+
+
 def journal_dir() -> Path:
     default = hermes_home() / "plugins" / "refine"
     return Path(get_str("journal_dir", str(default)))
