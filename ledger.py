@@ -1,48 +1,37 @@
-"""Usefulness ledger for refine-created skills.
-
-Without this, refine is a write-only loop: it creates skills and never learns
-whether any of them helped. That matters because skills enter the context of
-later sessions — a useless skill is not neutral, it actively costs attention.
-
-The ledger records what refine created and answers two questions:
-  1. has this skill been used since it was written?
-  2. did the failure it was written for stop happening?
-
-Question 2 is only answerable because the proposal stores the fingerprint of the
-pattern it addressed (see ``patterns.py``).
-
-Deliberately dependency-free apart from ``config``: this module must not import
-``core``, which imports it back through the command handler.
-"""
+"""Timestamp-aware usefulness ledger for refine-created entries."""
 
 import json
 import logging
+import os
+import sqlite3
+import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
+    from . import journal
     from .config import journal_dir, state_db_path
 except ImportError:
-    from config import journal_dir, state_db_path  # noqa: F811 — standalone test
+    import journal  # type: ignore
+    from config import journal_dir, state_db_path  # noqa: F811
 
 logger = logging.getLogger(__name__)
-
 _STATS_FILE_NAME = "skill_stats.json"
 
 
 def stats_path() -> Path:
-    d = journal_dir()
-    d.mkdir(parents=True, exist_ok=True)
-    return d / _STATS_FILE_NAME
+    path = journal_dir()
+    path.mkdir(parents=True, exist_ok=True)
+    return path / _STATS_FILE_NAME
 
 
 def load_stats() -> Dict[str, Any]:
-    p = stats_path()
-    if not p.is_file():
+    path = stats_path()
+    if not path.is_file():
         return {}
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
     except Exception as exc:
         logger.warning("Cannot read skill stats: %s", exc)
@@ -50,171 +39,230 @@ def load_stats() -> Dict[str, Any]:
 
 
 def _save_stats(stats: Dict[str, Any]) -> None:
+    path = stats_path()
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
     try:
-        stats_path().write_text(
-            json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-    except Exception as exc:
-        logger.error("Cannot write skill stats: %s", exc)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(stats, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
 
 
-def record_edit(proposal: Dict[str, Any], journal_id: str) -> None:
-    """Register an applied edit so it can be audited later."""
+def record_edit(
+    proposal: Dict[str, Any],
+    journal_id: str,
+    *,
+    outcome: str = "applied",
+    pending_id: str = "",
+) -> None:
     name = str(proposal.get("name", "")).strip()
     if not name:
         return
-    stats = load_stats()
-    stats[name] = {
-        "created_ts": time.time(),
-        "journal_id": journal_id,
-        "kind": proposal.get("kind", "skill"),
-        "action": proposal.get("action", ""),
-        "pattern_fingerprint": proposal.get("pattern_fingerprint", ""),
-    }
-    _save_stats(stats)
+    with journal.mutation_lock():
+        stats = load_stats()
+        previous = stats.get(name, {})
+        created_ts = (
+            previous.get("created_ts", time.time())
+            if previous.get("journal_id") == journal_id
+            else time.time()
+        )
+        stats[name] = {
+            "created_ts": created_ts,
+            "journal_id": journal_id,
+            "kind": proposal.get("kind", "skill"),
+            "action": proposal.get("action", ""),
+            "pattern_fingerprint": proposal.get("pattern_fingerprint", ""),
+            "outcome": outcome,
+            "pending_id": pending_id,
+        }
+        _save_stats(stats)
 
 
-# ── usage counting ──────────────────────────────────────────────────────────
+def record_journal_state(entry: Dict[str, Any]) -> None:
+    """Mirror a reconciled journal state without resetting its creation time."""
+    proposal = entry.get("proposal", {})
+    record_edit(
+        proposal,
+        str(entry.get("id", "")),
+        outcome=str(entry.get("outcome", "")),
+        pending_id=str(entry.get("pending_id", "")),
+    )
 
 
-def count_uses(name: str, since_ts: float) -> Optional[int]:
-    """How many times a skill was used since *since_ts*.
+def earliest_created_ts() -> Optional[float]:
+    values = [
+        float(meta.get("created_ts", 0))
+        for meta in load_stats().values()
+        if isinstance(meta, dict)
+        and meta.get("created_ts")
+        and meta.get("outcome", "applied") == "applied"
+    ]
+    return min(values) if values else None
 
-    Prefers a real counter from the host. The state.db fallback is a
-    **heuristic**: it counts messages mentioning the skill name, which
-    over-counts discussion about the skill and under-counts silent loads.
-    Never present its output as exact — ``audit`` renders it with a "~".
 
-    Returns None when neither source is available.
-    """
-    # 1. Host API, if Hermes tracks this itself.
+# ── usage counting ─────────────────────────────────────────────────────────
+
+
+def _count_uses_with_scope(name: str, since_ts: float) -> Tuple[Optional[int], str]:
+    """Return (count, scope): since_exact, all_time, since_approx, unavailable."""
     try:
-        from tools import skill_usage as _su
-        for fn_name in ("get_usage_count", "usage_count", "get_use_count"):
-            fn = getattr(_su, fn_name, None)
-            if callable(fn):
+        from tools import skill_usage as usage
+
+        for function_name in ("get_usage_count", "usage_count", "get_use_count"):
+            function = getattr(usage, function_name, None)
+            if not callable(function):
+                continue
+            try:
+                return int(function(name, since_ts=since_ts)), "since_exact"
+            except TypeError:
                 try:
-                    return int(fn(name))
+                    return int(function(name)), "all_time"
                 except Exception:
                     continue
+            except Exception:
+                continue
     except ImportError:
         pass
 
-    # 2. Fallback: approximate from the trajectory store.
     try:
-        import sqlite3
-
-        db_path = state_db_path()
-        if not db_path.is_file():
-            return None
-        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        path = state_db_path()
+        if not path.is_file():
+            return None, "unavailable"
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
-            row = con.execute(
-                "SELECT COUNT(*) FROM messages "
-                "WHERE active = 1 AND timestamp > ? AND content LIKE ?",
+            row = connection.execute(
+                "SELECT COUNT(*) FROM messages WHERE active = 1 "
+                "AND timestamp > ? AND content LIKE ?",
                 (since_ts, f"%{name}%"),
             ).fetchone()
-            return int(row[0]) if row else 0
+            return (int(row[0]) if row else 0), "since_approx"
         finally:
-            con.close()
+            connection.close()
     except Exception as exc:
         logger.debug("Usage fallback failed for %s: %s", name, exc)
-        return None
+        return None, "unavailable"
+
+
+def count_uses(name: str, since_ts: float) -> Optional[int]:
+    """Compatibility API returning the best available count."""
+    return _count_uses_with_scope(name, since_ts)[0]
 
 
 def unused_skills(min_age_days: int = 14) -> List[str]:
-    """Refine-created skills old enough to judge that were never used.
-
-    Fed back into the proposal prompt as negative examples — the cheapest
-    available defence against the model writing plausible-sounding trivia.
-    """
-    out: List[str] = []
     cutoff = time.time() - (min_age_days * 86400)
+    result: List[str] = []
     for name, meta in load_stats().items():
-        if meta.get("kind") != "skill":
+        if (
+            meta.get("kind") != "skill"
+            or meta.get("created_ts", 0) > cutoff
+            or meta.get("outcome", "applied") != "applied"
+        ):
             continue
-        created = meta.get("created_ts", 0)
-        if created > cutoff:
-            continue  # too young to judge
-        uses = count_uses(name, created)
+        uses, _scope = _count_uses_with_scope(name, meta.get("created_ts", 0))
         if uses == 0:
-            out.append(name)
-    return out[:10]
+            result.append(name)
+    return result[:10]
 
 
-# ── audit ───────────────────────────────────────────────────────────────────
+# ── audit ──────────────────────────────────────────────────────────────────
 
 
 def audit(current_patterns: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
-    """Build the audit table.
-
-    Args:
-        current_patterns: recent error patterns (from
-            ``core.collect_cross_session_patterns``). Used to answer "did the
-            failure this skill was written for come back?"
-    """
-    by_fp: Dict[str, Dict[str, Any]] = {
-        str(p.get("fingerprint", "")): p for p in (current_patterns or [])
+    by_fingerprint = {
+        str(item.get("fingerprint", "")): item for item in (current_patterns or [])
     }
     now = time.time()
     rows: List[Dict[str, Any]] = []
-
     for name, meta in sorted(load_stats().items()):
         created = meta.get("created_ts", 0) or now
         age_days = max(0, int((now - created) // 86400))
-        uses = count_uses(name, created)
-        fp = str(meta.get("pattern_fingerprint", "") or "")
-
+        outcome = meta.get("outcome", "applied")
+        fingerprint = str(meta.get("pattern_fingerprint", "") or "")
         recurred: Optional[bool] = None
-        if fp:
-            hit = by_fp.get(fp)
-            recurred = bool(hit and (hit.get("last_ts") or 0) > created)
 
-        if recurred is True:
-            verdict = "did not help"
-        elif uses == 0 and age_days >= 14:
-            verdict = "unused"
-        elif uses and uses > 0 and recurred is False:
-            verdict = "working"
+        if outcome == "pending_approval":
+            uses, usage_scope = None, "unavailable"
+            verdict = "pending approval"
+        elif outcome in ("rollback_prepared", "pending_rollback"):
+            uses, usage_scope = None, "unavailable"
+            verdict = "rollback pending"
+        elif outcome == "rolled_back":
+            uses, usage_scope = None, "unavailable"
+            verdict = "rolled back"
+        elif outcome == "rejected":
+            uses, usage_scope = None, "unavailable"
+            verdict = "rejected"
         else:
-            verdict = "too early" if age_days < 14 else "unclear"
+            uses, usage_scope = _count_uses_with_scope(name, created)
+            if fingerprint:
+                hit = by_fingerprint.get(fingerprint)
+                recurred = bool(hit and (hit.get("last_ts") or 0) > created)
+
+            if recurred is True:
+                verdict = "did not help"
+            elif uses == 0 and age_days >= 14:
+                verdict = "unused"
+            elif (
+                uses
+                and uses > 0
+                and recurred is False
+                and usage_scope in ("since_exact", "since_approx")
+            ):
+                verdict = "working"
+            else:
+                verdict = "too early" if age_days < 14 else "unclear"
 
         rows.append({
             "name": name,
             "kind": meta.get("kind", "skill"),
             "age_days": age_days,
             "uses": uses,
+            "usage_scope": usage_scope,
             "pattern_recurred": recurred,
             "verdict": verdict,
             "journal_id": meta.get("journal_id", ""),
+            "outcome": outcome,
         })
-
     return rows
 
 
 def format_audit(rows: List[Dict[str, Any]]) -> str:
-    """Render the audit table for the chat. Read-only — never deletes."""
     if not rows:
         return "No refine-created skills recorded yet."
-
     lines = [f"Refine-created entries ({len(rows)}):", ""]
-    lines.append(f"  {'name':<28} {'age':>5}  {'uses':>5}  {'recurred':>8}  verdict")
-    for r in rows:
-        uses = "?" if r["uses"] is None else f"~{r['uses']}"
-        rec = {True: "yes", False: "no", None: "—"}[r["pattern_recurred"]]
+    lines.append(f"  {'name':<28} {'age':>5}  {'uses':>7}  {'recurred':>8}  verdict")
+    for row in rows:
+        scope = row.get("usage_scope")
+        if row["uses"] is None:
+            uses = "?"
+        elif scope == "all_time":
+            uses = f"all:{row['uses']}"
+        elif scope == "since_approx":
+            uses = f"~{row['uses']}"
+        else:
+            uses = str(row["uses"])
+        recurred = {True: "yes", False: "no", None: "—"}[row["pattern_recurred"]]
         lines.append(
-            f"  {r['name'][:28]:<28} {str(r['age_days']) + 'd':>5}  {uses:>5}  {rec:>8}  {r['verdict']}"
+            f"  {row['name'][:28]:<28} {str(row['age_days']) + 'd':>5}  "
+            f"{uses:>7}  {recurred:>8}  {row['verdict']}"
         )
 
-    dead = [r for r in rows if r["verdict"] in ("unused", "did not help")]
-    if dead:
-        lines.append("")
-        lines.append("Candidates for removal:")
-        for r in dead:
-            lines.append(f"  {r['name']} — /refine rollback {r['journal_id']}")
-        lines.append("")
-        lines.append("Nothing was deleted. Run the command yourself if you agree.")
-
-    lines.append("")
-    lines.append("Note: use counts are approximate unless Hermes exposes a real counter.")
+    candidates = [row for row in rows if row["verdict"] in ("unused", "did not help")]
+    if candidates:
+        lines.extend(["", "Candidates for removal:"])
+        for row in candidates:
+            lines.append(f"  {row['name']} — /refine rollback {row['journal_id']}")
+        lines.extend(["", "Nothing was deleted. Run the command yourself if you agree."])
+    lines.extend([
+        "",
+        "Use labels: plain = timestamped host count, ~ = trajectory estimate, all: = host all-time aggregate.",
+        "All-time aggregates are not used to claim post-edit usage.",
+    ])
     return "\n".join(lines)

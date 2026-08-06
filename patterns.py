@@ -13,7 +13,12 @@ without a Hermes host.
 
 import hashlib
 import re
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
+
+try:
+    from .sanitization import scrub_text
+except ImportError:
+    from sanitization import scrub_text  # type: ignore
 
 # Order matters: timestamps and paths must be replaced before bare integers,
 # otherwise the digit rule eats the parts that make them recognizable.
@@ -56,7 +61,7 @@ def _strip_quotes(text: str) -> str:
     Tokenizing matters: a naive ``"[^"]*"`` regex matches from the closing quote
     of one JSON key to the opening quote of the next, mangling the boundary.
     """
-    return _DOUBLE_QUOTED.sub(lambda m: m.group(0)[1:-1], text)
+    return _DOUBLE_QUOTED.sub(lambda match: match.group(0)[1:-1], text)
 
 
 def normalize_error(content: str) -> str:
@@ -73,14 +78,14 @@ def normalize_error(content: str) -> str:
     # For a traceback, the only stable part is the final exception line; the
     # frames above it are noise that changes with every refactor.
     if any(marker in text for marker in _TRACEBACK_MARKERS):
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
         if lines:
             text = lines[-1]
 
     text = _strip_quotes(text)
 
-    for pattern, repl in _NORMALIZERS:
-        text = pattern.sub(repl, text)
+    for pattern, replacement in _NORMALIZERS:
+        text = pattern.sub(replacement, text)
 
     text = re.sub(r"\s+", " ", text).strip().lower()
     return text[:200]
@@ -92,16 +97,13 @@ def fingerprint(tool_name: str, content: str) -> str:
     return hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()[:12]
 
 
-def extract_patterns(items: Iterable[Dict[str, Any]], limit: int = 10) -> List[Dict[str, Any]]:
+def extract_patterns(
+    items: Iterable[Dict[str, Any]], limit: Optional[int] = 10
+) -> List[Dict[str, Any]]:
     """Group error occurrences into counted patterns.
 
-    Args:
-        items: dicts with ``tool``, ``content``, and optionally ``session_id``
-            and ``ts``. Content is expected to be already scrubbed.
-        limit: max patterns returned.
-
-    Returns:
-        Patterns sorted by (distinct sessions, total count) descending.
+    ``limit=None`` returns every pattern and is used by the post-edit audit;
+    interactive refine runs retain the small default prompt budget.
     """
     grouped: Dict[str, Dict[str, Any]] = {}
 
@@ -141,8 +143,8 @@ def extract_patterns(items: Iterable[Dict[str, Any]], limit: int = 10) -> List[D
         entry["sessions_seen"] = max(1, len(sessions))
         out.append(entry)
 
-    out.sort(key=lambda e: (e["sessions_seen"], e["count"]), reverse=True)
-    return out[:limit]
+    out.sort(key=lambda entry: (entry["sessions_seen"], entry["count"]), reverse=True)
+    return out if limit is None else out[:limit]
 
 
 def merge_patterns(*groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -170,7 +172,7 @@ def merge_patterns(*groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             )
 
     out = list(merged.values())
-    out.sort(key=lambda e: (e.get("sessions_seen", 1), e.get("count", 0)), reverse=True)
+    out.sort(key=lambda entry: (entry.get("sessions_seen", 1), entry.get("count", 0)), reverse=True)
     return out
 
 
@@ -179,12 +181,7 @@ def has_signal(
     corrections: List[Any],
     min_count: int = 2,
 ) -> bool:
-    """Is there anything worth spending a model call on?
-
-    True when a failure actually repeated (within a session or across sessions),
-    or when the user explicitly corrected the agent. Everything else is a single
-    one-off error, which teaches nothing generalizable.
-    """
+    """Return whether a repeated failure or explicit correction is present."""
     if corrections:
         return True
     for entry in patterns or []:
@@ -204,8 +201,8 @@ def format_patterns(patterns: List[Dict[str, Any]], limit: int = 8) -> str:
                 count=entry.get("count", 1),
                 sessions=entry.get("sessions_seen", 1),
                 tool=entry.get("tool") or "?",
-                sample=(entry.get("sample") or "").replace("\n", " ")[:160],
-                fp=entry.get("fingerprint", "")[:8],
+                sample=scrub_text(str(entry.get("sample") or "")).replace("\n", " ")[:160],
+                fp=scrub_text(str(entry.get("fingerprint", ""))),
             )
         )
     return "\n".join(lines)
