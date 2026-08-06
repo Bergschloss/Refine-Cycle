@@ -24,11 +24,11 @@ REFINE_PROPOSAL_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
         "action": {"type": "string", "enum": ["create", "patch", "no_op"]},
-        "kind": {"type": "string", "enum": ["skill", "memory"]},
+        "kind": {"type": "string", "enum": ["skill", "memory", "prompt"]},
         "name": {"type": "string"},
         "content": {
             "type": "string",
-            "description": "Complete replacement SKILL.md for skill create/patch; appended entry for memory.",
+            "description": "Complete replacement SKILL.md for skill create/patch; appended entry for memory; a short, narrow behavioral policy for prompt create.",
         },
         "category": {"type": "string"},
         "reason": {"type": "string"},
@@ -46,13 +46,16 @@ REFINE_SYSTEM_PROMPT = (
     "trajectory and propose ONE evidence-grounded, minimal edit.\n\n"
     "RULES:\n"
     "1. Return only one create, patch, or no_op proposal.\n"
-    "2. Never guess or duplicate an existing skill.\n"
+    "2. Never guess or duplicate an existing skill, memory, or prompt note.\n"
     "3. Never edit built-in or bundled skills.\n"
     "4. For every skill create or patch, content is the COMPLETE SKILL.md, not a diff. "
     "Preserve all useful current content when patching.\n"
     "5. Skills require YAML frontmatter with name and description, then a Markdown body.\n"
-    "6. Return no_op when no worthwhile edit exists.\n"
-    "7. Use exactly: action, kind, name, content, category, reason, evidence, and optional "
+    "6. A prompt note must be action=create and kind=prompt, with one or two lines in the "
+    "exact format 'When <specific condition>, <one action>.' It must be a narrow behavioral "
+    "policy, never a procedure, broad/global instruction, memory, skill, or replacement system prompt.\n"
+    "7. Return no_op when no worthwhile edit exists.\n"
+    "8. Use exactly: action, kind, name, content, category, reason, evidence, and optional "
     "pattern_fingerprint. Never combine action and kind.\n"
 )
 
@@ -202,7 +205,7 @@ def review_fallback(llm: PluginLlm, evidence_text: str) -> Dict[str, Any]:
 def _normalize_fields(parsed: Dict[str, Any]) -> Tuple[str, str, str, str, str]:
     action = str(parsed.get("action", "no_op")).strip().lower()
     for verb in ("create", "patch"):
-        for candidate_kind in ("skill", "memory"):
+        for candidate_kind in ("skill", "memory", "prompt"):
             if action == f"{verb}_{candidate_kind}":
                 parsed.setdefault("kind", candidate_kind)
                 action = verb
@@ -210,7 +213,7 @@ def _normalize_fields(parsed: Dict[str, Any]) -> Tuple[str, str, str, str, str]:
     name = str(parsed.get("name", "")).strip()
     content = str(parsed.get("content", ""))
     category = str(parsed.get("category", "")).strip()
-    if kind not in ("skill", "memory") and action == "create":
+    if kind not in ("skill", "memory", "prompt") and action == "create":
         kind = (
             "skill"
             if re.search(r"^---\s*$", content[:300], re.M) and "name:" in content[:300]
@@ -298,7 +301,7 @@ def propose(
         f"{evidence_text[-8000:]}\n\n"
         "Return one JSON object. Copy the full 12-character fp exactly when applicable."
     )
-    short = "Propose one minimal skill or memory edit."
+    short = "Propose one minimal skill, memory, or prompt-note edit."
 
     try:
         parsed = _ensure_dict(
@@ -330,10 +333,10 @@ def propose(
                 "evidence": _ensure_list(parsed.get("evidence")),
                 "pattern_fingerprint": "",
             })
-        if kind not in ("skill", "memory"):
+        if kind not in ("skill", "memory", "prompt"):
             return {"action": "no_op", "reason": f"Invalid kind: {kind}"}
-        if not name:
-            return {"action": "no_op", "reason": "Name is required for create/patch"}
+        if not name and kind != "prompt":
+            return {"action": "no_op", "reason": "Name is required for skill and memory create/patch"}
         if not content and not (action == "patch" and kind == "skill"):
             return {"action": "no_op", "reason": f"{action.title()} requires non-empty content"}
 

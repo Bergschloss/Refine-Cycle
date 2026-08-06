@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 _BACKUPS_DIR_NAME = "backups"
 _JOURNAL_FILE_NAME = "refine_journal.jsonl"
+_PROMPT_NOTES_FILE_NAME = "prompt_notes.json"
 _LOCK_FILE_NAME = ".mutation.lock"
 _LOCK_STALE_SECONDS = 300
 _THREAD_LOCK = threading.RLock()
@@ -43,6 +44,130 @@ def journal_path() -> Path:
 
 def backups_dir() -> Path:
     return ensure_dirs() / _BACKUPS_DIR_NAME
+
+
+def prompt_notes_path() -> Path:
+    """Return the plugin-owned prompt-note store; never a host memory path."""
+    return ensure_dirs() / _PROMPT_NOTES_FILE_NAME
+
+
+def _load_prompt_notes() -> Optional[List[Dict[str, str]]]:
+    """Return validated prompt notes, [] when absent, or None when unavailable."""
+    path = prompt_notes_path()
+    if not path.exists():
+        return []
+    if not path.is_file():
+        logger.warning("Prompt-note store is not a regular file")
+        return None
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+        raw_notes = document.get("notes") if isinstance(document, dict) else None
+        if not isinstance(raw_notes, list):
+            raise ValueError("notes must be a list")
+        notes: List[Dict[str, str]] = []
+        seen_ids = set()
+        for raw_note in raw_notes:
+            if not isinstance(raw_note, dict):
+                raise ValueError("note must be an object")
+            note_id = raw_note.get("id")
+            content = raw_note.get("content")
+            if (
+                not isinstance(note_id, str)
+                or len(note_id) != 12
+                or any(char not in "0123456789abcdef" for char in note_id)
+                or note_id in seen_ids
+                or not isinstance(content, str)
+                or not content.strip()
+                or scrub_text(content) != content
+            ):
+                raise ValueError("unsafe prompt note")
+            seen_ids.add(note_id)
+            notes.append({"id": note_id, "content": content})
+        return notes
+    except Exception as exc:
+        logger.warning("Cannot read prompt-note store: %s", scrub_text(str(exc)))
+        return None
+
+
+def load_prompt_notes() -> Optional[List[Dict[str, str]]]:
+    """Read safe prompt notes. Callers hold a mutation lock when consistency matters."""
+    return _load_prompt_notes()
+
+
+def _write_prompt_notes(notes: List[Dict[str, str]]) -> None:
+    """Atomically persist only validated, already-scrubbed note objects."""
+    safe_notes = []
+    for note in notes:
+        note_id = note.get("id") if isinstance(note, dict) else None
+        content = note.get("content") if isinstance(note, dict) else None
+        if (
+            not isinstance(note_id, str)
+            or len(note_id) != 12
+            or any(char not in "0123456789abcdef" for char in note_id)
+            or not isinstance(content, str)
+            or not content.strip()
+            or scrub_text(content) != content
+        ):
+            raise ValueError("Refusing to write an unsafe prompt note")
+        safe_notes.append({"id": note_id, "content": content})
+    _atomic_write_text(
+        prompt_notes_path(),
+        json.dumps({"notes": safe_notes}, ensure_ascii=False, separators=(",", ":")),
+    )
+
+
+def prompt_note_content_exists(content: str) -> Optional[bool]:
+    """Return None for unavailable storage so callers fail closed before mutation."""
+    with mutation_lock():
+        notes = _load_prompt_notes()
+        if notes is None:
+            return None
+        return any(note["content"] == content for note in notes)
+
+
+def normalize_prompt_note_content(content: str) -> str:
+    """Canonicalize a note once so journal proof and storage always agree."""
+    return scrub_text(str(content)).strip()
+
+
+def new_prompt_note(content: str) -> Optional[Dict[str, str]]:
+    """Preflight storage and allocate a stable ID without mutating the store."""
+    safe_content = normalize_prompt_note_content(content)
+    if not safe_content:
+        return None
+    with mutation_lock():
+        if _load_prompt_notes() is None:
+            return None
+        return {"id": uuid.uuid4().hex[:12], "content": safe_content}
+
+
+def add_prompt_note(note: Dict[str, str]) -> Dict[str, Any]:
+    """Persist one note atomically; this is plugin-owned and needs no host approval."""
+    with mutation_lock():
+        notes = _load_prompt_notes()
+        if notes is None:
+            return {"success": False, "error": "Prompt-note store is unavailable"}
+        note_id = note.get("id") if isinstance(note, dict) else None
+        content = note.get("content") if isinstance(note, dict) else None
+        if (
+            not isinstance(note_id, str)
+            or len(note_id) != 12
+            or any(char not in "0123456789abcdef" for char in note_id)
+            or not isinstance(content, str)
+            or not content.strip()
+            or scrub_text(content) != content
+        ):
+            return {"success": False, "error": "Prompt note is invalid"}
+        if any(item["id"] == note_id or item["content"] == content for item in notes):
+            return {"success": False, "error": "Prompt note already exists"}
+        try:
+            _write_prompt_notes(notes + [{"id": note_id, "content": content}])
+        except Exception as exc:
+            return {
+                "success": False,
+                "error": f"Cannot persist prompt note: {scrub_text(str(exc))}",
+            }
+        return {"success": True, "note_id": note_id}
 
 
 def _pid_is_alive(pid: int) -> bool:
@@ -375,6 +500,14 @@ def is_reversible(entry: Optional[Dict[str, Any]]) -> bool:
         return bool(entry.get("backup_path"))
     if kind in ("memory", "user"):
         return bool(entry.get("recovery"))
+    if kind == "prompt":
+        recovery = entry.get("recovery", {})
+        return bool(
+            action == "create"
+            and recovery.get("type") == "prompt_note"
+            and recovery.get("note_id")
+            and proposal.get("content")
+        )
     return False
 
 
@@ -546,6 +679,18 @@ def target_matches_applied(entry: Dict[str, Any]) -> Optional[bool]:
             and index < len(values)
             and values[index] == recovery.get("content")
         )
+    if kind == "prompt":
+        recovery = entry.get("recovery", {})
+        if recovery.get("type") != "prompt_note":
+            return False
+        notes = _load_prompt_notes()
+        if notes is None:
+            return None
+        return any(
+            note["id"] == recovery.get("note_id")
+            and note["content"] == proposal.get("content", "")
+            for note in notes
+        )
     return False
 
 
@@ -578,6 +723,14 @@ def rollback_target_matches(entry: Dict[str, Any]) -> Optional[bool]:
             and isinstance(index, int)
             and (index >= len(values) or values[index] != recovery.get("content"))
         )
+    if kind == "prompt":
+        recovery = entry.get("recovery", {})
+        if recovery.get("type") != "prompt_note":
+            return False
+        notes = _load_prompt_notes()
+        if notes is None:
+            return None
+        return not any(note["id"] == recovery.get("note_id") for note in notes)
     return False
 
 
@@ -786,3 +939,49 @@ def rollback_memory(entry_id: str) -> Dict[str, Any]:
             ),
         }
     return {"success": True, "message": f"Removed the exact appended {target} memory entry"}
+
+
+def rollback_prompt_note(entry_id: str) -> Dict[str, Any]:
+    """Remove only the unchanged plugin-owned note identified by this journal entry."""
+    with mutation_lock():
+        entry = get_entry(entry_id)
+        if not is_reversible(entry):
+            return {"success": False, "error": f"Journal entry {entry_id} is not a reversible prompt note"}
+        proposal = entry.get("proposal", {})
+        recovery = entry.get("recovery", {})
+        if proposal.get("kind") != "prompt" or recovery.get("type") != "prompt_note":
+            return {"success": False, "error": "Prompt-note recovery metadata is missing"}
+        note_id = recovery.get("note_id")
+        expected = proposal.get("content", "")
+        notes = _load_prompt_notes()
+        if notes is None:
+            return {"success": False, "error": "Prompt-note store is unavailable"}
+        index = next((i for i, note in enumerate(notes) if note["id"] == note_id), None)
+        if index is None:
+            return {"success": False, "error": "Prompt-note rollback conflict: note is missing"}
+        if notes[index]["content"] != expected:
+            return {"success": False, "error": "Prompt-note rollback conflict: note changed after refine applied it"}
+        try:
+            if entry.get("outcome") != "rollback_prepared":
+                entry = finalize(entry_id, "rollback_prepared")
+            _write_prompt_notes(notes[:index] + notes[index + 1:])
+        except Exception as exc:
+            _restore_applied(entry_id, scrub_text(str(exc)))
+            return {"success": False, "error": f"Prompt-note rollback failed: {scrub_text(str(exc))}"}
+
+        latest = get_entry(entry_id) or entry
+        if not rollback_target_matches(latest):
+            error = "Prompt-note rollback target state did not change"
+            _restore_applied(entry_id, error)
+            return {"success": False, "error": error}
+        try:
+            finalize(entry_id, "rolled_back")
+        except Exception as exc:
+            return {
+                "success": False,
+                "error": (
+                    "Prompt-note rollback changed the target but journal finalization failed; "
+                    f"recovery id: {entry_id}. {scrub_text(str(exc))}"
+                ),
+            }
+        return {"success": True, "message": f"Removed prompt note {note_id}"}

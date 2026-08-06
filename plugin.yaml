@@ -1,7 +1,7 @@
 name: refine
 version: 0.1.0
-description: "Self-improvement loop: reads agent trajectory, proposes minimal skill/memory edits, applies with journal + rollback."
+description: "Self-improvement loop: reads agent trajectory, proposes minimal skill/memory/prompt edits, applies with journal + rollback."
 author: hermes
 provides_tools: [refine_run]
-provides_hooks: [post_llm_call, on_session_end]
+provides_hooks: [pre_llm_call, post_llm_call, on_session_end]
 kind: standalone
