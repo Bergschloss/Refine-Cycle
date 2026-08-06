@@ -422,6 +422,39 @@ def _render_overview(
     return indent + _truncate_overview_line("(none)", text_limit)
 
 
+def _render_refinement_history(
+    records: List[Dict[str, Any]], *, max_entries: int, max_chars: int
+) -> str:
+    """Render durable edit outcomes as safe, bounded model feedback."""
+    if not records:
+        return ""
+    indent = "  " if max_chars > 2 else ""
+    text_limit = max_chars - len(indent)
+    lines: List[str] = []
+    for record in records[-max_entries:]:
+        proposal = record.get("proposal", {})
+        if not isinstance(proposal, dict):
+            continue
+        outcome = _overview_text(record.get("outcome", "")) or "unknown"
+        kind = _overview_text(proposal.get("kind", "")) or "—"
+        name = _overview_text(proposal.get("name", "")) or "—"
+        reason = _overview_text(record.get("reason", "")) or _overview_text(
+            proposal.get("reason", "")
+        ) or "—"
+        expected = _overview_text(proposal.get("expected_outcome", "")) or "—"
+        try:
+            version = int(record.get("version", proposal.get("version", 0)) or 0)
+        except (TypeError, ValueError):
+            version = 0
+        version_text = f"v{version}" if version >= 1 else "—"
+        line = (
+            f"{outcome:<10} — expects: {expected} — {kind:<6} {name} "
+            f"{version_text} — reason: {reason}"
+        )
+        lines.append(indent + _truncate_overview_line(line, text_limit))
+    return "\n".join(lines)
+
+
 def propose(
     llm: PluginLlm,
     evidence_text: str,
@@ -431,6 +464,7 @@ def propose(
     error_patterns: Optional[List[Dict[str, Any]]] = None,
     user_corrections: Optional[List[str]] = None,
     unused_skills: Optional[List[str]] = None,
+    refinement_history: Optional[List[Dict[str, Any]]] = None,
     purpose: str = "refine",
     run_context: str = "",
     skill_content_loader: Optional[Callable[[str], Optional[str]]] = None,
@@ -449,9 +483,11 @@ def propose(
     error_patterns = sanitize(error_patterns or [])
     user_corrections = [scrub_text(str(item)) for item in (user_corrections or [])]
     unused_skills = [scrub_text(str(item)) for item in (unused_skills or [])]
+    refinement_history = sanitize(refinement_history or [])
     run_context = scrub_text(str(run_context))
     overview_max_entries = config.overview_max_entries()
     overview_max_chars = config.overview_max_chars()
+    history_max_entries = config.history_max_entries()
     del purpose  # The host purpose is fixed to the plugin's trusted purpose.
 
     skills_list = _render_overview(
@@ -476,6 +512,16 @@ def propose(
             + "\n".join(f"  - {name}" for name in unused_skills[:10])
             + "\nDo not create more skills of this ineffective shape.\n"
         )
+    history_lines = _render_refinement_history(
+        refinement_history,
+        max_entries=history_max_entries,
+        max_chars=overview_max_chars,
+    )
+    history_block = (
+        "\n=== PREVIOUS REFINEMENTS ===\n" + history_lines + "\n"
+        if history_lines
+        else ""
+    )
     context_block = run_context.strip() or "(none)"
     instructions = (
         "Ground the proposal in one repeated failure or explicit correction.\n\n"
@@ -489,7 +535,8 @@ def propose(
         f"{skills_list}\n\n"
         "=== EXISTING MEMORIES ===\n"
         f"{mems_list}\n"
-        f"{unused_block}\n"
+        f"{unused_block}"
+        f"{history_block}\n"
         "=== RECENT TRAJECTORY ===\n"
         f"{evidence_text[-8000:]}\n\n"
         "Return one JSON object. Copy the full 12-character fp exactly when applicable."
