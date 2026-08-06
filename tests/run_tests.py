@@ -397,6 +397,306 @@ def test_refine_multipass():
         cfg.max_edits_per_run = orig
 
 
+def test_scrub_new_patterns():
+    """Vendor token formats and env-style lines are redacted."""
+    print("\nTest: scrub_text (extended patterns)")
+    from core import scrub_text
+
+    cases = [
+        ("HuggingFace", "hf_" + "a" * 24),
+        ("GitLab PAT", "glpat-" + "b" * 20),
+        ("SendGrid", "SG." + "c" * 20 + "." + "d" * 20),
+        ("DigitalOcean", "dop_v1_" + "e" * 64),
+        ("URL basic-auth", "https://admin:s3cr3tpass@internal.example.com/api"),
+        ("env line", "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENGbPxRfiCY"),
+    ]
+    for label, raw in cases:
+        out = scrub_text(raw)
+        if "[REDACTED]" in out and raw.split("@")[0].split("=")[-1] not in out:
+            ok(f"{label} redacted")
+        else:
+            fail(f"{label} redacted", f"got {out[:60]!r}")
+
+
+def test_scrub_no_false_positives():
+    """Benign config-looking text must survive untouched."""
+    print("\nTest: scrub_text (no false positives)")
+    from core import scrub_text
+
+    benign = [
+        "max_tokens=2048",
+        "token_count: 15",
+        "secretary=jane",
+        "secret=true",
+        "password: null",
+        '"api_key": null',
+        "use_secrets = False",
+        "auth: none",
+        "TOKEN = 1234",
+        "tokens: 8192",
+        "secret_scanning: enabled",
+        "https://github.com/Bergschloss/Refine-Cycle",
+        "see http://localhost:8080/api",
+    ]
+    for raw in benign:
+        out = scrub_text(raw)
+        if out == raw:
+            ok(f"kept: {raw}")
+        else:
+            fail(f"kept: {raw}", f"mangled to {out!r}")
+
+
+# ── temp state.db fixture ───────────────────────────────────────────────────
+
+_PLANTED_SECRET = "ghp_" + "Z" * 36
+
+
+def _make_fake_db(tmpdir: str, n_messages: int = 6) -> str:
+    """Build a throwaway state.db with the columns collect_evidence reads.
+
+    Never touches the real ~/.hermes/state.db.
+    """
+    import sqlite3 as _sq
+
+    path = str(Path(tmpdir) / "fake_state.db")
+    con = _sq.connect(path)
+    con.execute("CREATE TABLE sessions (id TEXT, started_at REAL)")
+    con.execute(
+        "CREATE TABLE messages (session_id TEXT, role TEXT, content TEXT, "
+        "tool_name TEXT, timestamp REAL, active INTEGER)"
+    )
+    con.execute("INSERT INTO sessions VALUES ('sess-test', 1000)")
+    rows = [
+        ("sess-test", "user", "deploy the thing", "", 1001, 1),
+        ("sess-test", "tool", f"error: auth failed, token={_PLANTED_SECRET}", "http", 1002, 1),
+        ("sess-test", "assistant", "retrying", "", 1003, 1),
+        ("sess-test", "tool", "error: auth failed again", "http", 1004, 1),
+        ("sess-test", "user", "no, that is not right, use the other endpoint", "", 1005, 1),
+        ("sess-test", "assistant", "ok", "", 1006, 1),
+    ][:n_messages]
+    con.executemany("INSERT INTO messages VALUES (?,?,?,?,?,?)", rows)
+    con.commit()
+    con.close()
+    return path
+
+
+def _patched_db(path: str):
+    """Return an _open_db replacement bound to the fake database."""
+    import sqlite3 as _sq
+
+    def _open():
+        con = _sq.connect(f"file:{path}?mode=ro", uri=True)
+        con.row_factory = _sq.Row
+        return con
+
+    return _open
+
+
+def test_evidence_scrubbed_from_db():
+    """A secret in a message row never survives collect_evidence()."""
+    print("\nTest: evidence scrubbed at DB read point")
+    import core
+
+    with tempfile.TemporaryDirectory() as td:
+        db = _make_fake_db(td)
+        orig = core._open_db
+        core._open_db = _patched_db(db)
+        try:
+            ev = core.collect_evidence()
+            blob = json.dumps(ev, ensure_ascii=False)
+        finally:
+            core._open_db = orig
+
+    assert_true(_PLANTED_SECRET not in blob, "planted secret absent from evidence")
+    assert_in("[REDACTED]", blob, "evidence contains redaction marker")
+
+
+def test_refine_run_output_scrubbed():
+    """Regression: the no_op return path must not leak raw evidence.
+
+    refine_run() returns the evidence dict on the no_op branch, and that dict
+    is serialized as the refine_run tool result — straight back into the
+    model's context and into state.db.
+    """
+    print("\nTest: refine_run output scrubbed (no_op path)")
+    import core
+    import journal as j
+
+    if j.daily_limit_reached():
+        ok("skipped — daily edit limit reached")
+        return
+
+    mock = MockLlm({"action": "no_op", "reason": "nothing to learn"})
+
+    with tempfile.TemporaryDirectory() as td:
+        db = _make_fake_db(td)
+        orig = core._open_db
+        core._open_db = _patched_db(db)
+        try:
+            result = core.refine_run(mock, reason="scrub regression")
+            blob = json.dumps(result, ensure_ascii=False)
+        finally:
+            core._open_db = orig
+
+    assert_true(_PLANTED_SECRET not in blob, "planted secret absent from tool result")
+    assert_true(bool(mock.calls), "mock LLM was actually called")
+
+    sent = json.dumps(mock.calls, ensure_ascii=False, default=str)
+    assert_true(_PLANTED_SECRET not in sent, "planted secret never sent to the LLM")
+
+
+def test_pattern_fingerprint():
+    """Errors that differ only by volatile detail collapse to one pattern."""
+    print("\nTest: error fingerprinting")
+    import patterns as P
+
+    a = P.fingerprint("http", "HTTP 429 rate limited for /users/8821 at 2026-08-06T10:11:12Z")
+    b = P.fingerprint("http", "HTTP 429 rate limited for /users/9134 at 2026-08-06T11:44:01Z")
+    assert_eq(a, b, "same shape, different ids → one fingerprint")
+
+    c = P.fingerprint("http", "HTTP 403 forbidden for /users/8821")
+    assert_true(a != c, "different status → different fingerprint")
+
+    d = P.fingerprint("bash", "HTTP 429 rate limited for /users/8821")
+    assert_true(a != d, "same text, different tool → different fingerprint")
+
+    tb = ('Traceback (most recent call last):\n  File "/tmp/x.py", line 12, in f\n'
+          '    raise ValueError("bad id 991")\nValueError: bad id 991')
+    assert_eq(P.normalize_error(tb), "valueerror: bad id n", "traceback reduced to final line")
+
+
+def test_pattern_aggregation():
+    """extract_patterns counts occurrences and distinct sessions."""
+    print("\nTest: pattern aggregation")
+    import patterns as P
+
+    items = [
+        {"tool": "http", "content": f"HTTP 429 for /u/{i}", "session_id": f"s{i % 3}", "ts": 1000 + i}
+        for i in range(6)
+    ]
+    items.append({"tool": "gmail", "content": "insufficient scope", "session_id": "s9", "ts": 2000})
+
+    pats = P.extract_patterns(items)
+    assert_eq(len(pats), 2, "two distinct patterns")
+    assert_eq(pats[0]["count"], 6, "repeated pattern counted 6x")
+    assert_eq(pats[0]["sessions_seen"], 3, "seen across 3 sessions")
+
+    merged = P.merge_patterns(pats, [{"fingerprint": pats[0]["fingerprint"], "count": 99, "sessions_seen": 5}])
+    assert_eq(merged[0]["count"], 99, "merge keeps the higher count")
+
+
+def test_signal_gate():
+    """has_signal only fires on a real repeat or an explicit correction."""
+    print("\nTest: signal gate")
+    import patterns as P
+
+    assert_true(not P.has_signal([{"count": 1, "sessions_seen": 1}], []), "single one-off → no signal")
+    assert_true(P.has_signal([{"count": 2, "sessions_seen": 1}], []), "repeated twice → signal")
+    assert_true(P.has_signal([{"count": 1, "sessions_seen": 2}], []), "seen in 2 sessions → signal")
+    assert_true(P.has_signal([], ["no, that is wrong"]), "user correction → signal")
+
+
+def test_signal_gate_skips_llm():
+    """With no repeat and no correction, refine_run must not call the model."""
+    print("\nTest: signal gate skips the LLM call")
+    import core
+    import journal as j
+
+    if j.daily_limit_reached():
+        ok("skipped — daily edit limit reached")
+        return
+
+    mock = MockLlm({"action": "no_op", "reason": "unused"})
+
+    with tempfile.TemporaryDirectory() as td:
+        # 4 neutral messages: no errors, no corrections → no signal at all.
+        import sqlite3 as _sq
+        db = str(Path(td) / "quiet.db")
+        con = _sq.connect(db)
+        con.execute("CREATE TABLE sessions (id TEXT, started_at REAL)")
+        con.execute("CREATE TABLE messages (session_id TEXT, role TEXT, content TEXT, "
+                    "tool_name TEXT, timestamp REAL, active INTEGER)")
+        con.execute("INSERT INTO sessions VALUES ('quiet', 1000)")
+        con.executemany("INSERT INTO messages VALUES (?,?,?,?,?,?)", [
+            ("quiet", "user", "what is the weather", "", 1001, 1),
+            ("quiet", "assistant", "it is sunny today", "", 1002, 1),
+            ("quiet", "user", "thanks a lot friend", "", 1003, 1),
+            ("quiet", "assistant", "you are welcome", "", 1004, 1),
+        ])
+        con.commit(); con.close()
+
+        orig = core._open_db
+        core._open_db = _patched_db(db)
+        try:
+            result = core.refine_run(mock, reason="gate test")
+        finally:
+            core._open_db = orig
+
+    assert_true(not mock.calls, "LLM was NOT called (no signal)")
+    assert_eq(result.get("llm_called"), False, "result reports llm_called=False")
+    assert_true(result.get("success") is True, "run still succeeds as a no_op")
+
+
+def test_dedup_guard():
+    """An identical proposal applied recently is refused."""
+    print("\nTest: dedup guard")
+    import journal as j
+    from core import _validate_proposal
+
+    proposal = {
+        "action": "create", "kind": "skill", "name": "refine-dedup-probe",
+        "content": "---\nname: refine-dedup-probe\ndescription: x\n---\n\n# x",
+    }
+    h1 = j.proposal_hash(proposal)
+    h2 = j.proposal_hash(dict(proposal))
+    assert_eq(h1, h2, "hash is stable for identical proposals")
+
+    other = dict(proposal, content=proposal["content"] + " changed")
+    assert_true(j.proposal_hash(other) != h1, "different content → different hash")
+
+    # Record it as applied, then the guardrail must refuse the same edit.
+    j.log(trigger="test", reason="dedup probe", session_id="test",
+          proposal=proposal, outcome="applied")
+    err = _validate_proposal(proposal)
+    assert_true(bool(err) and "already applied" in (err or ""),
+                f"repeat proposal rejected (got: {err})")
+
+
+def test_ledger_audit():
+    """Ledger records edits and the audit verdicts follow the evidence."""
+    print("\nTest: usefulness ledger + audit")
+    import ledger as L
+    import time as _t
+
+    original = L.load_stats()
+    try:
+        fp = "deadbeef1234"
+        L._save_stats({
+            "helped-skill": {
+                "created_ts": _t.time() - 30 * 86400, "journal_id": "j1",
+                "kind": "skill", "action": "create", "pattern_fingerprint": fp,
+            },
+            "did-not-help": {
+                "created_ts": _t.time() - 30 * 86400, "journal_id": "j2",
+                "kind": "skill", "action": "create", "pattern_fingerprint": "cafebabe0000",
+            },
+        })
+
+        # The second skill's pattern showed up again after it was written.
+        current = [{"fingerprint": "cafebabe0000", "last_ts": _t.time(), "count": 3, "sessions_seen": 2}]
+        rows = {r["name"]: r for r in L.audit(current)}
+
+        assert_eq(rows["did-not-help"]["pattern_recurred"], True, "recurring pattern detected")
+        assert_eq(rows["did-not-help"]["verdict"], "did not help", "verdict follows recurrence")
+        assert_eq(rows["helped-skill"]["pattern_recurred"], False, "non-recurring pattern")
+
+        report = L.format_audit(list(rows.values()))
+        assert_in("did-not-help", report, "report lists the failing skill")
+        assert_in("Nothing was deleted", report, "report is explicitly read-only")
+    finally:
+        L._save_stats(original)
+
+
 # ── run ─────────────────────────────────────────────────────────────────────
 
 
@@ -428,7 +728,17 @@ def main():
         test_refine_rollback_nonexistent,
         test_list_skill_names,
         test_scrub_text,
+        test_scrub_new_patterns,
+        test_scrub_no_false_positives,
         test_scrub_proposal,
+        test_evidence_scrubbed_from_db,
+        test_refine_run_output_scrubbed,
+        test_pattern_fingerprint,
+        test_pattern_aggregation,
+        test_signal_gate,
+        test_signal_gate_skips_llm,
+        test_dedup_guard,
+        test_ledger_audit,
         test_guardrail_create,
         test_refine_multipass,
     ]
