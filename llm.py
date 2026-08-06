@@ -148,6 +148,11 @@ def _salvage_parsed(result: Any, *, requested_max_tokens: int) -> _Reply:
     output_tokens = _output_tokens(result)
     if not text:
         if output_tokens:
+            model = scrub_text(str(getattr(result, "model", "")))
+            logger.warning(
+                "Refine model returned output but no final text (model=%s)",
+                model or "unknown",
+            )
             return _Reply(
                 None,
                 "no_final_text",
@@ -254,6 +259,18 @@ def review_fallback(llm: PluginLlm, evidence_text: str) -> Dict[str, Any]:
             max_tokens=REVIEWER_MAX_TOKENS,
         )
         reply = _salvage_parsed(result, requested_max_tokens=REVIEWER_MAX_TOKENS)
+        if reply.failure:
+            rationale = (
+                "Reviewer returned no final answer."
+                if reply.failure == "no_final_text"
+                else "Reviewer unavailable or returned invalid output."
+            )
+            return {
+                "should_refine": False,
+                "rationale": rationale,
+                "instructions": "",
+                "failure": reply.failure,
+            }
         parsed = _ensure_dict(reply.parsed)
     except Exception as exc:
         logger.warning("Reviewer fallback failed: %s", scrub_text(str(exc)))
