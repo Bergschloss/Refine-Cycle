@@ -485,6 +485,7 @@ def _new_entry(
     error: str = "",
     recovery: Optional[Dict[str, Any]] = None,
     group: Optional[Dict[str, Any]] = None,
+    snapshot: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     entry = {
         "id": uuid.uuid4().hex[:12],
@@ -498,6 +499,10 @@ def _new_entry(
         "recovery": recovery or {},
         "error": error,
     }
+    # Carrying the pre-edit content in the record itself is what makes rollback
+    # independent of a backup file still being on disk.
+    if snapshot:
+        entry["snapshot"] = snapshot
     # A multi-edit transaction stays one durable record per edit, so rollback,
     # reconciliation, dedup, and the daily edit budget keep working unchanged.
     # ``group`` only reports which edits belonged together.
@@ -517,6 +522,7 @@ def log(
     error: str = "",
     recovery: Optional[Dict[str, Any]] = None,
     group: Optional[Dict[str, Any]] = None,
+    snapshot: Optional[Dict[str, Any]] = None,
 ) -> str:
     entry = _new_entry(
         trigger=trigger,
@@ -528,6 +534,7 @@ def log(
         error=error,
         recovery=recovery,
         group=group,
+        snapshot=snapshot,
     )
     _append_entry(entry)
     return entry["id"]
@@ -542,6 +549,7 @@ def prepare(
     backup_path: str = "",
     recovery: Optional[Dict[str, Any]] = None,
     group: Optional[Dict[str, Any]] = None,
+    snapshot: Optional[Dict[str, Any]] = None,
 ) -> str:
     return log(
         trigger=trigger,
@@ -552,6 +560,7 @@ def prepare(
         backup_path=backup_path,
         recovery=recovery,
         group=group,
+        snapshot=snapshot,
     )
 
 
@@ -595,7 +604,7 @@ def is_reversible(entry: Optional[Dict[str, Any]]) -> bool:
     if kind == "skill" and action == "create":
         return bool(proposal.get("name") and proposal.get("content"))
     if kind == "skill" and action == "patch":
-        return bool(entry.get("backup_path"))
+        return snapshot_has_before(entry) or bool(entry.get("backup_path"))
     if kind in ("memory", "user"):
         return bool(entry.get("recovery"))
     if kind == "prompt":
@@ -700,17 +709,84 @@ def read_skill_content(name: str) -> Optional[str]:
     return content if known else None
 
 
-def backup_skill(name: str) -> Optional[Path]:
-    content = read_skill_content(name)
-    if content is None:
+def _content_digest(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8", "replace")).hexdigest()
+
+
+def prepare_skill_recovery(name: str, after: str) -> Optional[Dict[str, Any]]:
+    """Capture a skill's pre-edit state as a journal snapshot and a backup file.
+
+    One host read serves both, so the two records cannot disagree. The snapshot
+    makes rollback independent of a file surviving on disk; the ``.bak`` file
+    stays because it is human-readable and because entries journaled before
+    snapshots existed still restore from it.
+
+    ``before_sha256`` is taken from the real content. The journal scrubs
+    credentials out of everything it writes, so a snapshot of a skill that
+    contained a secret would come back altered — the digest makes that
+    detectable instead of restoring redacted text over the user's skill.
+    """
+    known, before = _read_skill_state(name)
+    if not known or before is None:
         return None
     backup = backups_dir() / f"{int(time.time() * 1000)}_skill_{name}.bak"
     try:
-        _atomic_write_text(backup, content)
+        _atomic_write_text(backup, before)
     except Exception as exc:
         logger.warning("Cannot back up skill '%s': %s", name, scrub_text(str(exc)))
         return None
-    return backup
+    return {
+        "backup_path": str(backup),
+        "snapshot": {
+            "kind": "skill",
+            "name": name,
+            "before": before,
+            "before_sha256": _content_digest(before),
+            "after_sha256": _content_digest(after),
+        },
+    }
+
+
+def _snapshot_of(entry: Dict[str, Any]) -> Dict[str, Any]:
+    snapshot = entry.get("snapshot")
+    return snapshot if isinstance(snapshot, dict) else {}
+
+
+def snapshot_has_before(entry: Dict[str, Any]) -> bool:
+    """Report whether this entry carries its own restorable pre-edit content."""
+    snapshot = _snapshot_of(entry)
+    return isinstance(snapshot.get("before"), str) and bool(
+        snapshot.get("before_sha256")
+    )
+
+
+def snapshot_before_content(entry: Dict[str, Any]) -> Optional[str]:
+    """Return the verified pre-edit content, preferring the journal snapshot.
+
+    Falls back to the backup file both for entries written before snapshots
+    existed and for a snapshot whose digest no longer matches its content.
+    """
+    snapshot = _snapshot_of(entry)
+    before = snapshot.get("before")
+    digest = str(snapshot.get("before_sha256", ""))
+    if isinstance(before, str) and digest:
+        if _content_digest(before) == digest:
+            return before
+        logger.warning(
+            "Refine journal snapshot for '%s' does not match its digest; "
+            "falling back to the backup file",
+            scrub_text(str(snapshot.get("name", ""))),
+        )
+    backup_path = Path(str(entry.get("backup_path", "")))
+    if not backup_path.is_file():
+        return None
+    try:
+        return backup_path.read_text(encoding="utf-8")
+    except Exception as exc:
+        logger.warning(
+            "Cannot read refine backup %s: %s", backup_path, scrub_text(str(exc))
+        )
+        return None
 
 
 def _memory_entries(target: str) -> Optional[List[str]]:
@@ -801,12 +877,8 @@ def rollback_target_matches(entry: Dict[str, Any]) -> Optional[bool]:
         if proposal.get("action") == "create":
             known, content = _read_skill_state(name)
             return (content is None) if known else None
-        backup_path = Path(str(entry.get("backup_path", "")))
-        if not backup_path.is_file():
-            return False
-        try:
-            expected = backup_path.read_text(encoding="utf-8")
-        except Exception:
+        expected = snapshot_before_content(entry)
+        if expected is None:
             return False
         known, current = _read_skill_state(name)
         return (current == expected) if known else None
@@ -920,10 +992,16 @@ def rollback_skill(entry_id: str) -> Dict[str, Any]:
         return {"success": False, "error": f"Rollback conflict: skill '{name}' changed after refine applied it"}
     backup_content = ""
     if action != "create":
-        backup_path = Path(str(entry.get("backup_path", "")))
-        if not backup_path.is_file():
-            return {"success": False, "error": f"Backup file not found: {backup_path}"}
-        backup_content = backup_path.read_text(encoding="utf-8")
+        restored = snapshot_before_content(entry)
+        if restored is None:
+            return {
+                "success": False,
+                "error": (
+                    f"Cannot restore skill '{name}': the journal carries no verified "
+                    "snapshot and its backup file is missing or unreadable"
+                ),
+            }
+        backup_content = restored
 
     try:
         if entry.get("outcome") != "rollback_prepared":

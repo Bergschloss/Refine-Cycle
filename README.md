@@ -49,9 +49,9 @@ trajectory (state.db) → scrub → fingerprint + aggregate → signal gate
 | **1. Collect evidence** | Reads the last N messages of the selected session from `<HERMES_HOME>/state.db` with `mode=ro`. Credentials are redacted before downstream use. |
 | **2. Aggregate** | Normalizes errors to invariant shapes, records complete 12-character fingerprints, and counts recurrence within and across sessions. |
 | **3. Signal gate and reviewer** | Repeated patterns or explicit corrections reach the proposal model. If neither exists, a substantial session may receive one small, conservative reviewer call; a decline is a sanitized, journaled `no_op`. |
-| **4. LLM proposal** | Requests one structured `create`, `patch`, or `no_op` proposal with an optional one-sentence, falsifiable `expected_outcome`. Kinds are `skill`, `memory`, and `prompt`. Every model-bound field is sanitized. The proposal output budget is derived locally from the shared 15,000-character content limit; the reviewer remains separately capped at 300 tokens. A cut-off, malformed, or reasoning-only reply is journaled as `llm_incomplete` rather than presented as a normal `no_op`. Skill patches receive the current complete `SKILL.md` only when it is unchanged by scrubbing and no larger than 15,000 characters. |
-| **5. Guardrails** | Enforces agent-created patch targets, fresh create names, content/frontmatter, prompt-note policy shape, size limits, daily budget, and recent-duplicate rejection. |
-| **6. Prepare** | Creates a durable skill backup, memory recovery metadata, or prompt-note recovery metadata, then appends and `fsync`s a `prepared` journal record before mutation. |
+| **4. LLM proposal** | Requests one structured `create`, `patch`, or `no_op` proposal with an optional one-sentence, falsifiable `expected_outcome`. Kinds are `skill`, `memory`, and `prompt`. A proposal may instead carry an `edits` array of inseparable edits under one shared reason, `expected_outcome`, and `summary`. Every model-bound field is sanitized. The proposal output budget is derived locally from the shared 15,000-character content limit and scales with `max_edits_per_proposal`; the reviewer remains separately capped at 300 tokens. A cut-off, malformed, or reasoning-only reply is journaled as `llm_incomplete` rather than presented as a normal `no_op`. Skill patches receive the current complete `SKILL.md` only when it is unchanged by scrubbing and no larger than 15,000 characters. |
+| **5. Guardrails** | Enforces agent-created patch targets, fresh create names, content/frontmatter, prompt-note policy shape, size limits, daily budget, and recent-duplicate rejection. Every check runs per edit, so a later edit of a transaction is measured against the edits already applied before it. |
+| **6. Prepare** | Captures a skill's pre-edit content as both a journal snapshot and a readable `.bak` file, or memory/prompt-note recovery metadata, then appends and `fsync`s a `prepared` journal record before mutation. |
 | **7. Apply and reconcile** | Runs the standard host API for skills/memory (`patch` maps to host `edit`) or atomically writes the plugin-owned prompt-note store. It proves target state and records `applied`, `pending_approval`, or `error`. Host pending approvals reconcile lazily before later runs, audit, or rollback. |
 | **8. Rollback** | Journals `rollback_prepared` before a rollback side effect. A rollback is finalized only after target-state proof; staged host rollbacks remain `pending_rollback` until approval reconciliation. |
 
@@ -200,6 +200,37 @@ these notes. Creation, target-state proof, audit rows, and conflict-aware
 rollback are still journaled; host approval remains in force for host-managed
 skills and memory.
 
+### Multi-edit transactions
+
+Some lessons are not one edit. A new skill and the memory entry that says when to
+reach for it are inseparable: applied separately, the state between them is
+inconsistent. A proposal may therefore carry an `edits` array under one shared
+reason, `expected_outcome`, and `summary`, capped by `max_edits_per_proposal`.
+
+Durably, nothing new was invented. Each edit still gets its own journal record,
+its own recovery metadata, and its own rollback ID, tied together only by an
+additive `group` field (`id`, `index`, `size`, `summary`, and `dropped` when
+edits were discarded). That is what keeps `/refine rollback <id>`, approval
+reconciliation, dedup, and the ledger working exactly as before — and it is why
+the daily budget counts edits rather than proposals.
+
+Edits apply in order and the run stops at the first failure. A partial
+transaction is never reported as clean:
+
+- Applied and reserved edits are `applied` / `pending_approval` as usual.
+- An edit whose host write landed but whose journal finalization failed still
+  owns a recovery ID and is listed as one.
+- Edits the daily budget refused, and edits not attempted after an earlier
+  failure, are journaled as `rejected`, which consumes no budget.
+- Edits discarded while shaping the proposal — past the cap, unusable, or
+  repeating a target already claimed in the same proposal — are counted, block a
+  `completed` verdict, and are reported in `group.dropped`.
+
+So which edits of a transaction landed is readable from the journal alone, not
+only from a message that automatic runs discard.
+
+There is no `delete` action: a transaction can only create or patch.
+
 ### Auditing what refine wrote
 
 `/refine audit` reports whether refine-created entries were used and whether the
@@ -250,8 +281,9 @@ All keys live under `plugins.entries.refine`:
 | `auto_min_messages` | int | `15` | Minimum messages for session-end auto-analysis. |
 | `auto_turn_interval` | int | `25` | Assistant messages added since this session's last automatic attempt; `0` disables only the turn trigger. |
 | `auto_cooldown_minutes` | int | `20` | Minimum durable journal-derived gap between automatic attempts. |
-| `max_edits_per_run` | int | `1` | Maximum applied or reserved edits per run. |
-| `max_edits_per_day` | int | `3` | Maximum applied, pending, or prepared edits per UTC day. |
+| `max_edits_per_run` | int | `1` | Maximum proposal passes per run. |
+| `max_edits_per_proposal` | int | `3` | Maximum inseparable edits one proposal may apply as a single transaction. `1` disables transactions. |
+| `max_edits_per_day` | int | `3` | Maximum applied, pending, or prepared **edits** per UTC day. This is the blast-radius limit and is re-checked before every edit. |
 | `only_agent_created` | bool | `true` | Only patch agent-created skills. |
 | `journal_dir` | path | `<HERMES_HOME>/plugins/refine` | Journal, lock, ledger, backups, and prompt notes. |
 | `overview_max_entries` | int | `40` | Existing skills and memory snippets listed per kind in a proposal prompt. |
@@ -301,6 +333,15 @@ llm:
 - **No host approval for the prompt-note store:** it is a plugin-owned atomic
   file, not a host memory or skill write. Host-managed skill and memory changes
   still respect staged approvals and reconciliation.
+- **Rollback is not modeled as an ordinary proposal:** rolling back a skill
+  `create` means deleting it, and the no-delete guardrail rejects any proposal
+  carrying a delete. Routing rollback through the proposal path would therefore
+  need a privileged bypass of that guardrail. It would also replace the
+  `rollback_prepared` / `pending_rollback` / `rolled_back` transitions that
+  approval reconciliation and `/refine rollback <id>` idempotence depend on, and
+  break rollback for every record written before the change. Rollback keeps its
+  own path; what it gained is journal snapshots, so it no longer depends on a
+  file surviving on disk.
 
 ---
 
@@ -315,10 +356,35 @@ actually reversible:
 
 Create rollback deletes a skill only if current content still exactly matches
 the refine proposal. Patch rollback refuses to overwrite a later change before
-restoring its durable backup. Memory rollback removes only the exact appended
+restoring its pre-edit content. Memory rollback removes only the exact appended
 entry and preserves unrelated later entries. Prompt-note rollback removes only
 its exact unchanged note and preserves later notes; a changed or missing note is
 a conflict and is left untouched.
+
+### Where the restored content comes from
+
+A skill patch records its pre-edit content twice: as a `snapshot` inside the
+journal record, and as a `.bak` file under `journal_dir/backups`. Both come from
+one host read, so they cannot disagree. Rollback prefers the snapshot, so losing
+the backup file no longer costs the rollback.
+
+The snapshot carries a SHA-256 digest of the real pre-edit content. The journal
+redacts credentials from everything it writes, so a snapshot of a skill that
+contained a secret would come back altered; the digest makes that detectable and
+the raw `.bak` file is used instead, rather than writing redacted text over the
+skill. If neither source survives, rollback refuses with an explicit error and
+changes nothing.
+
+Records written before snapshots existed carry only `backup_path` and keep
+rolling back from it unchanged.
+
+### Rolling back a transaction
+
+Each edit of a multi-edit transaction owns its own journal record and its own
+rollback ID; there is no transaction-level undo. Recovery IDs are listed
+**newest first**, which is the order to follow: memory recovery is positional, so
+undoing an earlier append before a later one shifts the later entry and its
+rollback fails closed as a conflict.
 
 If mutation succeeded but journal finalization failed, the returned recovery ID
 points to the durable `prepared` record. Pending forward approvals consume budget

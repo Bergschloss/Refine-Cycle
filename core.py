@@ -794,11 +794,12 @@ def _apply_edit(
     action = proposal["action"]
     name = proposal.get("name", "")
     backup_path = ""
+    snapshot: Optional[Dict[str, Any]] = None
     recovery: Dict[str, Any] = {}
     prompt_note: Optional[Dict[str, str]] = None
     if kind == "skill" and action == "patch":
-        backup = journal.backup_skill(name)
-        if backup is None:
+        captured = journal.prepare_skill_recovery(name, proposal.get("content", ""))
+        if captured is None:
             error = f"Cannot create durable backup for skill '{name}'; mutation aborted"
             _journal_nonmutation(
                 trigger=trigger,
@@ -816,7 +817,8 @@ def _apply_edit(
                 "reversible": False,
                 "edits_applied": 0,
             }
-        backup_path = str(backup)
+        backup_path = str(captured["backup_path"])
+        snapshot = captured["snapshot"]
         recovery = {"type": "skill_patch", "name": name}
     elif kind == "skill":
         recovery = {"type": "skill_create", "name": name}
@@ -879,6 +881,7 @@ def _apply_edit(
             backup_path=backup_path,
             recovery=recovery,
             group=group,
+            snapshot=snapshot,
         )
     except Exception as exc:
         return {
@@ -913,6 +916,7 @@ def _apply_edit(
             "proposal": proposal,
             "recovery": recovery,
             "backup_path": backup_path,
+            "snapshot": snapshot or {},
         }
         if not journal.target_matches_applied(prepared_entry):
             apply_result = {

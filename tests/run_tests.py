@@ -1056,7 +1056,7 @@ class RefineTests(unittest.TestCase):
             "content": skill_content(name, "# Changed"), "reason": "why", "evidence": [],
         }
         with patch.object(core._llm, "propose", return_value=patch_proposal), patch.object(
-            journal, "backup_skill", return_value=None
+            journal, "prepare_skill_recovery", return_value=None
         ):
             result = core.refine_run(MockLlm())
         self.assertFalse(result["success"])
@@ -1164,6 +1164,82 @@ class RefineTests(unittest.TestCase):
         conflict = core.refine_rollback(changed["journal_id"])
         self.assertFalse(conflict["success"])
         self.assertEqual(FakeHost.skills[name], later)
+
+    def test_patch_rollback_prefers_the_journal_snapshot_over_the_backup_file(self):
+        name = "snapshot-rollback"
+        old = skill_content(name, "# Old\n\nPreserve me.")
+        new = skill_content(name, "# Old\n\nPreserve me.\n\nFixed.")
+        FakeHost.add_skill(name, old)
+        result = self.run_proposal({
+            "action": "patch", "kind": "skill", "name": name,
+            "content": new, "reason": "failure", "evidence": [],
+        })
+        entry = journal.get_entry(result["journal_id"])
+        self.assertEqual(entry["snapshot"]["before"], old)
+        self.assertEqual(FakeHost.skills[name], new)
+
+        # Losing the backup file no longer costs the rollback.
+        Path(result["backup_path"]).unlink()
+        self.assertTrue(journal.is_reversible(journal.get_entry(result["journal_id"])))
+        self.assertTrue(core.refine_rollback(result["journal_id"])["success"])
+        self.assertEqual(FakeHost.skills[name], old)
+
+    def test_legacy_patch_entry_without_a_snapshot_still_rolls_back(self):
+        name = "legacy-rollback"
+        old = skill_content(name, "# Old\n\nLegacy body.")
+        new = skill_content(name, "# Old\n\nLegacy body.\n\nPatched.")
+        FakeHost.add_skill(name, new)
+        backup = journal.backups_dir() / "legacy_skill.bak"
+        backup.write_text(old, encoding="utf-8")
+        entry_id = journal.log(
+            trigger="manual", reason="legacy", session_id="session",
+            proposal={
+                "action": "patch", "kind": "skill", "name": name,
+                "content": new, "reason": "legacy", "evidence": [],
+            },
+            outcome="applied", backup_path=str(backup),
+            recovery={"type": "skill_patch", "name": name},
+        )
+        stored = journal.get_entry(entry_id)
+        self.assertNotIn("snapshot", stored)
+        self.assertTrue(journal.is_reversible(stored))
+        self.assertTrue(core.refine_rollback(entry_id)["success"])
+        self.assertEqual(FakeHost.skills[name], old)
+
+    def test_a_snapshot_that_fails_its_digest_falls_back_to_the_backup_file(self):
+        name = "digest-mismatch"
+        old = skill_content(name, "# Old\n\nTrue body.")
+        backup = journal.backups_dir() / "digest_skill.bak"
+        backup.write_text(old, encoding="utf-8")
+        entry = {
+            "backup_path": str(backup),
+            "snapshot": {
+                "kind": "skill", "name": name,
+                "before": skill_content(name, "# Old\n\n[REDACTED] body."),
+                "before_sha256": journal._content_digest(old),
+            },
+        }
+        # The stored text no longer hashes to the recorded digest, so the raw
+        # backup wins and redacted text is never written over the user's skill.
+        self.assertEqual(journal.snapshot_before_content(entry), old)
+
+    def test_patch_rollback_fails_clearly_when_no_recovery_source_survives(self):
+        name = "no-recovery"
+        old = skill_content(name, "# Old\n\nBody.")
+        new = skill_content(name, "# Old\n\nBody.\n\nPatched.")
+        FakeHost.add_skill(name, old)
+        result = self.run_proposal({
+            "action": "patch", "kind": "skill", "name": name,
+            "content": new, "reason": "failure", "evidence": [],
+        })
+        Path(result["backup_path"]).unlink()
+        stripped = dict(journal.get_entry(result["journal_id"]))
+        stripped.pop("snapshot")
+        with patch.object(journal, "get_entry", return_value=stripped):
+            failed = journal.rollback_skill(result["journal_id"])
+        self.assertFalse(failed["success"])
+        self.assertIn("no verified", failed["error"])
+        self.assertEqual(FakeHost.skills[name], new)
 
     def test_memory_rollback_removes_exact_append_only(self):
         FakeHost.memory_entries[:] = ["before"]
