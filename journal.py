@@ -484,8 +484,9 @@ def _new_entry(
     backup_path: str = "",
     error: str = "",
     recovery: Optional[Dict[str, Any]] = None,
+    group: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    return {
+    entry = {
         "id": uuid.uuid4().hex[:12],
         "ts": time.time(),
         "trigger": trigger,
@@ -497,6 +498,12 @@ def _new_entry(
         "recovery": recovery or {},
         "error": error,
     }
+    # A multi-edit transaction stays one durable record per edit, so rollback,
+    # reconciliation, dedup, and the daily edit budget keep working unchanged.
+    # ``group`` only reports which edits belonged together.
+    if group:
+        entry["group"] = group
+    return entry
 
 
 def log(
@@ -509,6 +516,7 @@ def log(
     backup_path: str = "",
     error: str = "",
     recovery: Optional[Dict[str, Any]] = None,
+    group: Optional[Dict[str, Any]] = None,
 ) -> str:
     entry = _new_entry(
         trigger=trigger,
@@ -519,6 +527,7 @@ def log(
         backup_path=backup_path,
         error=error,
         recovery=recovery,
+        group=group,
     )
     _append_entry(entry)
     return entry["id"]
@@ -532,6 +541,7 @@ def prepare(
     proposal: Dict[str, Any],
     backup_path: str = "",
     recovery: Optional[Dict[str, Any]] = None,
+    group: Optional[Dict[str, Any]] = None,
 ) -> str:
     return log(
         trigger=trigger,
@@ -541,6 +551,7 @@ def prepare(
         outcome="prepared",
         backup_path=backup_path,
         recovery=recovery,
+        group=group,
     )
 
 

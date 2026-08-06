@@ -259,7 +259,18 @@ def _handle_refine_command(raw_args: str) -> Optional[str]:
     if result.get("outcome") == "partial_success":
         summary = "⚠️ " + summary
     proposal = result.get("proposal", {})
-    if proposal.get("action") not in (None, "no_op"):
+    edits = proposal.get("edits")
+    if isinstance(edits, list) and edits:
+        if proposal.get("summary"):
+            summary += f"\n📝 {proposal['summary']}"
+        for edit in edits:
+            if not isinstance(edit, dict):
+                continue
+            summary += (
+                f"\n   • {edit.get('action', '?')} {edit.get('kind', '?')} "
+                f"\"{edit.get('name', '?')}\""
+            )
+    elif proposal.get("action") not in (None, "no_op"):
         summary += (
             f"\n📝 {proposal.get('action', '?')} {proposal.get('kind', '?')} "
             f"\"{proposal.get('name', '?')}\""

@@ -67,20 +67,27 @@ def record_edit(
     name = str(proposal.get("name", "")).strip()
     if not name:
         return
+    kind = str(proposal.get("kind", "skill") or "skill")
+    # Skills keep their bare name as the key so existing statistics, the audit
+    # table, and the prompt overview keep resolving. Other kinds are namespaced,
+    # because one transaction can legitimately create a skill and a same-named
+    # memory entry, and a shared key would hide one of them from the audit.
+    key = name if kind == "skill" else f"{kind}:{name}"
     with journal.mutation_lock():
         stats = load_stats()
-        previous = stats.get(name, {})
+        previous = stats.get(key, {})
         now = time.time()
         same_edit = previous.get("journal_id") == journal_id
         created_ts = previous.get("created_ts", now) if same_edit else now
         previous_version = previous.get("version", 1 if previous else 0)
         version = previous_version if same_edit else previous_version + 1
-        stats[name] = {
+        stats[key] = {
             "created_ts": created_ts,
             "updated_ts": now,
             "version": version,
             "journal_id": journal_id,
-            "kind": proposal.get("kind", "skill"),
+            "name": name,
+            "kind": kind,
             "action": proposal.get("action", ""),
             "pattern_fingerprint": proposal.get("pattern_fingerprint", ""),
             "expected_outcome": (
@@ -189,7 +196,9 @@ def audit(current_patterns: Optional[List[Dict[str, Any]]] = None) -> List[Dict[
     }
     now = time.time()
     rows: List[Dict[str, Any]] = []
-    for name, meta in sorted(load_stats().items()):
+    for key, meta in sorted(load_stats().items()):
+        # Legacy rows have no explicit name; their key is the name.
+        name = str(meta.get("name") or key)
         created = meta.get("created_ts", 0) or now
         age_days = max(0, int((now - created) // 86400))
         try:

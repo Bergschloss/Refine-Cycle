@@ -107,6 +107,11 @@ def max_edits_per_run() -> int:
     return get_int("max_edits_per_run", 1, min_val=1)
 
 
+def max_edits_per_proposal() -> int:
+    """Maximum inseparable edits one proposal may apply as a single transaction."""
+    return get_int("max_edits_per_proposal", 3, min_val=1)
+
+
 def max_edits_per_day() -> int:
     return get_int("max_edits_per_day", 3, min_val=1)
 
