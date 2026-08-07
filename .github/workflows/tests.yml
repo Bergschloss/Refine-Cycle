@@ -1,0 +1,38 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # The point of the matrix is the OS, not the tests. The longest-lived bug in
+    # this project was a hardcoded ~/.hermes that made the plugin read nothing on
+    # Windows, silently. A green run on one OS proves nothing about the other.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # No install step: the plugin and its tests are standard library only.
+      # run_tests.py puts the repo root on sys.path itself, so it runs as-is.
+      - name: Run tests
+        run: python tests/run_tests.py
+        env:
+          PYTHONIOENCODING: utf-8
