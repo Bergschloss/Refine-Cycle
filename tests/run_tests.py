@@ -1595,6 +1595,30 @@ class RefineTests(unittest.TestCase):
         self.assertNotIn("memory-secret-123", FakeHost.memory_entries[-1])
         self.assertTrue(core.refine_rollback(memory_result["journal_id"])["success"])
 
+    def test_lock_unlink_retries_on_permission_error(self):
+        """Wave 1.3: transient unlink failure must not leave a permanent deadlock."""
+        calls = {"n": 0}
+        real_unlink = Path.unlink
+
+        def flaky_unlink(self_path, *args, **kwargs):
+            if self_path.name.endswith(_LOCK_FILE_NAME):
+                calls["n"] += 1
+                if calls["n"] <= 2:
+                    raise PermissionError("handle still open")
+            return real_unlink(self_path, *args, **kwargs)
+
+        from journal import _LOCK_FILE_NAME  # noqa: F811
+
+        with patch.object(Path, "unlink", flaky_unlink):
+            with journal.mutation_lock():
+                pass  # Acquire and release.
+        # The lock must be released despite 2 transient failures.
+        lock_path = journal._mutation_lock_path(journal.ensure_dirs())
+        self.assertFalse(lock_path.exists())
+        # A subsequent acquisition must succeed without TimeoutError.
+        with journal.mutation_lock(timeout=1.0):
+            pass
+
     def test_new_malformed_lock_is_not_deleted_until_mtime_is_stale(self):
         lock_path = journal._mutation_lock_path(journal.ensure_dirs())
         lock_path.write_bytes(b"")

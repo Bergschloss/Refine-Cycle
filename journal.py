@@ -369,11 +369,13 @@ def _migration_lock(source: Path, timeout: float = 30.0) -> Iterator[None]:
             try:
                 current = json.loads(lock_path.read_text(encoding="utf-8"))
                 if current.get("token") == token:
-                    lock_path.unlink()
+                    _retry_on_contention(
+                        lock_path.unlink, _UNLINK_RETRY_BUDGET_SECONDS, OSError
+                    )
             except FileNotFoundError:
                 pass
             except Exception as exc:
-                logger.warning(
+                logger.error(
                     "Could not release refine migration lock: %s",
                     scrub_text(str(exc)),
                 )
@@ -829,12 +831,14 @@ def _acquire_mutation_lock(*, wait: bool, timeout: float = 0.0) -> Iterator[bool
             try:
                 current = json.loads(path.read_text(encoding="utf-8"))
                 if current.get("token") == token:
-                    path.unlink()
+                    _retry_on_contention(
+                        path.unlink, _UNLINK_RETRY_BUDGET_SECONDS, OSError
+                    )
             except FileNotFoundError:
                 pass
             except Exception as exc:
-                logger.warning(
-                    "Could not release refine mutation lock: %s",
+                logger.error(
+                    "Could not release refine mutation lock (process may self-deadlock): %s",
                     scrub_text(str(exc)),
                 )
 
