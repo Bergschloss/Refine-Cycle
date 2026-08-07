@@ -90,11 +90,15 @@ def normalize_error(content: str) -> str:
         text = pattern.sub(replacement, text)
 
     text = re.sub(r"\s+", " ", text).strip().lower()
-    return text[:200]
+    return text
 
 
 def fingerprint(tool_name: str, content: str) -> str:
-    """Stable short id for an error shape, scoped by the tool that produced it."""
+    """Stable short id for an error shape, scoped by the tool that produced it.
+
+    Hashes the full normalized text so errors sharing a long prefix but with
+    different tails remain distinct patterns.
+    """
     key = f"{tool_name or ''}|{normalize_error(content)}"
     return hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()[:12]
 

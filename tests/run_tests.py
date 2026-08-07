@@ -447,6 +447,19 @@ class RefineTests(unittest.TestCase):
         self.assertTrue(core._is_error_content("x" * 10000 + " timeout"))
         self.assertFalse(core._is_error_content("exit_code: 0\ncompleted normally"))
 
+    def test_fingerprint_distinguishes_errors_with_shared_long_prefix(self):
+        """Wave 2.4: different tails beyond 200 chars must produce different fps."""
+        prefix = "error: " + "shared-flag " * 25  # >200 chars
+        self.assertNotEqual(
+            patterns.fingerprint("bash", prefix + "unique-tail-alpha"),
+            patterns.fingerprint("bash", prefix + "unique-tail-bravo"),
+        )
+        # Same content still gives the same fp
+        self.assertEqual(
+            patterns.fingerprint("bash", prefix + "same"),
+            patterns.fingerprint("bash", prefix + "same"),
+        )
+
     def test_traceback_normalization_only_truncates_real_tracebacks(self):
         """Wave 2.3: File/at markers alone must not truncate normal output."""
         # Real Python traceback → extract final exception line
