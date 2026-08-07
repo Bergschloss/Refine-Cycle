@@ -431,7 +431,6 @@ LLM trust policy (`plugins.entries.refine.llm`):
 llm:
   allow_model_override: false
   allow_provider_override: false
-  allow_agent_id_override: false
 ```
 
 ---

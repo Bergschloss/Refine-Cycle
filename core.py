@@ -364,7 +364,8 @@ def _skill_items() -> List[Any]:
         result = raw if not isinstance(raw, str) else json.loads(raw)
         skills = result.get("skills", []) if isinstance(result, dict) else result
         return skills if isinstance(skills, list) else []
-    except Exception:
+    except Exception as exc:
+        logger.warning("Cannot retrieve skill items: %s", scrub_text(str(exc)))
         return []
 
 
@@ -421,7 +422,8 @@ def list_memory_snippets() -> List[str]:
             scrub_text(str(entry))[:120]
             for entry in (store.memory_entries + store.user_entries)[-20:]
         ]
-    except Exception:
+    except Exception as exc:
+        logger.warning("Cannot read memory snippets: %s", scrub_text(str(exc)))
         return []
 
 
@@ -608,8 +610,8 @@ def refine_status() -> Dict[str, Any]:
     plugin_source_collision = False
     try:
         plugin_source_collision = (jdir / "plugin.yaml").is_file()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Cannot inspect plugin source collision: %s", scrub_text(str(exc)))
     if plugin_source_collision:
         warnings.append({
             "code": "journal_dir_is_plugin_source",
@@ -694,8 +696,8 @@ def refine_status() -> Dict[str, Any]:
                     session_message_count = row["n"] if row else 0
                 finally:
                     conn.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Cannot read session message count: %s", scrub_text(str(exc)))
     if sid_source == "unknown":
         blockers.append({
             "code": "session_unknown",
@@ -756,7 +758,8 @@ def refine_audit() -> Dict[str, Any]:
             if earliest
             else []
         )
-    except Exception:
+    except Exception as exc:
+        logger.error("Audit pattern collection failed: %s", scrub_text(str(exc)))
         current = []
     rows = ledger.audit(current)
     return {"success": True, "rows": rows, "report": ledger.format_audit(rows)}

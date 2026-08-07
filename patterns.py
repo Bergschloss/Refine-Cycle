@@ -206,7 +206,7 @@ def format_patterns(patterns: List[Dict[str, Any]], limit: int = 8) -> str:
             "  [{count}x across {sessions} session(s)] {tool} — {sample} (fp:{fp})".format(
                 count=entry.get("count", 1),
                 sessions=entry.get("sessions_seen", 1),
-                tool=entry.get("tool") or "?",
+                tool=scrub_text(str(entry.get("tool") or "?")).replace("\n", " "),
                 sample=scrub_text(str(entry.get("sample") or "")).replace("\n", " ")[:160],
                 fp=scrub_text(str(entry.get("fingerprint", ""))),
             )

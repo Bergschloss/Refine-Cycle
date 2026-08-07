@@ -213,7 +213,7 @@ def _on_pre_llm_call(**kwargs) -> Optional[dict]:
                 return {"context": safe_rendered}
             selected = selected[1:]
     except Exception:
-        logger.debug("refine prompt-note hook failed", exc_info=True)
+        logger.warning("refine prompt-note hook failed", exc_info=True)
     return None
 
 
@@ -348,7 +348,7 @@ def _handle_refine_command(raw_args: str) -> Optional[str]:
             return core.refine_audit().get("report", "No data.")
         except Exception as exc:
             logger.exception("refine audit failed")
-            return f"❌ Audit failed: {exc}"
+            return f"❌ Audit failed: {core.scrub_text(str(exc))}"
 
     if args == "status":
         try:
@@ -477,7 +477,7 @@ def _handle_refine_command(raw_args: str) -> Optional[str]:
         result = core.refine_run(llm=_session_llm(), reason=args, auto=False)
     except Exception as exc:
         logger.exception("refine command failed")
-        return f"❌ Refine failed: {exc}"
+        return f"❌ Refine failed: {core.scrub_text(str(exc))}"
 
     if not result.get("success") and result.get("outcome") != "partial_success":
         return f"❌ {result.get('message', 'Unknown error')}"
