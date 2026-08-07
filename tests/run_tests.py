@@ -144,12 +144,12 @@ class FakeHost:
             ("session", "tool", "ERROR: request failed for /item/200", "http", now - 1, 1),
         ]
         connection = sqlite3.connect(path)
-        connection.execute("CREATE TABLE sessions (id TEXT, started_at REAL)")
+        connection.execute("CREATE TABLE sessions (id TEXT, started_at REAL, source TEXT DEFAULT 'cli')")
         connection.execute(
             "CREATE TABLE messages (session_id TEXT, role TEXT, content TEXT, "
             "tool_name TEXT, timestamp REAL, active INTEGER)"
         )
-        connection.execute("INSERT INTO sessions VALUES ('session', ?)", (now - 10,))
+        connection.execute("INSERT INTO sessions VALUES ('session', ?, 'cli')", (now - 10,))
         connection.executemany("INSERT INTO messages VALUES (?,?,?,?,?,?)", rows)
         connection.commit()
         connection.close()
@@ -4265,10 +4265,10 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
         connection = sqlite3.connect(path)
         connection.execute("DELETE FROM sessions")
         connection.execute(
-            "INSERT INTO sessions VALUES ('active-session', ?)", (now - 200,)
+            "INSERT INTO sessions VALUES ('active-session', ?, 'cli')", (now - 200,)
         )
         connection.execute(
-            "INSERT INTO sessions VALUES ('ghost-session', ?)", (now - 2,)
+            "INSERT INTO sessions VALUES ('ghost-session', ?, 'cli')", (now - 2,)
         )
         connection.commit()
         connection.close()
@@ -4294,6 +4294,70 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
         FakeHost.entry_config()["auto_enabled"] = False
         plugin_init._on_session_end(session_id="end-sess-xyz")
         self.assertEqual(core._noted_session_id(), "end-sess-xyz")
+
+    # ── Session source filter (Part D) ────────────────────────────────────────
+
+    def test_cron_session_is_skipped_by_default(self):
+        # Mark the test session as cron in the DB.
+        path = self.root / "state.db"
+        connection = sqlite3.connect(path)
+        connection.execute("UPDATE sessions SET source='cron' WHERE id='session'")
+        connection.commit()
+        connection.close()
+        model = MockLlm({
+            "action": "no_op", "reason": "nothing", "evidence": [],
+            "kind": "", "name": "", "content": "",
+        })
+        result = core.refine_run(model, session_id="session")
+        self.assertEqual(result.get("outcome"), "skipped_session_source")
+        self.assertIn("cron", result["message"])
+        # No model called, no budget spent
+        self.assertEqual(len(model.calls), 0)
+        self.assertEqual(journal.count_today_applied(), 0)
+
+    def test_cli_session_is_not_skipped(self):
+        # Default source is 'cli' which is not in skip list
+        model = MockLlm({
+            "action": "no_op", "reason": "nothing", "evidence": [],
+            "kind": "", "name": "", "content": "",
+        })
+        result = core.refine_run(model, session_id="session")
+        # Should proceed past the source check (may end as no_op for signal reasons)
+        self.assertNotEqual(result.get("outcome"), "skipped_session_source")
+
+    def test_empty_skip_sources_skips_nothing(self):
+        FakeHost.entry_config()["skip_session_sources"] = []
+        path = self.root / "state.db"
+        connection = sqlite3.connect(path)
+        connection.execute("UPDATE sessions SET source='cron' WHERE id='session'")
+        connection.commit()
+        connection.close()
+        model = MockLlm({
+            "action": "no_op", "reason": "nothing", "evidence": [],
+            "kind": "", "name": "", "content": "",
+        })
+        result = core.refine_run(model, session_id="session")
+        self.assertNotEqual(result.get("outcome"), "skipped_session_source")
+
+    def test_invalid_skip_sources_config_uses_default(self):
+        FakeHost.entry_config()["skip_session_sources"] = "not a list"
+        self.assertEqual(config.skip_session_sources(), ["cron"])
+
+    def test_source_read_failure_does_not_block_the_pass(self):
+        # If the source cannot be read (missing column, etc.), the pass proceeds.
+        with patch.object(core, "_get_session_source", return_value=""):
+            model = MockLlm({
+                "action": "no_op", "reason": "nothing", "evidence": [],
+                "kind": "", "name": "", "content": "",
+            })
+            result = core.refine_run(model, session_id="session")
+        self.assertNotEqual(result.get("outcome"), "skipped_session_source")
+
+    def test_status_reports_skip_sources_and_session_source(self):
+        status = core.refine_status()
+        self.assertIn("skip_session_sources", status)
+        self.assertEqual(status["skip_session_sources"], ["cron"])
+        self.assertEqual(status["session_source"], "cli")
 
 
 if __name__ == "__main__":

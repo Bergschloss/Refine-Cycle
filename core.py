@@ -102,6 +102,24 @@ def _open_db() -> Optional[sqlite3.Connection]:
         return None
 
 
+def _get_session_source(session_id: str) -> str:
+    """Read-only lookup of a session's source column. Returns "" on any failure."""
+    if not session_id:
+        return ""
+    connection = _open_db()
+    if not connection:
+        return ""
+    try:
+        row = connection.execute(
+            "SELECT source FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        return str(row["source"] or "") if row else ""
+    except Exception:
+        return ""
+    finally:
+        connection.close()
+
+
 def _structured_error_status(content: str) -> Optional[bool]:
     """Return a definitive structured status, or None when text is unstructured."""
     try:
@@ -664,6 +682,8 @@ def refine_status() -> Dict[str, Any]:
         "session_id": sid,
         "session_id_source": sid_source,
         "session_message_count": session_message_count,
+        "session_source": _get_session_source(sid) if sid else "",
+        "skip_session_sources": config.skip_session_sources(),
         "llm_model": target["model"],
         "llm_provider": target["provider"],
         "llm_target_source": target["source"],
@@ -944,6 +964,20 @@ def _refine_once(
             "success": False,
             "outcome": "session_unknown",
             "message": "Cannot identify the current session; refine did not run.",
+            "evidence": evidence,
+            "reversible": False,
+        }
+    # Source filter: skip machine-generated sessions whose trajectory is noise.
+    skip_sources = config.skip_session_sources()
+    session_db_source = _get_session_source(session)
+    if session_db_source and session_db_source.lower() in skip_sources:
+        return {
+            "success": True,
+            "outcome": "skipped_session_source",
+            "message": (
+                f"Session source '{session_db_source}' is in skip_session_sources; "
+                "refine did not run."
+            ),
             "evidence": evidence,
             "reversible": False,
         }

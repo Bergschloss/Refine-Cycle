@@ -7,7 +7,7 @@ All values have sensible defaults — config.yaml only provides overrides.
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +168,21 @@ def reviewer_cooldown_minutes() -> int:
 
 def cross_session_enabled() -> bool:
     return get_bool("cross_session_enabled", True)
+
+
+def skip_session_sources() -> List[str]:
+    """Session sources to skip for automatic and manual refinement.
+
+    A session whose ``source`` column matches one of these values is not
+    analysed. Intended for machine-generated sessions (cron, batch) whose
+    trajectory is noise rather than signal. Invalid config (not a list of
+    strings) falls back to the default rather than raising.
+    """
+    entry = _get_refine_entry()
+    val = entry.get("skip_session_sources")
+    if isinstance(val, list) and all(isinstance(item, str) for item in val):
+        return [item.strip().lower() for item in val if item.strip()]
+    return ["cron"]
 
 
 def cross_session_days() -> int:
