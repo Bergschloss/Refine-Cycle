@@ -34,15 +34,25 @@ def stats_read_path() -> Path:
 
 
 def load_stats() -> Dict[str, Any]:
+    """Load the skill stats ledger, distinguishing absence from corruption.
+
+    Returns {} only when the file is genuinely absent. On read/parse error the
+    function raises IOError so callers do not overwrite a corrupted or locked
+    file with a single entry.
+    """
     path = stats_read_path()
     if not path.is_file():
         return {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        raw = journal._retry_on_contention(
+            lambda: path.read_text(encoding="utf-8"),
+            journal._READ_RETRY_BUDGET_SECONDS,
+        )
+        data = json.loads(raw)
         return data if isinstance(data, dict) else {}
     except Exception as exc:
-        logger.warning("Cannot read skill stats: %s", exc)
-        return {}
+        logger.error("Cannot read skill stats: %s", exc)
+        raise IOError(f"Ledger unreadable: {scrub_text(str(exc))}") from exc
 
 
 def _save_stats(stats: Dict[str, Any]) -> None:

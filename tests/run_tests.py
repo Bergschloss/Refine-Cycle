@@ -717,6 +717,29 @@ class RefineTests(unittest.TestCase):
             reconciled_stats["updated_ts"], patched_stats["updated_ts"]
         )
 
+    def test_ledger_refuses_to_overwrite_on_read_failure(self):
+        """Wave 1.2: corrupted or locked ledger must not be wiped by record_edit."""
+        path = ledger.stats_path()
+        original = json.dumps({"existing-skill": {"version": 3, "created_ts": 1}})
+        path.write_text(original, encoding="utf-8")
+        # Corrupt the file so JSON parse fails.
+        path.write_text("{bad json", encoding="utf-8")
+        # record_edit must not succeed and must not overwrite.
+        try:
+            ledger.record_edit(
+                {"name": "new-skill", "kind": "skill", "action": "create"},
+                "j-new",
+            )
+        except Exception:
+            pass
+        self.assertEqual(path.read_text(encoding="utf-8"), "{bad json")
+
+    def test_ledger_absent_file_is_not_an_error(self):
+        """An absent ledger file is normal (new install), not an unreadable state."""
+        path = ledger.stats_read_path()
+        path.unlink(missing_ok=True)
+        self.assertEqual(ledger.load_stats(), {})
+
     def test_ledger_reports_churn_and_loads_legacy_stats(self):
         created = time.time() - (30 * 86400)
         ledger.stats_path().write_text(json.dumps({
