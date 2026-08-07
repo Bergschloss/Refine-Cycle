@@ -414,16 +414,35 @@ def review_fallback(llm: PluginLlm, evidence_text: str, *, target: Optional[Dict
     )
     try:
         call_started = time.time()
-        result = llm.complete_structured(
-            system_prompt=scrub_text(REVIEWER_FALLBACK_SYSTEM_PROMPT),
-            input=[PluginLlmTextInput(text=scrub_text(instructions))],
-            json_schema=sanitize(REVIEWER_FALLBACK_SCHEMA),
-            schema_name="refine_reviewer",
-            purpose="refine",
-            temperature=0.0,
-            max_tokens=REVIEWER_MAX_TOKENS,
-            **resolved_target,
-        )
+        try:
+            result = llm.complete_structured(
+                system_prompt=scrub_text(REVIEWER_FALLBACK_SYSTEM_PROMPT),
+                input=[PluginLlmTextInput(text=scrub_text(instructions))],
+                json_schema=sanitize(REVIEWER_FALLBACK_SCHEMA),
+                schema_name="refine_reviewer",
+                purpose="refine",
+                temperature=0.0,
+                max_tokens=REVIEWER_MAX_TOKENS,
+                **resolved_target,
+            )
+        except PluginLlmTrustError:
+            raise
+        except Exception as schema_exc:
+            logger.warning(
+                "Reviewer json_schema failed (%s); falling back to json_mode",
+                scrub_text(str(schema_exc)),
+            )
+            result = llm.complete_structured(
+                system_prompt=scrub_text(REVIEWER_FALLBACK_SYSTEM_PROMPT)
+                + "\nReply with one JSON object only, without Markdown fences.",
+                input=[PluginLlmTextInput(text=scrub_text(instructions))],
+                json_mode=True,
+                schema_name="refine_reviewer",
+                purpose="refine",
+                temperature=0.0,
+                max_tokens=REVIEWER_MAX_TOKENS,
+                **resolved_target,
+            )
         _record_call_meta(result, call_started)
         reply = _salvage_parsed(result, requested_max_tokens=REVIEWER_MAX_TOKENS)
         if reply.failure:
@@ -449,12 +468,13 @@ def review_fallback(llm: PluginLlm, evidence_text: str, *, target: Optional[Dict
             "failure": "llm_call_error",
             "error": safe_error,
         }
-    if not parsed or not isinstance(parsed.get("shouldRefine"), bool):
+    if not parsed or not isinstance(parsed.get("shouldRefine", parsed.get("should_refine")), bool):
         return {
             "should_refine": False,
             "rationale": "Reviewer unavailable or returned invalid output.",
             "instructions": "",
         }
+    should_refine_value = parsed.get("shouldRefine", parsed.get("should_refine"))
     raw_rationale = parsed.get("rationale")
     raw_instructions = parsed.get("instructions")
     if not isinstance(raw_rationale, str) or not isinstance(raw_instructions, str):
@@ -465,14 +485,14 @@ def review_fallback(llm: PluginLlm, evidence_text: str, *, target: Optional[Dict
         }
     rationale = scrub_text(raw_rationale).strip()
     instructions = scrub_text(raw_instructions).strip()
-    if not rationale or (parsed["shouldRefine"] and not instructions):
+    if not rationale or (should_refine_value and not instructions):
         return {
             "should_refine": False,
             "rationale": "Reviewer returned an incomplete verdict.",
             "instructions": "",
         }
     return {
-        "should_refine": parsed["shouldRefine"],
+        "should_refine": should_refine_value,
         "rationale": rationale[:1000],
         "instructions": instructions[:2000],
     }

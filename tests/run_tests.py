@@ -2585,6 +2585,29 @@ class RefineTests(unittest.TestCase):
         self.assertEqual(len(reviewer_records), 1)
         self.assertIn("Reviewer approved", reviewer_records[0]["reason"])
 
+    def test_reviewer_json_mode_fallback_and_snake_case_key(self):
+        """Wave 2.8: reviewer retries with json_mode on schema failure and accepts should_refine."""
+        # json_schema raises, json_mode succeeds with snake_case key
+        calls = []
+
+        class FallbackLlm:
+            def complete_structured(self, **kwargs):
+                calls.append(kwargs)
+                if "json_schema" in kwargs:
+                    raise RuntimeError("json_schema not supported")
+                return MockResult({
+                    "should_refine": True,
+                    "rationale": "A durable lesson exists.",
+                    "instructions": "Persist the retry pattern.",
+                })
+
+        result = llm.review_fallback(FallbackLlm(), "evidence text")
+        self.assertTrue(result["should_refine"])
+        self.assertEqual(result["rationale"], "A durable lesson exists.")
+        self.assertEqual(result["instructions"], "Persist the retry pattern.")
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(calls[1].get("json_mode"))
+
     def test_reviewer_decline_is_a_sanitized_no_op_without_application(self):
         now = time.time()
         FakeHost.make_db([
