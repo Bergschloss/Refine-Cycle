@@ -205,7 +205,8 @@ def _on_pre_llm_call(**kwargs) -> Optional[dict]:
         selected = selected[-config.prompt_notes_max_count():]
         while selected:
             rendered = "Refine notes:\n" + "\n".join(
-                f"- {note['content']}" for note in selected
+                "- " + note["content"].replace("\n", "\n  ")
+                for note in selected
             )
             safe_rendered = core.scrub_text(rendered)
             if len(safe_rendered) <= config.prompt_notes_max_chars():

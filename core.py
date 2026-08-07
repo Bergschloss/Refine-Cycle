@@ -797,6 +797,8 @@ def _prompt_note_content_error(
     first_line = lines[0]
     if not re.match(r"(?i)^when\s+[^,\n]{3,200},\s+\S", first_line):
         return "Prompt note must use 'When <specific condition>, <one action>.'"
+    if len(lines) > 1 and not re.match(r"(?i)^when\s+[^,\n]{3,200},\s+\S", lines[1]):
+        return "Every line of a prompt note must use 'When <specific condition>, <one action>.'"
     blocked_terms = r"(?i)\b(?:always|never|ignore|system prompt|instruction|any user|all users|every request|first|then|finally)\b"
     if any(re.search(blocked_terms, line) for line in lines):
         return "Prompt note must be a narrow conditional policy, not a global or procedural instruction"
@@ -1120,10 +1122,19 @@ def _refine_once(
     corrections = evidence.get("user_corrections", [])
     lines: List[str] = []
     for message in evidence.get("messages", []):
-        tag = f"[{message['role']}]"
+        role = message["role"]
+        tag = f"[{role}]"
         if message.get("tool_name"):
             tag += f"({message['tool_name']})"
-        lines.append(f"{tag} {message['content'][:400]}")
+        content = message["content"][:400]
+        if role == "tool":
+            # Strip any attempt to close the boundary tag from within tool output.
+            safe_content = content.replace("</untrusted_tool_result>", "")
+            lines.append(
+                f"{tag} <untrusted_tool_result>{safe_content}</untrusted_tool_result>"
+            )
+        else:
+            lines.append(f"{tag} {content}")
     evidence_text = "\n".join(lines)
     proposal_context = safe_reason
     if config.min_signal_required() and not patterns.has_signal(

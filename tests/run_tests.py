@@ -2032,28 +2032,37 @@ class RefineTests(unittest.TestCase):
                  "content": "Reach for capped-one first."},
             ],
         }
+        # With the inseparable semantics, dropped edits abort the transaction.
         FakeHost.entry_config()["max_edits_per_proposal"] = 2
         capped = llm.propose(MockLlm(reply), "evidence", [], [])
-        # The duplicate target is dropped and the third edit is past the cap.
-        # Preserve that loss so applying the remaining edit reports a partial
-        # transaction instead of silently claiming the inseparable set landed.
-        self.assertEqual(capped["action"], "multi")
-        self.assertEqual(len(capped["edits"]), 1)
-        self.assertEqual(capped["edits"][0]["name"], "capped-one")
-        self.assertEqual(capped["dropped_edits"], 2)
-        self.assertEqual(capped["expected_outcome"], "The repeated failure stops.")
+        self.assertEqual(capped["action"], "no_op")
+        self.assertIn("aborted", capped["reason"].lower())
 
+        # Without a cap, the duplicate is still dropped → abort.
         FakeHost.entry_config()["max_edits_per_proposal"] = 3
         model = MockLlm(reply)
         grouped = llm.propose(model, "evidence", [], [])
-        self.assertEqual(grouped["action"], "multi")
-        self.assertEqual([edit["kind"] for edit in grouped["edits"]], ["skill", "memory"])
-        self.assertEqual(grouped["summary"], "Add the skill and its memory pointer")
-        for edit in grouped["edits"]:
-            self.assertEqual(edit["expected_outcome"], "The repeated failure stops.")
-            self.assertEqual(edit["pattern_fingerprint"], "deadbeef1234")
-        # Creates inside a transaction cost no extra retry call.
-        self.assertEqual(len(model.calls), 1)
+        self.assertEqual(grouped["action"], "no_op")
+        self.assertIn("aborted", grouped["reason"].lower())
+
+        # A clean transaction with no duplicates and within the cap succeeds.
+        clean_reply = {
+            "action": "create", "reason": "Repeated failure",
+            "expected_outcome": "The repeated failure stops.",
+            "pattern_fingerprint": "deadbeef1234",
+            "summary": "Add the skill and its memory pointer",
+            "edits": [
+                {"action": "create", "kind": "skill", "name": "capped-one",
+                 "content": skill_content("capped-one")},
+                {"action": "create", "kind": "memory", "name": "note",
+                 "content": "Reach for capped-one first."},
+            ],
+        }
+        clean_model = MockLlm(clean_reply)
+        clean = llm.propose(clean_model, "evidence", [], [])
+        self.assertEqual(clean["action"], "multi")
+        self.assertEqual(len(clean["edits"]), 2)
+        self.assertEqual(clean["summary"], "Add the skill and its memory pointer")
 
     def test_transaction_subcall_truncation_is_reported_not_disguised(self):
         name = "patched-in-transaction"
@@ -2217,18 +2226,10 @@ class RefineTests(unittest.TestCase):
         }
         model = MockLlm(reply)
         proposal = llm.propose(model, "evidence", [], [])
-        self.assertEqual(proposal["action"], "multi")
-        self.assertEqual(len(proposal["edits"]), 1)
-        self.assertEqual(proposal["edits"][0]["name"], "kept-edit")
-        self.assertEqual(proposal["dropped_edits"], 1)
+        # Inseparable transaction aborts when any sub-edit is unusable.
+        self.assertEqual(proposal["action"], "no_op")
+        self.assertIn("aborted", proposal["reason"].lower())
         self.assertEqual(len(model.calls), 1)
-
-        result = self.run_proposal(proposal)
-        self.assertFalse(result["success"])
-        self.assertEqual(result["outcome"], "partial_success")
-        self.assertEqual(result["edits_applied"], 1)
-        self.assertIn("discarded before apply", result["message"])
-        self.assertEqual(grouped_entries()[0]["group"]["dropped"], 1)
 
     def test_patch_selection_without_content_reaches_complete_replacement(self):
         name = "contentless-patch"
@@ -2922,6 +2923,54 @@ class RefineTests(unittest.TestCase):
         self.assertEqual(entry["proposal"]["content"], "When retrying, verify the target.")
         self.assertEqual(journal.load_prompt_notes()[0]["content"], "When retrying, verify the target.")
         self.assertTrue(journal.target_matches_applied(entry))
+
+    def test_tool_content_wrapped_in_untrusted_boundary_tags(self):
+        """Wave 3.1: tool output in evidence_text is wrapped in boundary tags."""
+        model = MockLlm({"action": "no_op", "reason": "none"})
+        core.refine_run(model, session_id="session")
+        if model.calls:
+            prompt_text = model.calls[0]["input"][0].text
+            self.assertIn("<untrusted_tool_result>", prompt_text)
+            self.assertIn("</untrusted_tool_result>", prompt_text)
+            # User/assistant messages must NOT be wrapped
+            self.assertNotIn("[user] <untrusted_tool_result>", prompt_text)
+
+    def test_prompt_note_second_line_must_match_when_pattern(self):
+        """Wave 3.2: both lines of a 2-line prompt note must be conditional policies."""
+        # Valid 2-line note
+        valid = "When retrying a request, verify the endpoint.\nWhen the retry fails, log the error."
+        self.assertIsNone(core._prompt_note_content_error(valid, check_rendered_size=False))
+        # Invalid second line
+        invalid = "When retrying a request, verify the endpoint.\nDo this unconditionally."
+        error = core._prompt_note_content_error(invalid, check_rendered_size=False)
+        self.assertIsNotNone(error)
+        self.assertIn("Every line", error)
+
+    def test_inseparable_transaction_aborts_on_any_dropped_edit(self):
+        """Wave 3.4: dropped sub-edit causes entire transaction to abort."""
+        result = llm.propose(
+            MockLlm({
+                "action": "multi",
+                "reason": "inseparable fix",
+                "expected_outcome": "better",
+                "edits": [
+                    {"action": "create", "kind": "skill", "name": "valid-edit",
+                     "content": "---\nname: valid-edit\ndescription: ok\n---\n# Body\n"},
+                    {"action": "create", "kind": "skill", "name": "", "content": ""},
+                ],
+            }),
+            "evidence", [], [],
+        )
+        self.assertEqual(result["action"], "no_op")
+        self.assertIn("aborted", result["reason"].lower())
+
+    def test_prompt_note_rendering_indents_second_line(self):
+        """Wave 3.3: multi-line prompt notes render with indented continuation."""
+        policy = "When verifying a target, confirm it.\nWhen the target is invalid, reject it."
+        # Bypass normal validation since we're testing rendering
+        journal.add_prompt_note({"id": "aabbccddee01", "content": policy, "scope": "global"})
+        result = plugin_init._on_pre_llm_call()
+        self.assertIn("\n  When the target", result["context"])
 
     def test_prompt_note_rejects_global_procedural_shape_and_unrenderable_size(self):
         for invalid in (
