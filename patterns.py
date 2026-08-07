@@ -77,7 +77,9 @@ def normalize_error(content: str) -> str:
 
     # For a traceback, the only stable part is the final exception line; the
     # frames above it are noise that changes with every refactor.
-    if any(marker in text for marker in _TRACEBACK_MARKERS):
+    # Only the unambiguous header proves this is a real traceback; `File "` and
+    # `  at ` alone appear in normal CLI output and must not trigger truncation.
+    if "Traceback (most recent call last)" in text or "Traceback (most recent" in text:
         lines = [line.strip() for line in text.splitlines() if line.strip()]
         if lines:
             text = lines[-1]

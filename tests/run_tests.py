@@ -447,6 +447,27 @@ class RefineTests(unittest.TestCase):
         self.assertTrue(core._is_error_content("x" * 10000 + " timeout"))
         self.assertFalse(core._is_error_content("exit_code: 0\ncompleted normally"))
 
+    def test_traceback_normalization_only_truncates_real_tracebacks(self):
+        """Wave 2.3: File/at markers alone must not truncate normal output."""
+        # Real Python traceback → extract final exception line
+        real_tb = (
+            'Traceback (most recent call last):\n'
+            '  File "app.py", line 42, in main\n'
+            '    result = fetch()\n'
+            'ConnectionError: timed out'
+        )
+        self.assertEqual(patterns.normalize_error(real_tb), "connectionerror: timed out")
+        # Normal output with File "..." must NOT be truncated
+        normal = 'Updated File "config.json" successfully\nDone in 2s'
+        normalized = patterns.normalize_error(normal)
+        self.assertIn("config.json", normalized)
+        self.assertIn("done", normalized)
+        # Different real errors remain different fingerprints
+        self.assertNotEqual(
+            patterns.fingerprint("http", "rate limited"),
+            patterns.fingerprint("http", "permission denied"),
+        )
+
     def test_correction_requires_explicit_context(self):
         routine = (
             "Use the API for this task", "Do not forget the tests", "Try again tomorrow",
