@@ -318,6 +318,7 @@ install_fake_host()
 import config
 import core
 import journal
+import sanitization
 import ledger
 import llm
 import patterns
@@ -1520,6 +1521,21 @@ class RefineTests(unittest.TestCase):
         with patch.object(core, "collect_cross_session_patterns", return_value=[]) as collect:
             core.refine_audit()
         collect.assert_called_once_with(since_ts=created, max_rows=None, max_sessions=None)
+    def test_scrub_text_does_not_produce_double_bracket_marker(self):
+        """Wave 1.4: [REDACTED]] corruption must not occur in any secret form."""
+        cases = [
+            'API_KEY="secret123456"',
+            "MY_SECRET_TOKEN=abcdef123456",
+            'password="p@ss:w,rd!"',
+            'token: "ghp_aaaaaaaaaa1234567890aaaaaa"',
+        ]
+        for text in cases:
+            result = sanitization.scrub_text(text)
+            self.assertNotIn("[REDACTED]]", result, f"Double bracket in: {text!r}")
+            self.assertIn("[REDACTED]", result)
+            # Idempotence
+            self.assertEqual(sanitization.scrub_text(result), result)
+
     def test_sanitization_is_idempotent_and_all_prompt_inputs_are_scrubbed(self):
         marker_text = 'token=[REDACTED] and password: "[REDACTED]"'
         self.assertEqual(core.scrub_text(marker_text), marker_text)
