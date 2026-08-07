@@ -1,8 +1,10 @@
 name: tests
 
+# Every push on every branch, and every pull request. The code here is written
+# by agents on many short-lived branches; a signal that only arrives at main is
+# a signal that arrives too late.
 on:
   push:
-    branches: [main]
   pull_request:
 
 permissions:
