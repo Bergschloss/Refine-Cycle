@@ -223,8 +223,8 @@ def unused_skills(min_age_days: int = 14) -> List[str]:
             or meta.get("outcome", "applied") != "applied"
         ):
             continue
-        uses, _scope = _count_uses_with_scope(name, meta.get("created_ts", 0))
-        if uses == 0:
+        uses, scope = _count_uses_with_scope(name, meta.get("created_ts", 0))
+        if uses == 0 and scope == "since_exact":
             result.append(name)
     return result[:10]
 
@@ -232,14 +232,90 @@ def unused_skills(min_age_days: int = 14) -> List[str]:
 # ── audit ──────────────────────────────────────────────────────────────────
 
 
-def audit(current_patterns: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+def _merge_journal_stats(
+    stats: Dict[str, Any], journal_entries: Optional[List[Dict[str, Any]]]
+) -> Dict[str, Any]:
+    """Fill ledger attribution gaps from the journal lifecycle authority."""
+    merged = {
+        key: dict(value) if isinstance(value, dict) else value
+        for key, value in stats.items()
+    }
+    tracked_outcomes = {
+        "prepared", "applied", "pending_approval", "rollback_prepared",
+        "pending_rollback", "rolled_back", "rejected",
+    }
+    ordered = sorted(
+        (entry for entry in (journal_entries or []) if isinstance(entry, dict)),
+        key=lambda entry: float(entry.get("ts", 0) or 0),
+    )
+    for entry in ordered:
+        if entry.get("outcome") not in tracked_outcomes:
+            continue
+        proposal = entry.get("proposal")
+        if not isinstance(proposal, dict) or proposal.get("action") not in ("create", "patch"):
+            continue
+        name = str(proposal.get("name", "")).strip()
+        if not name:
+            continue
+        kind = str(proposal.get("kind", "skill") or "skill")
+        key = name if kind == "skill" else f"{kind}:{name}"
+        entry_id = str(entry.get("id", ""))
+        timestamp = float(entry.get("ts", 0) or 0)
+        existing = merged.get(key)
+        if isinstance(existing, dict) and existing.get("journal_id") == entry_id:
+            existing["outcome"] = entry.get("outcome", existing.get("outcome", ""))
+            existing["pending_id"] = entry.get("pending_id", existing.get("pending_id", ""))
+            continue
+        if isinstance(existing, dict):
+            try:
+                existing_ts = float(existing.get("updated_ts", existing.get("created_ts", 0)) or 0)
+            except (TypeError, ValueError):
+                existing_ts = 0
+            if existing_ts > timestamp:
+                continue
+            try:
+                version = max(1, int(existing.get("version", 1) or 1)) + 1
+            except (TypeError, ValueError):
+                version = 2
+        else:
+            version = 1
+        meta = {
+            "created_ts": timestamp,
+            "updated_ts": float(entry.get("finalized_ts", timestamp) or timestamp),
+            "version": version,
+            "journal_id": entry_id,
+            "name": name,
+            "kind": kind,
+            "action": proposal.get("action", ""),
+            "pattern_fingerprint": proposal.get("pattern_fingerprint", ""),
+            "expected_outcome": (
+                scrub_text(proposal["expected_outcome"]).strip()
+                if isinstance(proposal.get("expected_outcome"), str)
+                else ""
+            ),
+            "outcome": entry.get("outcome", ""),
+            "pending_id": entry.get("pending_id", ""),
+        }
+        llm_meta = entry.get("llm_meta")
+        if isinstance(llm_meta, dict) and llm_meta.get("reported_model"):
+            meta["reported_model"] = scrub_text(str(llm_meta["reported_model"]))[:60]
+        merged[key] = meta
+    return merged
+
+
+def audit(
+    current_patterns: Optional[List[Dict[str, Any]]] = None,
+    *,
+    journal_entries: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
     patterns_available = current_patterns is not None
     by_fingerprint = {
         str(item.get("fingerprint", "")): item for item in (current_patterns or [])
     }
     now = time.time()
     rows: List[Dict[str, Any]] = []
-    for key, meta in sorted(load_stats().items()):
+    merged_stats = _merge_journal_stats(load_stats(), journal_entries)
+    for key, meta in sorted(merged_stats.items()):
         # Legacy rows have no explicit name; their key is the name.
         name = str(meta.get("name") or key)
         created = meta.get("created_ts", 0) or now
@@ -256,7 +332,10 @@ def audit(current_patterns: Optional[List[Dict[str, Any]]] = None) -> List[Dict[
         fingerprint = str(meta.get("pattern_fingerprint", "") or "")
         recurred: Optional[bool] = None
 
-        if outcome == "pending_approval":
+        if outcome == "prepared":
+            uses, usage_scope = None, "unavailable"
+            verdict = "recovery needed"
+        elif outcome == "pending_approval":
             uses, usage_scope = None, "unavailable"
             verdict = "pending approval"
         elif outcome in ("rollback_prepared", "pending_rollback"):
@@ -276,13 +355,13 @@ def audit(current_patterns: Optional[List[Dict[str, Any]]] = None) -> List[Dict[
 
             if recurred is True:
                 verdict = "did not help"
-            elif uses == 0 and age_days >= 14:
+            elif uses == 0 and age_days >= 14 and usage_scope == "since_exact":
                 verdict = "unused"
             elif (
                 uses
                 and uses > 0
                 and recurred is False
-                and usage_scope in ("since_exact", "since_approx")
+                and usage_scope == "since_exact"
             ):
                 verdict = "working"
             else:

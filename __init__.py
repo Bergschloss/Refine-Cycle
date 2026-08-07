@@ -133,14 +133,20 @@ def _run_auto_refine(session_id: str, *, cleanup_session_notes: bool = False) ->
                 _clear_session_prompt_notes(session_id)
             return
         with journal.try_mutation_lock() as acquired:
-            if acquired and _cooldown_elapsed():
+            if not acquired:
+                message = "Automatic refine skipped because the mutation lock is busy"
+                logger.warning(message)
+                core.note_auto_event("mutation_lock_busy", message)
+            elif _cooldown_elapsed():
                 core.refine_run(
                     llm=_session_llm(),
                     session_id=session_id,
                     auto=True,
                 )
             if cleanup_session_notes:
-                _clear_session_prompt_notes(session_id)
+                _clear_session_prompt_notes(
+                    session_id, timeout=None if acquired else 0.0
+                )
     except Exception:
         logger.exception("refine auto hook failed")
     finally:
@@ -219,15 +225,27 @@ def _on_pre_llm_call(**kwargs) -> Optional[dict]:
 
 def _clear_session_prompt_notes(
     session_id: str, *, timeout: Optional[float] = None
-) -> None:
-    """Clear plugin-owned session notes without stalling a host callback."""
+) -> bool:
+    """Clear session notes without stalling, and expose failed cleanup."""
+    if not isinstance(session_id, str) or not session_id.strip():
+        return True
     try:
         if timeout is None:
-            journal.clear_session_prompt_notes(session_id)
+            removed = journal.clear_session_prompt_notes(session_id)
         else:
-            journal.clear_session_prompt_notes(session_id, timeout=timeout)
-    except Exception:
-        logger.debug("refine session prompt-note cleanup failed", exc_info=True)
+            removed = journal.clear_session_prompt_notes(session_id, timeout=timeout)
+        if removed is None:
+            message = "Session prompt-note cleanup did not complete"
+            logger.warning(message)
+            core.note_auto_event("prompt_note_cleanup_failed", message)
+            return False
+        return True
+    except Exception as exc:
+        safe_error = core.scrub_text(str(exc))
+        message = f"Session prompt-note cleanup failed: {safe_error}"
+        logger.warning(message)
+        core.note_auto_event("prompt_note_cleanup_failed", message)
+        return False
 
 
 def _on_session_reset(session_id: str = "", **kwargs) -> None:
@@ -373,6 +391,19 @@ def _handle_refine_command(raw_args: str) -> Optional[str]:
             + (f" @ {status['llm_provider']}" if status["llm_provider"] else "")
             + f" (source: {status['llm_target_source']})",
             f"journal: {status['journal_dir']} ({status['journal_dir_state_text']})",
+            (
+                (
+                    "storage: "
+                    if status['persistence']['total_bytes_complete']
+                    else "storage: at least "
+                )
+                + f"{status['persistence']['total_bytes']} bytes total; "
+                f"journal={status['persistence']['journal'].get('bytes')} bytes/"
+                f"{status['persistence']['journal'].get('physical_lines')} lines; "
+                f"backups={status['persistence']['backups'].get('count')}/"
+                f"{status['persistence']['backups'].get('bytes')} bytes; "
+                f"ledger={status['persistence']['ledger'].get('bytes')} bytes"
+            ),
             f"migration: {status['migration_outcome']}"
             + (
                 f" (active: {status['migration'].get('active_dir')})"
@@ -383,6 +414,12 @@ def _handle_refine_command(raw_args: str) -> Optional[str]:
         if status["cooldown_remaining_minutes"] > 0:
             lines.append(
                 f"cooldown remaining: {status['cooldown_remaining_minutes']} min"
+            )
+        if status["recent_auto_events"]:
+            lines.append("recent auto events:")
+            lines.extend(
+                f"  • {event.get('code', 'unknown')} — {event.get('message', '')}"
+                for event in status["recent_auto_events"][-3:]
             )
         if status["blockers"]:
             lines.append("blockers:")
@@ -572,6 +609,24 @@ def _on_session_end(
                 _run_auto_refine(session_id, cleanup_session_notes=True)
                 return
             evidence = core.collect_evidence(session_id=session_id, limit=30)
+            collection_status = str(evidence.get("collection_status", "ok"))
+            if collection_status != "ok":
+                logger.warning(
+                    "refine auto: evidence unavailable (%s); recording durable failure",
+                    core.scrub_text(collection_status),
+                )
+                entry_id = core.record_evidence_failure(
+                    session_id,
+                    collection_status,
+                    str(evidence.get("collection_error", "")),
+                    trigger="auto",
+                )
+                if not entry_id:
+                    core.note_auto_event(
+                        "evidence_failure_not_persisted",
+                        f"Evidence failure {collection_status} could not be journaled",
+                    )
+                return
             messages = evidence.get("messages", [])
             if len(messages) < config.auto_min_messages():
                 logger.debug("refine auto: not enough messages (%d)", len(messages))

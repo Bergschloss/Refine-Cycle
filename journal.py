@@ -9,6 +9,7 @@ import re
 import tempfile
 import threading
 import time
+import unicodedata
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -58,6 +59,82 @@ _MIGRATION_STATUS: Dict[str, Any] = {
 _MODEL_TOKEN_CHARS = r"[A-Za-z0-9._:\-]{1,120}"
 _MODEL_TOKEN = re.compile(rf"^{_MODEL_TOKEN_CHARS}$")
 _MODEL_ID = re.compile(rf"^{_MODEL_TOKEN_CHARS}(?:/{_MODEL_TOKEN_CHARS})*$")
+
+# A duplicate journal id is a state transition, not a replacement record. The
+# loader and writer share this table so hand-edited/cross-process records cannot
+# bypass checks that finalize() applies to normal writes.
+_JOURNAL_TRANSITIONS = {
+    "prepared": {"applied", "error", "pending_approval"},
+    "pending_approval": {"applied", "rejected"},
+    "applied": {"rollback_prepared"},
+    "rollback_prepared": {"pending_rollback", "rolled_back", "applied"},
+    "pending_rollback": {"rolled_back", "applied"},
+}
+_JOURNAL_IMMUTABLE_FIELDS = (
+    "id", "ts", "trigger", "reason", "session_id", "proposal",
+    "backup_path", "snapshot", "group", "llm_meta",
+)
+
+
+def prompt_note_content_is_structurally_safe(content: Any) -> bool:
+    """Reject markup/control characters that can restructure future context."""
+    if not isinstance(content, str) or "<" in content or ">" in content:
+        return False
+    for character in content:
+        if character == "\n":
+            continue
+        if unicodedata.category(character) in {"Cc", "Cf", "Cs", "Co", "Cn"}:
+            return False
+    return True
+
+
+def _journal_transition_error(
+    previous: Dict[str, Any], current: Dict[str, Any]
+) -> Optional[str]:
+    """Return why a duplicate-id state is forged or an illegal transition."""
+    before = str(previous.get("outcome", ""))
+    after = str(current.get("outcome", ""))
+    if after not in _JOURNAL_TRANSITIONS.get(before, set()):
+        return f"illegal journal transition {before!r} -> {after!r}"
+    for field in _JOURNAL_IMMUTABLE_FIELDS:
+        if previous.get(field) != current.get(field):
+            return f"journal transition changed immutable field {field!r}"
+
+    previous_recovery = previous.get("recovery", {})
+    current_recovery = current.get("recovery", {})
+    if not isinstance(previous_recovery, dict) or not isinstance(current_recovery, dict):
+        return "journal recovery metadata must be an object"
+    expected_recovery = dict(previous_recovery)
+    previous_pending_id = previous.get("pending_id")
+    current_pending_id = current.get("pending_id")
+    pending_id = current_pending_id
+    if after in {"pending_approval", "pending_rollback"}:
+        if not isinstance(pending_id, str) or not pending_id:
+            return "pending journal state requires a pending_id"
+        # Forward approval and rollback approval are separate phases; the latter
+        # legitimately replaces the earlier host pending id.
+        expected_recovery["pending_id"] = pending_id
+    elif current_pending_id != previous_pending_id:
+        return "non-pending journal transition changed pending_id"
+    if current_recovery != expected_recovery:
+        return "journal transition changed immutable recovery metadata"
+
+    finalized_ts = current.get("finalized_ts")
+    if (
+        not isinstance(finalized_ts, (int, float))
+        or isinstance(finalized_ts, bool)
+        or not math.isfinite(float(finalized_ts))
+    ):
+        return "journal transition requires a finite finalized_ts"
+    return None
+
+
+def _validate_journal_transition(
+    previous: Dict[str, Any], current: Dict[str, Any]
+) -> None:
+    error = _journal_transition_error(previous, current)
+    if error:
+        raise ValueError(error)
 
 
 def valid_model_identifier(value: str) -> bool:
@@ -593,6 +670,7 @@ def _normalize_prompt_note(note: Any) -> Optional[Dict[str, str]]:
         or not isinstance(content, str)
         or not content.strip()
         or scrub_text(content) != content
+        or not prompt_note_content_is_structurally_safe(content)
         or scope not in ("global", "session")
     ):
         return None
@@ -1031,15 +1109,14 @@ def _load_entries_state() -> "tuple[List[Dict[str, Any]], str]":
     order: List[str] = []
 
     def _read():
-        with path.open("r", encoding="utf-8", errors="replace") as handle:
+        with path.open("r", encoding="utf-8", errors="strict") as handle:
             for line in handle:
                 if not line.strip():
                     continue
                 try:
                     entry = json.loads(line)
-                except json.JSONDecodeError:
-                    logger.warning("Skipping corrupt journal line")
-                    continue
+                except json.JSONDecodeError as exc:
+                    raise ValueError("journal contains an invalid JSON record") from exc
                 if not isinstance(entry, dict):
                     raise ValueError("journal record must be an object")
                 entry_id = entry.get("id")
@@ -1058,6 +1135,8 @@ def _load_entries_state() -> "tuple[List[Dict[str, Any]], str]":
                     raise ValueError("journal record proposal must be an object")
                 if entry_id not in latest:
                     order.append(entry_id)
+                else:
+                    _validate_journal_transition(latest[entry_id], entry)
                 latest[entry_id] = entry
 
     try:
@@ -1264,6 +1343,7 @@ def finalize(
         recovery["pending_id"] = updated["pending_id"]
         updated["recovery"] = recovery
     updated["finalized_ts"] = time.time()
+    _validate_journal_transition(entry, updated)
     _append_entry(updated)
     return sanitize(updated)
 

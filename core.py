@@ -40,6 +40,32 @@ def _one_line(value: Any) -> str:
 
 _LAST_SESSION_ID = ""
 _LAST_SESSION_LOCK = threading.Lock()
+_AUTO_EVENTS: List[Dict[str, Any]] = []
+_LAST_AUTO_EVENT_LOCK = threading.Lock()
+_AUTO_EVENTS_MAX = 10
+_PERSISTENCE_WARNING_BYTES = 100 * 1024 * 1024
+
+
+def note_auto_event(code: str, message: str) -> None:
+    """Remember bounded, scrubbed background events for /refine status."""
+    event = {
+        "code": _one_line(scrub_text(code))[:64],
+        "message": _one_line(scrub_text(message))[:300],
+        "ts": time.time(),
+    }
+    with _LAST_AUTO_EVENT_LOCK:
+        _AUTO_EVENTS.append(event)
+        del _AUTO_EVENTS[:-_AUTO_EVENTS_MAX]
+
+
+def recent_auto_events() -> List[Dict[str, Any]]:
+    with _LAST_AUTO_EVENT_LOCK:
+        return [dict(event) for event in _AUTO_EVENTS]
+
+
+def last_auto_event() -> Dict[str, Any]:
+    events = recent_auto_events()
+    return events[-1] if events else {}
 
 
 def note_session_id(session_id: str) -> None:
@@ -108,7 +134,7 @@ def _open_db() -> Optional[sqlite3.Connection]:
         connection.row_factory = sqlite3.Row
         return connection
     except Exception as exc:
-        logger.warning("Cannot open state.db: %s", exc)
+        logger.warning("Cannot open state.db: %s", scrub_text(str(exc)))
         return None
 
 
@@ -220,15 +246,24 @@ def collect_evidence(session_id: Optional[str] = None, limit: int = 60) -> Dict[
         "user_corrections": [],
         "session_id": "",
         "session_id_source": "unknown",
+        "collection_status": "session_unknown",
+        "collection_error": "",
     }
     resolved, how = resolve_session_id(session_id or "")
     if not resolved:
         empty["session_id_source"] = how
         return empty
+    db_path = config.state_db_path()
+    if not db_path.is_file():
+        empty["session_id"] = resolved
+        empty["session_id_source"] = how
+        empty["collection_status"] = "db_absent"
+        return empty
     connection = _open_db()
     if not connection:
         empty["session_id"] = resolved
         empty["session_id_source"] = how
+        empty["collection_status"] = "db_unavailable"
         return empty
     try:
         sql = (
@@ -285,11 +320,16 @@ def collect_evidence(session_id: Optional[str] = None, limit: int = 60) -> Dict[
             "user_corrections": corrections[-5:],
             "session_id": resolved,
             "session_id_source": how,
+            "collection_status": "ok",
+            "collection_error": "",
         }
     except Exception as exc:
-        logger.warning("Current-session evidence query failed: %s", scrub_text(str(exc)))
+        safe_error = scrub_text(str(exc))
+        logger.warning("Current-session evidence query failed: %s", safe_error)
         empty["session_id"] = resolved
         empty["session_id_source"] = how
+        empty["collection_status"] = "query_error"
+        empty["collection_error"] = safe_error[:300]
         return empty
     finally:
         connection.close()
@@ -532,6 +572,84 @@ def _journal_dir_state(directory: Path) -> str:
         return "unknown"
 
 
+def _persistence_snapshot(directory: Path) -> Dict[str, Any]:
+    """Inspect plugin runtime storage without creating, mutating, or pruning it."""
+    def file_metric(path: Path) -> Dict[str, Any]:
+        try:
+            if not path.exists():
+                return {"state": "absent", "bytes": 0}
+            if not path.is_file():
+                return {"state": "unknown", "bytes": None}
+            return {"state": "ok", "bytes": path.stat().st_size}
+        except Exception:
+            return {"state": "unknown", "bytes": None}
+
+    journal_metric = file_metric(journal.journal_read_path())
+    journal_metric.update({"physical_lines": 0, "logical_entries": 0})
+    if journal_metric["state"] == "ok":
+        try:
+            with journal.journal_read_path().open("r", encoding="utf-8", errors="replace") as handle:
+                journal_metric["physical_lines"] = sum(1 for line in handle if line.strip())
+            loaded, state = journal._load_entries_safe()
+            journal_metric["state"] = state
+            journal_metric["logical_entries"] = len(loaded) if state == "ok" else None
+        except Exception:
+            journal_metric["state"] = "unknown"
+            journal_metric["logical_entries"] = None
+
+    backup_metric: Dict[str, Any] = {"state": "absent", "count": 0, "bytes": 0}
+    backup_dir = directory / "backups"
+    try:
+        if backup_dir.exists() and not backup_dir.is_dir():
+            backup_metric = {"state": "unknown", "count": None, "bytes": None}
+        elif backup_dir.is_dir():
+            files = [path for path in backup_dir.iterdir() if path.is_file()]
+            backup_metric = {
+                "state": "ok",
+                "count": len(files),
+                "bytes": sum(path.stat().st_size for path in files),
+            }
+    except Exception:
+        backup_metric = {"state": "unknown", "count": None, "bytes": None}
+
+    ledger_metric = file_metric(ledger.stats_read_path())
+    if ledger_metric["state"] == "ok":
+        try:
+            ledger.load_stats()
+            ledger_metric["readable"] = True
+        except IOError:
+            ledger_metric.update({"state": "unreadable", "readable": False})
+    else:
+        ledger_metric["readable"] = ledger_metric["state"] == "absent"
+
+    prompt_metric = file_metric(journal.prompt_notes_read_path())
+    if prompt_metric["state"] == "ok":
+        prompt_metric["readable"] = journal.load_prompt_notes() is not None
+        if not prompt_metric["readable"]:
+            prompt_metric["state"] = "unreadable"
+    else:
+        prompt_metric["readable"] = prompt_metric["state"] == "absent"
+    metrics = (journal_metric, backup_metric, ledger_metric, prompt_metric)
+    total_complete = all(isinstance(metric.get("bytes"), int) for metric in metrics)
+    byte_values = [
+        metric.get("bytes")
+        for metric in metrics
+        if isinstance(metric.get("bytes"), int)
+    ]
+    total_bytes = sum(byte_values)
+    return {
+        "journal": journal_metric,
+        "backups": backup_metric,
+        "ledger": ledger_metric,
+        "prompt_notes": prompt_metric,
+        "total_bytes": total_bytes,
+        "total_bytes_complete": total_complete,
+        "total_bytes_is_lower_bound": not total_complete,
+        "warning_threshold_bytes": _PERSISTENCE_WARNING_BYTES,
+        "over_warning_threshold": total_bytes >= _PERSISTENCE_WARNING_BYTES,
+    }
+
+
 def refine_status() -> Dict[str, Any]:
     """Report why automatic refinement will or will not run.
 
@@ -547,6 +665,7 @@ def refine_status() -> Dict[str, Any]:
     jdir = config.journal_dir()
     jdir_state = _journal_dir_state(jdir)
     migration = journal.migration_status()
+    persistence = _persistence_snapshot(jdir)
 
     # The effective model belongs in this report. A pinned model that no provider
     # serves turns every pass into an ordinary no_op, and without it here the
@@ -578,11 +697,9 @@ def refine_status() -> Dict[str, Any]:
         journal_path = journal.journal_read_path()
         journal_present = journal_path.is_file()
         if journal_present:
-            # An unparseable journal yields no entries rather than an error, so
-            # probe readability explicitly: silently reporting "0 edits today"
-            # would also report the cooldown as elapsed and let automatic passes
-            # run unthrottled against a journal nobody can read.
-            journal_path.read_text(encoding="utf-8")
+            _, state = journal._load_entries_safe()
+            if state != "ok":
+                raise IOError(f"journal state is {state}")
             edits_today = journal.count_today_applied()
             last_ts = journal.last_attempt_ts()
             cooldown_remaining = auto_cooldown_remaining_minutes()
@@ -632,6 +749,29 @@ def refine_status() -> Dict[str, Any]:
         })
 
     warnings: List[Dict[str, str]] = []
+    if not persistence["total_bytes_complete"]:
+        warnings.append({
+            "code": "persistence_size_unknown",
+            "message": (
+                "One or more runtime stores could not be sized; the displayed "
+                "storage value is only a lower bound"
+            ),
+        })
+    if persistence["over_warning_threshold"]:
+        warnings.append({
+            "code": "persistence_growth",
+            "message": (
+                "Refine runtime data uses "
+                f"{persistence['total_bytes']} bytes, above the read-only status "
+                f"warning threshold of {persistence['warning_threshold_bytes']} bytes"
+            ),
+        })
+    for store_name in ("ledger", "prompt_notes"):
+        if persistence[store_name].get("state") == "unreadable":
+            warnings.append({
+                "code": f"{store_name}_unreadable",
+                "message": f"The refine {store_name.replace('_', '-')} store is unreadable",
+            })
     if migration.get("outcome") == "failed":
         warnings.append({
             "code": "journal_migration_failed",
@@ -762,6 +902,9 @@ def refine_status() -> Dict[str, Any]:
         "journal_dir_state": jdir_state,
         "journal_dir_state_text": _JOURNAL_DIR_STATE_TEXT.get(jdir_state, jdir_state),
         "journal_dir_is_plugin_source": plugin_source_collision,
+        "persistence": persistence,
+        "last_auto_event": last_auto_event(),
+        "recent_auto_events": recent_auto_events(),
         "migration": migration,
         "migration_outcome": migration.get("outcome", "not_checked"),
         "session_id": sid,
@@ -783,10 +926,21 @@ def refine_status() -> Dict[str, Any]:
 
 
 def refine_audit() -> Dict[str, Any]:
-    with journal.mutation_lock():
-        _reconcile_pending()
     try:
-        earliest = ledger.earliest_created_ts()
+        with journal.mutation_lock():
+            _reconcile_pending()
+            journal_entries = journal.entries()
+    except Exception as exc:
+        safe_error = scrub_text(str(exc))
+        logger.error("Audit journal read failed: %s", safe_error)
+        return {
+            "success": False,
+            "complete": False,
+            "rows": [],
+            "report": "Audit incomplete: the refine journal is unreadable; no conclusions were drawn.",
+        }
+    try:
+        ledger_earliest = ledger.earliest_created_ts()
     except IOError as exc:
         safe_error = scrub_text(str(exc))
         logger.error("Audit ledger read failed: %s", safe_error)
@@ -796,6 +950,17 @@ def refine_audit() -> Dict[str, Any]:
             "rows": [],
             "report": "Audit incomplete: the refine ledger is unreadable; no conclusions were drawn.",
         }
+
+    journal_times = [
+        float(entry.get("ts", 0))
+        for entry in journal_entries
+        if entry.get("outcome") == "applied"
+        and isinstance(entry.get("proposal"), dict)
+        and entry["proposal"].get("action") in ("create", "patch")
+        and entry.get("ts")
+    ]
+    earliest_candidates = [value for value in [ledger_earliest, *journal_times] if value]
+    earliest = min(earliest_candidates) if earliest_candidates else None
 
     complete = True
     current: Optional[List[Dict[str, Any]]] = []
@@ -811,7 +976,7 @@ def refine_audit() -> Dict[str, Any]:
             logger.error("Audit pattern collection failed: %s", scrub_text(str(exc)))
             current = None
             complete = False
-    rows = ledger.audit(current)
+    rows = ledger.audit(current, journal_entries=journal_entries)
     report = ledger.format_audit(rows)
     if not complete:
         report = (
@@ -846,6 +1011,8 @@ def _prompt_note_content_error(
 ) -> Optional[str]:
     """Keep globally injected notes narrow, declarative, and renderable as one block."""
     lines = [line.strip() for line in content.splitlines() if line.strip()]
+    if not journal.prompt_note_content_is_structurally_safe(content):
+        return "Prompt note cannot contain markup or context-control characters"
     if not 1 <= len(lines) <= 2:
         return "Prompt note must contain one or two non-empty policy lines"
     if any(
@@ -1033,7 +1200,43 @@ def _journal_nonmutation(**kwargs: Any) -> Optional[str]:
     try:
         return journal.log(**kwargs)
     except Exception as exc:
-        logger.error("Cannot write refine journal: %s", exc)
+        logger.error("Cannot write refine journal: %s", scrub_text(str(exc)))
+        return None
+
+
+def record_evidence_failure(
+    session_id: str,
+    collection_status: str,
+    collection_error: str = "",
+    *,
+    trigger: str = "auto",
+    timeout: float = 30.0,
+) -> Optional[str]:
+    """Wait off the host callback, then durably record unavailable evidence."""
+    safe_status = _one_line(scrub_text(collection_status))[:64] or "unknown"
+    safe_error = _one_line(scrub_text(collection_error))[:300]
+    message = f"Current-session evidence is unavailable ({safe_status})."
+    try:
+        with journal.mutation_lock(timeout=timeout):
+            _, state = journal._load_entries_safe()
+            if state == "unreadable":
+                raise IOError("journal is unreadable")
+            return journal.log(
+                trigger=trigger,
+                reason=message,
+                session_id=session_id,
+                proposal={
+                    "action": "no_op",
+                    "reason": message,
+                    "expected_outcome": "",
+                },
+                outcome="evidence_unavailable",
+                error=safe_error or message,
+            )
+    except Exception as exc:
+        logger.error(
+            "Cannot durably record evidence failure: %s", scrub_text(str(exc))
+        )
         return None
 
 
@@ -1170,6 +1373,37 @@ def _refine_once(
     evidence["source_lookup_status"] = source_lookup_status
     session = resolved_session
     session_source = resolved_source
+    collection_status = str(evidence.get("collection_status", "ok"))
+    if collection_status != "ok":
+        failure_message = (
+            "Current-session evidence is unavailable "
+            f"({collection_status}); refine did not infer an empty session."
+        )
+        entry_id = _journal_nonmutation(
+            trigger=trigger,
+            reason=safe_reason or failure_message,
+            session_id=session,
+            proposal={
+                "action": "no_op",
+                "reason": failure_message,
+                "expected_outcome": "",
+            },
+            outcome="evidence_unavailable",
+            error=failure_message,
+        )
+        response = {
+            "success": False,
+            "outcome": "evidence_unavailable",
+            "failure": collection_status,
+            "message": failure_message,
+            "evidence": evidence,
+            "reversible": False,
+        }
+        if entry_id:
+            response["journal_id"] = entry_id
+        else:
+            response["message"] += " The failure could not be journaled."
+        return response
     if len(evidence.get("messages", [])) < 3:
         return {
             "success": True,
@@ -1201,6 +1435,7 @@ def _refine_once(
             lines.append(f"[{role}] {content}")
     evidence_text = "\n".join(lines)
     proposal_context = safe_reason
+    reviewer_context = ""
     if config.min_signal_required() and not patterns.has_signal(
         error_patterns, corrections, min_count=config.min_pattern_count()
     ):
@@ -1232,12 +1467,24 @@ def _refine_once(
                 and not reviewer.get("should_refine")
             )
             reviewer_outcome = (
-                "llm_error"
+                (
+                    "llm_incomplete"
+                    if reviewer_failure in {"malformed", "truncated", "no_final_text"}
+                    else "llm_error"
+                )
                 if reviewer_failure
                 else ("target_issue" if reviewer_target_issue else "no_op")
             )
             reviewer_error = (
-                "The reviewer model call failed."
+                (
+                    "The reviewer returned an incomplete or malformed verdict."
+                    if reviewer_failure in {"malformed", "truncated", "no_final_text"}
+                    else (
+                        "The host trust policy denied the reviewer model call."
+                        if reviewer_failure == "llm_trust_denied"
+                        else "The reviewer model call failed."
+                    )
+                )
                 if reviewer_failure
                 else (
                     "The configured refine model target is unusable."
@@ -1270,7 +1517,7 @@ def _refine_once(
             if reviewer_failure:
                 return {
                     "success": False,
-                    "outcome": "llm_error",
+                    "outcome": reviewer_outcome,
                     "failure": reviewer_failure,
                     "message": reviewer_error,
                     "journal_id": reviewer_entry_id,
@@ -1311,9 +1558,7 @@ def _refine_once(
                     "reversible": False,
                 }
             reviewer_instructions = scrub_text(str(reviewer.get("instructions", "")))
-            proposal_context = "\n".join(
-                part for part in (safe_reason, f"Reviewer-approved instructions: {reviewer_instructions}") if part
-            )
+            reviewer_context = reviewer_instructions
         else:
             proposal = {
                 "action": "no_op",
@@ -1353,6 +1598,7 @@ def _refine_once(
         refinement_history=journal.recent_refinements(config.history_max_entries()),
         purpose="refine",
         run_context=proposal_context,
+        reviewer_context=reviewer_context,
         skill_content_loader=journal.read_skill_content,
         target=_run_target,
     )
@@ -1385,15 +1631,18 @@ def _refine_once(
             ),
             "llm_call_error": "The refine model call failed.",
             "llm_trust_denied": "The host trust policy denied the refine model call.",
+            "local_safety": scrub_text(str(proposal.get("reason", "")))
+            or "The refine proposal could not be completed safely.",
         }
         failure_message = failure_messages.get(
             failure, "The refine proposal could not be completed."
         )
-        failure_outcome = (
-            "llm_error"
-            if failure in ("llm_call_error", "llm_trust_denied")
-            else "llm_incomplete"
-        )
+        if failure in ("llm_call_error", "llm_trust_denied"):
+            failure_outcome = "llm_error"
+        elif failure == "local_safety":
+            failure_outcome = "safety_blocked"
+        else:
+            failure_outcome = "llm_incomplete"
         entry_id = _journal_nonmutation(
             trigger=trigger,
             reason=safe_reason or failure_message,
