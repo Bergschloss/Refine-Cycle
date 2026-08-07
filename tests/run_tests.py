@@ -1566,6 +1566,20 @@ class RefineTests(unittest.TestCase):
         with patch.object(core, "collect_cross_session_patterns", return_value=[]) as collect:
             core.refine_audit()
         collect.assert_called_once_with(since_ts=created, max_rows=None, max_sessions=None)
+    def test_sanitize_handles_bytes_and_preserves_non_string_keys(self):
+        """Wave 2.6: bytes secrets scrubbed, non-string dict keys preserved."""
+        secret = b'api_key="bytesecret123456"'
+        result = sanitization.sanitize({"data": secret, 1: "ok", "nested": [secret]})
+        # bytes value is scrubbed
+        self.assertNotIn(b"bytesecret123456", result["data"])
+        self.assertIn(b"[REDACTED]", result["data"])
+        self.assertIsInstance(result["data"], bytes)
+        # int key preserved as int
+        self.assertIn(1, result)
+        self.assertNotIn("1", result)
+        # nested list bytes also scrubbed
+        self.assertNotIn(b"bytesecret123456", result["nested"][0])
+
     def test_credential_scrubbing_gaps_url_bearer_float(self):
         """Wave 2.5: token-only URLs, quoted Bearer, and float numbers."""
         # Token-only URL (no colon in userinfo)

@@ -97,8 +97,15 @@ def sanitize(value: Any) -> Any:
     """Recursively scrub every string in a journal- or model-bound value."""
     if isinstance(value, str):
         return scrub_text(value)
+    if isinstance(value, (bytes, bytearray)):
+        text = value.decode("utf-8", errors="replace")
+        scrubbed = scrub_text(text)
+        return type(value)(scrubbed.encode("utf-8", errors="replace"))
     if isinstance(value, dict):
-        return {scrub_text(str(key)): sanitize(item) for key, item in value.items()}
+        return {
+            (scrub_text(key) if isinstance(key, str) else key): sanitize(item)
+            for key, item in value.items()
+        }
     if isinstance(value, list):
         return [sanitize(item) for item in value]
     if isinstance(value, tuple):
