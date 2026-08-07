@@ -419,6 +419,15 @@ class RefineTests(unittest.TestCase):
         self.assertTrue(str(config.state_db_path()).startswith(str(self.root)))
         self.assertTrue(str(journal.journal_path()).startswith(str(self.root)))
 
+    def test_error_patterns_carry_resolved_session_id(self):
+        """Wave 2.2: error_items must use the resolved session, not the raw argument."""
+        result = core.collect_evidence()  # no explicit session_id argument
+        for pattern in result.get("error_patterns", []):
+            # session_id in pattern items must be non-empty (the resolved value)
+            self.assertTrue(pattern.get("session_id") or pattern.get("sessions_seen", 0) >= 1)
+        # The returned session_id must be the resolved one
+        self.assertEqual(result["session_id"], "session")
+
     def test_recursive_sanitation_covers_every_journal_field(self):
         entry_id = journal.log(
             trigger="manual", reason='password: "p@ss:w,rd!"', session_id="session",

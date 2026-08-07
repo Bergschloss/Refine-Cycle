@@ -255,7 +255,7 @@ def collect_evidence(session_id: Optional[str] = None, limit: int = 60) -> Dict[
                 error_items.append({
                     "tool": tool_name,
                     "content": bounded,
-                    "session_id": session_id,
+                    "session_id": resolved,
                     "ts": row["timestamp"] or 0,
                 })
             if role == "user" and _is_correction(content):
