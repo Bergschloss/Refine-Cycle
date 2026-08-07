@@ -8,6 +8,7 @@ under a fresh TemporaryDirectory; it never reads or writes live Hermes state.
 import importlib.util
 import inspect
 import json
+import os
 import shutil
 import subprocess
 from collections import Counter
@@ -4697,6 +4698,37 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
         FakeHost.entry_config()["skip_session_sources"] = "not a list"
         self.assertEqual(config.skip_session_sources(), ["cron"])
 
+    def test_config_string_coercion_and_cooldown_zero(self):
+        """Wave 2.9-2.12: config honors string bool/int and allows cooldown=0."""
+        # String booleans
+        FakeHost.entry_config()["auto_enabled"] = "false"
+        self.assertFalse(config.auto_enabled())
+        FakeHost.entry_config()["auto_enabled"] = "true"
+        self.assertTrue(config.auto_enabled())
+        FakeHost.entry_config()["auto_enabled"] = "yes"
+        self.assertTrue(config.auto_enabled())
+        # String integers
+        FakeHost.entry_config()["max_edits_per_day"] = "5"
+        self.assertEqual(config.max_edits_per_day(), 5)
+        # Cooldown zero
+        FakeHost.entry_config()["auto_cooldown_minutes"] = 0
+        self.assertEqual(config.auto_cooldown_minutes(), 0)
+        FakeHost.entry_config()["reviewer_cooldown_minutes"] = 0
+        self.assertEqual(config.reviewer_cooldown_minutes(), 0)
+
+    def test_journal_dir_expands_tilde_and_env_vars(self):
+        """Wave 2.9: ~/refine must expand to user home, not literal ./~/refine."""
+        FakeHost.entry_config()["journal_dir"] = "~/refine-data"
+        result = config.journal_dir()
+        self.assertNotIn("~", str(result))
+        self.assertTrue(str(result).startswith(str(Path.home())))
+
+    def test_hermes_home_respects_env_variable(self):
+        """Wave 2.12: HERMES_HOME env var used when hermes_constants unavailable."""
+        with patch.dict(os.environ, {"HERMES_HOME": "/custom/hermes"}), \
+             patch.dict(sys.modules, {"hermes_constants": None}):
+            self.assertEqual(config.hermes_home(), Path("/custom/hermes"))
+
     def test_source_read_failure_does_not_block_the_pass(self):
         # If the source cannot be read (missing column, etc.), the pass proceeds.
         with patch.object(core, "_get_session_source_status", return_value=("", "error")):
@@ -5035,7 +5067,7 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
         if config.os.name != "nt":
             self.skipTest("Windows-specific fallback")
         expected_root = self.root / "LocalAppData"
-        with patch.dict(config.os.environ, {"LOCALAPPDATA": str(expected_root)}), \
+        with patch.dict(config.os.environ, {"LOCALAPPDATA": str(expected_root), "HERMES_HOME": ""}), \
              patch.dict(sys.modules, {"hermes_constants": None}):
             self.assertEqual(config.hermes_home(), expected_root / "hermes")
 
