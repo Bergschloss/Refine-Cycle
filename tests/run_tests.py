@@ -1487,8 +1487,10 @@ class RefineTests(unittest.TestCase):
             self.assertNotIn("rollback:", ordinary)
             plugin_init._handle_refine_command("rollback abcdef123456")
             rollback.assert_called_once_with("abcdef123456")
-            plugin_init._handle_refine_command("rollback not-an-id")
-            self.assertEqual(run.call_args.kwargs["reason"], "rollback not-an-id")
+            # Invalid rollback syntax returns a usage error, not a refine pass.
+            invalid_result = plugin_init._handle_refine_command("rollback not-an-id")
+            self.assertIn("Invalid rollback format", invalid_result)
+            self.assertEqual(run.call_count, 1)  # only the "audit logging failures" call
 
     def test_ledger_uses_only_supported_post_edit_evidence(self):
         created = time.time() - 30 * 86400

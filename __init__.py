@@ -465,6 +465,12 @@ def _handle_refine_command(raw_args: str) -> Optional[str]:
         if result.get("success"):
             return f"✅ Rollback {entry_id}: {result.get('message', 'done')}"
         return f"❌ Rollback failed: {result.get('error', 'unknown error')}"
+    if args.startswith("rollback "):
+        return (
+            "❌ Invalid rollback format. Expected a 12-character hex journal ID.\n"
+            "Usage: /refine rollback <12-character journal_id>\n"
+            f"Find ids in {journal.journal_read_path()}"
+        )
 
     try:
         result = core.refine_run(llm=_session_llm(), reason=args, auto=False)
