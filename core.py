@@ -25,6 +25,65 @@ _UNTRUSTED_TOOL_TAG = re.compile(
     r"<\s*/?\s*untrusted_tool_result\s*>", re.IGNORECASE
 )
 _RECORD_SEPARATOR = re.compile(r"[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]+")
+_RESOURCE_REFERENCE = re.compile(
+    r"""(?ix)
+    (?: [a-z]+:// )                         # any URL scheme
+    | (?: ~[/\\] | (?<![\w.])[/\\][\w.] )   # absolute or home-relative path
+    | (?: [A-Za-z]: (?=\S) )                    # absolute or drive-relative Windows path
+    | (?: \$\{?\w+ | %\w+% )                # environment expansion
+    | [`|;&><$]                               # shell metacharacters
+    """
+)
+_RESOURCE_NETWORK_OR_SHELL = re.compile(r"(?ix)(?:[a-z]+://|[`|;&><$])")
+_HOST_REFERENCE = re.compile(
+    r"""(?ix)
+    (?:
+        (?<![\w.-])(?:[a-z0-9-]+\.)+[a-z]{2,63}(?![\w.-]) # dotted hostname
+        | \b(?:localhost|intranet)\b                         # common bare hostnames
+        | \b(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}\b # IPv4
+        | \b127(?:\.\d{1,3}){1,3}\b                       # abbreviated IPv4 loopback
+        | \b(?:2130706433|0x7f000001|017700000001)\b         # numeric IPv4 loopback
+        | \[(?:[0-9a-f]{0,4}:){2,7}[0-9a-f:]*\]              # bracketed IPv6
+        | (?<![0-9a-f])(?:[0-9a-f]{0,4}:){2,7}[0-9a-f:]*(?![0-9a-f:]) # bare IPv6
+    )
+    """
+)
+_OVERRIDE_INTENT = re.compile(
+    r"(?i)\b(?:ignore|disregard|override|bypass|skip|forget|regardless of|instead of)\b"
+)
+_HIGHER_PRIORITY_GUIDANCE = re.compile(
+    r"(?i)\b(?:developer|system|prompt|instruction|guidance|constraint|policy|rule|guardrail)\b"
+)
+_PROMPT_NOTE_FORMAT = re.compile(r"(?i)^when\s+[^,\n]{3,200},\s+\S")
+_PROMPT_NOTE_CONDITION = re.compile(r"(?i)^when\s+([^,\n]{3,200}),\s+\S")
+_PROMPT_NOTE_ACTION = re.compile(r"(?i)^when\s+[^,\n]{3,200},\s+(.+?)\s*$")
+_PROMPT_NOTE_SAFE_TARGET = r"""
+(?:(?:the|this|its|an?|expected|relevant|exact)\s+)+
+(?:endpoint|parameters?|target|response|result|output|value|shape|error|failure|tests?|request|details?)
+(?:\s+(?:and|or|the|this|its|expected|relevant|exact|endpoint|parameters?|target|response|result|output|value|shape|error|failure|tests?|request|details?))*
+"""
+_PROMPT_NOTE_SAFE_ACTION = re.compile(
+    rf"""(?ix)
+    (?:
+        (?:check|confirm|inspect|verify)\s+(?:{_PROMPT_NOTE_SAFE_TARGET})(?:\s+before\s+(?:acting|continuing))?
+        | confirm\s+it(?:\s+before\s+acting)?
+        | confirm\s+it['’]s\s+clear,\s+concise,\s+and\s+accurate
+        | avoid\s+(?:unsupported\s+claims|speculation|unnecessary\s+changes)
+        | ask\s+(?:for\s+clarification|(?:a|one)\s+focused\s+question)
+        | follow\s+(?:the\s+)?(?:old|current|existing|established)\s+(?:policy|guidance)
+        | keep\s+(?:the\s+)?(?:response|result|scope|change|policy)\s+(?:narrow|concise|minimal|focused)
+        | log\s+(?:the\s+)?(?:error|failure|outcome)
+        | mention\s+(?:the\s+)?(?:limitation|uncertainty|assumption)(?:\s+plainly)?
+        | prefer\s+(?:unified|concise|clear|minimal)\s+(?:format|response|summary)
+        | redact\s+(?:credentials?|secrets?|sensitive\s+(?:data|values?)|api[_-]?key(?:\s*=\s*["']?\[REDACTED\]["']?)?)
+        | reject\s+(?:it|the\s+(?:invalid\s+)?(?:target|request|response|result))
+        | retry\s+(?:the\s+|this\s+)?request
+        | summarize\s+(?:the\s+)?(?:common\s+cause|error|failure|result|outcome)
+        | use\s+the\s+(?:supplied|provided|exact)\s+(?:spelling|name|format)
+        | wait\s+for\s+(?:clarification|confirmation|approval|input)
+    )\.?
+    """
+)
 
 
 def _one_line(value: Any) -> str:
@@ -624,11 +683,19 @@ def _persistence_snapshot(directory: Path) -> Dict[str, Any]:
 
     prompt_metric = file_metric(journal.prompt_notes_read_path())
     if prompt_metric["state"] == "ok":
-        prompt_metric["readable"] = journal.load_prompt_notes() is not None
-        if not prompt_metric["readable"]:
-            prompt_metric["state"] = "unreadable"
+        notes = journal.load_prompt_notes()
+        prompt_metric["readable"] = notes is not None
+        if notes is None:
+            prompt_metric.update({"state": "unreadable", "not_injected_count": None})
+        else:
+            prompt_metric["not_injected_count"] = sum(
+                1
+                for note in notes
+                if _stored_prompt_note_content_error(note["content"])
+            )
     else:
         prompt_metric["readable"] = prompt_metric["state"] == "absent"
+        prompt_metric["not_injected_count"] = 0 if prompt_metric["readable"] else None
     metrics = (journal_metric, backup_metric, ledger_metric, prompt_metric)
     total_complete = all(isinstance(metric.get("bytes"), int) for metric in metrics)
     byte_values = [
@@ -772,6 +839,15 @@ def refine_status() -> Dict[str, Any]:
                 "code": f"{store_name}_unreadable",
                 "message": f"The refine {store_name.replace('_', '-')} store is unreadable",
             })
+    invalid_prompt_notes = persistence["prompt_notes"].get("not_injected_count")
+    if isinstance(invalid_prompt_notes, int) and invalid_prompt_notes:
+        warnings.append({
+            "code": "prompt_notes_invalid",
+            "message": (
+                f"{invalid_prompt_notes} stored prompt note(s) do not meet the current "
+                "injection policy and will not be injected"
+            ),
+        })
     if migration.get("outcome") == "failed":
         warnings.append({
             "code": "journal_migration_failed",
@@ -1020,14 +1096,28 @@ def _prompt_note_content_error(
         for line in lines
     ):
         return "Prompt note must be a policy, not a list or procedure"
-    first_line = lines[0]
-    if not re.match(r"(?i)^when\s+[^,\n]{3,200},\s+\S", first_line):
+    if not _PROMPT_NOTE_FORMAT.match(lines[0]):
         return "Prompt note must use 'When <specific condition>, <one action>.'"
-    if len(lines) > 1 and not re.match(r"(?i)^when\s+[^,\n]{3,200},\s+\S", lines[1]):
+    if len(lines) > 1 and not _PROMPT_NOTE_FORMAT.match(lines[1]):
         return "Every line of a prompt note must use 'When <specific condition>, <one action>.'"
-    blocked_terms = r"(?i)\b(?:always|never|ignore|system prompt|instruction|any user|all users|every request|first|then|finally)\b"
-    if any(re.search(blocked_terms, line) for line in lines):
-        return "Prompt note must be a narrow conditional policy, not a global or procedural instruction"
+    if any(
+        _RESOURCE_REFERENCE.search(line) or _HOST_REFERENCE.search(line)
+        for line in lines
+    ):
+        if any(_RESOURCE_NETWORK_OR_SHELL.search(line) for line in lines):
+            return "Prompt note cannot reference URLs, commands, or shell syntax"
+        if any(_HOST_REFERENCE.search(line) for line in lines):
+            return "Prompt note cannot reference hosts"
+        return "Prompt note cannot reference file paths or environment variables"
+    if any(_OVERRIDE_INTENT.search(line) for line in lines):
+        return "Prompt note cannot override prior guidance"
+    for line in lines:
+        condition_match = _PROMPT_NOTE_CONDITION.match(line)
+        if not condition_match or _HIGHER_PRIORITY_GUIDANCE.search(condition_match.group(1)):
+            return "Prompt note condition cannot refer to higher-priority guidance"
+        action_match = _PROMPT_NOTE_ACTION.match(line)
+        if not action_match or not _PROMPT_NOTE_SAFE_ACTION.fullmatch(action_match.group(1)):
+            return "Prompt note action must match an approved behavioral policy"
     rendered = "Refine notes:\n- " + content
     per_note_limit = max(
         1, config.prompt_notes_max_chars() // config.prompt_notes_max_count()
@@ -1038,6 +1128,14 @@ def _prompt_note_content_error(
             f"{per_note_limit})"
         )
     return None
+
+
+def _stored_prompt_note_content_error(content: Any) -> Optional[str]:
+    """Return the semantic injection error for a structurally stored note."""
+    safe_content = scrub_text(str(content)).strip()
+    if not safe_content:
+        return "Prompt note is empty after scrubbing"
+    return _prompt_note_content_error(safe_content, check_rendered_size=False)
 
 
 def _validate_proposal(proposal: Dict[str, Any]) -> Optional[str]:

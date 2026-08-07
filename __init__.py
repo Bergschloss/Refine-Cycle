@@ -203,7 +203,12 @@ def _on_pre_llm_call(**kwargs) -> Optional[dict]:
             if scope == "session" and note.get("session_id") != session_id:
                 continue
             content = core.scrub_text(note["content"]).strip()
-            if not content or core._prompt_note_content_error(content, check_rendered_size=False):
+            content_error = core._stored_prompt_note_content_error(content)
+            if content_error:
+                core.note_auto_event(
+                    "prompt_note_not_injected",
+                    f"Prompt note {note['id']} was not injected: {content_error}",
+                )
                 continue
             selected.append({"id": note["id"], "content": content})
         if not selected:
