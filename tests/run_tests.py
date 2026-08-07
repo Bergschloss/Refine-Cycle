@@ -1110,6 +1110,49 @@ class RefineTests(unittest.TestCase):
         self.assertNotIn("prepare-fail", FakeHost.skills)
         self.assertNotIn("unsafe!value", json.dumps(result))
 
+    def test_journal_unreadable_blocks_budget_and_dedup(self):
+        """Wave 1.1: unreadable journal must fail closed — budget ∞ and dedup disabled."""
+        # Write a valid entry so the journal file exists.
+        journal.log(
+            trigger="manual", reason="exists", session_id="s",
+            proposal={"action": "no_op"}, outcome="applied",
+        )
+        # Simulate persistent PermissionError on file open.
+        real_open = Path.open
+
+        def deny_open(self_path, *args, **kwargs):
+            if self_path.name == "refine_journal.jsonl":
+                raise PermissionError("Access denied")
+            return real_open(self_path, *args, **kwargs)
+
+        with patch.object(Path, "open", deny_open):
+            self.assertTrue(journal.daily_limit_reached())
+            self.assertTrue(journal.was_applied_recently({"kind": "skill", "name": "x", "content": "y"}, 7))
+            result = core.refine_run(MockLlm(), session_id="session")
+            self.assertFalse(result["success"])
+            self.assertEqual(result["outcome"], "journal_unreadable")
+
+    def test_journal_transient_permission_error_retries_then_succeeds(self):
+        """A single transient PermissionError is retried and reading succeeds."""
+        journal.log(
+            trigger="manual", reason="recoverable", session_id="s",
+            proposal={"action": "no_op"}, outcome="no_op",
+        )
+        real_open = Path.open
+        calls = {"n": 0}
+
+        def flaky_open(self_path, *args, **kwargs):
+            if self_path.name == "refine_journal.jsonl":
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise PermissionError("Momentary lock")
+            return real_open(self_path, *args, **kwargs)
+
+        with patch.object(Path, "open", flaky_open):
+            entries, state = journal._load_entries_safe()
+        self.assertEqual(state, "ok")
+        self.assertTrue(len(entries) >= 1)
+
     def test_journal_append_preserves_history_and_recovers_after_corrupt_tail(self):
         first = journal.log(
             trigger="test", reason="first", session_id="s",

@@ -993,6 +993,17 @@ def _refine_once(
     started = time.time()
     safe_reason = scrub_text(reason)
 
+    # Fail closed when journal is unreadable: without history the budget, dedup,
+    # and context guards are all bypassed. Must be distinguishable from no_op.
+    _, journal_state = journal._load_entries_safe()
+    if journal_state == "unreadable":
+        return {
+            "success": False,
+            "outcome": "journal_unreadable",
+            "message": "Journal could not be read; refine did not run to avoid bypassing budget limits.",
+            "reversible": False,
+        }
+
     resolved_session, resolved_source = resolve_session_id(session_id or "")
     if not resolved_session:
         evidence = {
@@ -2129,7 +2140,15 @@ def refine_run(
     """Serialize a run, reconcile approvals, and preserve every recovery id."""
     started = time.time()
     with journal.mutation_lock():
-        _reconcile_pending()
+        try:
+            _reconcile_pending()
+        except IOError:
+            return {
+                "success": False,
+                "outcome": "journal_unreadable",
+                "message": "Journal could not be read; refine did not run to avoid bypassing budget limits.",
+                "reversible": False,
+            }
 
         if dry_run:
             # Dry-run: one proposal pass, no apply, no budget consumed.

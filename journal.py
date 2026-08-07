@@ -983,13 +983,18 @@ def _atomic_write_text(path: Path, content: str) -> None:
 
 
 def _load_entries() -> List[Dict[str, Any]]:
-    """Stream journal state, skipping corrupt lines and collapsing updates by id."""
+    """Stream journal state, skipping corrupt lines and collapsing updates by id.
+
+    Returns [] only when the file is genuinely absent. A transient read failure
+    raises IOError so callers fail closed rather than assuming an empty journal.
+    """
     path = journal_read_path()
     if not path.is_file():
         return []
     latest: Dict[str, Dict[str, Any]] = {}
     order: List[str] = []
-    try:
+
+    def _read():
         with path.open("r", encoding="utf-8", errors="replace") as handle:
             for line in handle:
                 if not line.strip():
@@ -1005,10 +1010,25 @@ def _load_entries() -> List[Dict[str, Any]]:
                 if entry_id not in latest:
                     order.append(entry_id)
                 latest[entry_id] = entry
+
+    try:
+        _retry_on_contention(_read, _READ_RETRY_BUDGET_SECONDS)
     except Exception as exc:
-        logger.warning("Failed to read journal: %s", scrub_text(str(exc)))
-        return []
+        logger.error("Failed to read journal: %s", scrub_text(str(exc)))
+        raise IOError(f"Journal unreadable: {scrub_text(str(exc))}") from exc
     return [latest[entry_id] for entry_id in order]
+
+
+def _load_entries_safe() -> "tuple[List[Dict[str, Any]], str]":
+    """Return (entries, state) where state is 'ok', 'absent', or 'unreadable'."""
+    path = journal_read_path()
+    if not path.is_file():
+        return [], "absent"
+    try:
+        return _load_entries(), "ok"
+    except IOError:
+        return [], "unreadable"
+
 
 
 def entries() -> List[Dict[str, Any]]:
@@ -1228,13 +1248,21 @@ def is_reversible(entry: Optional[Dict[str, Any]]) -> bool:
 
 
 def count_today_applied() -> int:
-    """Count today's edits that are applied, reserved, or rollback-in-flight."""
+    """Count today's edits that are applied, reserved, or rollback-in-flight.
+
+    Returns max_edits_per_day() when the journal is unreadable, so the budget
+    gate stays closed rather than silently allowing unlimited edits.
+    """
     today = datetime.now(timezone.utc).date()
     consumed = {
         "applied", "pending_approval", "prepared", "rollback_prepared", "pending_rollback"
     }
+    try:
+        all_entries = _load_entries()
+    except IOError:
+        return max_edits_per_day()
     count = 0
-    for entry in _load_entries():
+    for entry in all_entries:
         if entry.get("outcome") not in consumed:
             continue
         try:
@@ -1249,6 +1277,25 @@ def daily_limit_reached() -> bool:
     return count_today_applied() >= max_edits_per_day()
 
 
+def was_applied_recently(proposal: Dict[str, Any], within_days: int) -> bool:
+    """Return True when an identical edit exists or journal is unreadable (fail closed)."""
+    target = proposal_hash(proposal)
+    cutoff = time.time() - (within_days * 86400)
+    consumed = {
+        "applied", "pending_approval", "prepared", "rollback_prepared", "pending_rollback"
+    }
+    try:
+        all_entries = _load_entries()
+    except IOError:
+        return True
+    for entry in all_entries:
+        if entry.get("outcome") not in consumed:
+            continue
+        if (entry.get("ts") or 0) >= cutoff and proposal_hash(entry.get("proposal", {})) == target:
+            return True
+    return False
+
+
 def proposal_hash(proposal: Dict[str, Any]) -> str:
     key = "|".join([
         str(proposal.get("kind", "")),
@@ -1257,19 +1304,6 @@ def proposal_hash(proposal: Dict[str, Any]) -> str:
     ])
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
 
-
-def was_applied_recently(proposal: Dict[str, Any], within_days: int) -> bool:
-    target = proposal_hash(proposal)
-    cutoff = time.time() - (within_days * 86400)
-    consumed = {
-        "applied", "pending_approval", "prepared", "rollback_prepared", "pending_rollback"
-    }
-    for entry in _load_entries():
-        if entry.get("outcome") not in consumed:
-            continue
-        if (entry.get("ts") or 0) >= cutoff and proposal_hash(entry.get("proposal", {})) == target:
-            return True
-    return False
 
 
 # ── recovery metadata and target-state proof ───────────────────────────────
