@@ -133,6 +133,7 @@ Then check that automatic refinement can actually run:
 # min messages: 15
 # cooldown: 20 min
 # edits today: 0/3
+# model: deepseek-v4-flash @ opencode-go (source: live)
 # journal: /home/you/.hermes/refine-data (does not exist yet, will be created on first write)
 # blockers: none — automatic refinement is active
 ```
@@ -157,13 +158,42 @@ toward the budget it reports.
 /refine focus on Gmail API failures
 /refine audit
 /refine status
+/refine model
+/refine model deepseek-v4-flash
+/refine model opencode-go/deepseek-v4
+/refine model auto
 /refine rollback 1f2a3b4c5d6e
 ```
 
-`audit` and `rollback <12-character-id>` are exact subcommands. `status`
-reports whether automatic refinement is active, what blocks it, and whether
-the journal directory is safe. Other text, including reasons beginning with
-those words, is passed to the proposal model as the manual reason.
+`audit`, `status`, `model`, and `rollback <12-character-id>` are exact
+subcommands. `status` reports whether automatic refinement is active, what
+blocks it, which model it will use, and whether the journal directory is safe.
+
+`model` shows or sets the model refine asks for. Bare `model` prints the
+effective target and whether host trust allows it; `model <name>` or
+`model <provider>/<name>` pins one; `model auto` removes the override. `auto`
+returns to the next source in the priority order, which is the configured
+`plugins.entries.refine.llm` value when there is one, and the live Hermes model
+only when there is not. The override is stored in `model_override.json` inside
+`journal_dir` — refine never writes to the Hermes config.
+
+Both stores are validated the same way: a provider must be a single token, a
+model id may be namespaced, and a value matching a credential pattern is refused
+rather than stored. A configured value that fails either rule is dropped and
+reported in `/refine status` and `/refine model`.
+
+In the command, **the first slash is always the provider separator** and every
+later one belongs to the model id: `/refine model openrouter/deepseek/deepseek-chat`
+pins provider `openrouter` and model `deepseek/deepseek-chat`. There is therefore
+no command form for a namespaced model with no provider — set
+`plugins.entries.refine.llm.model` for that. And a pinned provider only reaches
+the host when `allow_provider_override` is true, which `/refine model` reports.
+
+Other text is passed to the proposal model as the manual reason. That includes
+text beginning with a subcommand word, with one deliberate exception: after
+`model`, a single token shaped like an identifier (`deepseek-v4`, `a/b`) is
+treated as a target, so `/refine model drift` pins a model rather than asking for
+a refinement about drift. Use `/refine drift` or `/refine model auto` to undo.
 
 ### Automatic refinement
 
@@ -323,13 +353,21 @@ model is read from a process-local runtime override that the agent refreshes at
 the top of every turn. So a model switched mid-session is intended to apply to
 refine as well, without any plugin-side plumbing.
 
-One caveat is worth knowing, because it is not a refine bug and refine cannot
-fix it: Hermes caches auxiliary clients under a key that does **not** include
-the resolved model, and the plugin call passes no live-runtime dict, so the key
-is constant. In a long-running gateway the first cached client keeps supplying
-the model captured when it was built, which can outlive a mid-session switch
-until that entry is evicted or the process restarts. Restarting the gateway is
-the reliable way to clear it.
+One caveat is worth knowing, and it depends on the Hermes version. On Hermes
+builds older than 2026-07-17, auxiliary clients are cached under a key that does
+**not** include the resolved model; a plugin call passes no live-runtime dict, so
+the key is constant and the first cached client keeps supplying the model
+captured when it was built, outliving a mid-session switch until the entry is
+evicted or the process restarts. Upstream closed this in `73057ed16`
+("scope runtime state to each turn") and `fdc6c32d7` ("isolate runtime cache by
+live context"), both dated 2026-07-17 — verified by reading the Hermes repository,
+not from this one, so re-check against your own checkout before relying on it.
+Never a refine bug either way; on an older host, restarting the gateway clears it.
+
+`/refine model` reports which source **refine** resolved, and with `source: live`
+the value it read from the host at that moment. It cannot report which model a
+cached host client will actually use, so on an older host it is not a way to
+confirm a mid-session switch took effect. Restart the gateway, or pin the target.
 
 Pinning refine's own target sidesteps all of that and makes the choice
 deterministic:
@@ -367,7 +405,7 @@ All keys live under `plugins.entries.refine`:
 | `max_edits_per_proposal` | int | `3` | Maximum inseparable edits one proposal may apply as a single transaction. `1` disables transactions. |
 | `max_edits_per_day` | int | `3` | Maximum applied, pending, or prepared **edits** per UTC day. This is the blast-radius limit and is re-checked before every edit. |
 | `only_agent_created` | bool | `true` | Only patch agent-created skills. |
-| `journal_dir` | path | `<HERMES_HOME>/plugins/refine` | Journal, lock, ledger, backups, and prompt notes. |
+| `journal_dir` | path | `<HERMES_HOME>/plugins/refine` | Journal, lock, ledger, backups, prompt notes, and the `/refine model` override. |
 | `overview_max_entries` | int | `40` | Existing skills and memory snippets listed per kind in a proposal prompt. |
 | `overview_max_chars` | int | `240` | Maximum characters in each structured overview or history line. |
 | `history_max_entries` | int | `20` | Recent create/patch outcomes fed back into a proposal prompt. |
@@ -412,14 +450,23 @@ llm:
   reasoning and no final text is reported as `llm_incomplete`; pin a
   non-reasoning model for refine with `plugins.entries.refine.llm` (`model` /
   `provider`) under the existing trust policy when that mitigation is needed.
-- **A model switch can be masked by Hermes's auxiliary client cache:** plugin
-  calls resolve through the `auto` path, which prefers the live main model, but
-  the client cache key omits the resolved model and the plugin call supplies no
-  live-runtime dict, so the key never changes. A cached client therefore keeps
-  its original model until it is evicted or the process restarts. Refine cannot
-  close this from the plugin side; the fix is host-side (include the resolved
-  model in the cache key, or pass the live runtime through the plugin call).
-  Pin `llm.model` / `llm.provider` when a deterministic target is needed.
+- **A model switch can be masked by Hermes's auxiliary client cache, on older
+  hosts only:** plugin calls resolve through the `auto` path, which prefers the
+  live main model, but before `73057ed16` / `fdc6c32d7` (both 2026-07-17) the
+  client cache key omitted the resolved model and a plugin call supplied no
+  live-runtime dict, so the key never changed and a cached client kept its
+  original model until eviction or restart. Refine cannot close this from the
+  plugin side and does not try, and it cannot detect which host version it runs
+  on, so `/refine model` cannot tell you whether you are affected. On a current
+  host it is fixed; otherwise restart the gateway or pin `llm.model` /
+  `llm.provider`.
+- **The live main model is read through a private host API:** `live_main_target()`
+  imports `_read_main_provider` / `_read_main_model` from
+  `agent.auxiliary_client`. Hermes exposes no public accessor. Both names were
+  confirmed present in a real installation, but a private name can move without
+  notice, so the import is guarded and simply yields no live value on failure —
+  `/refine model` then reports `source: host_default` rather than claiming a
+  target it does not have.
 - **No host approval for the prompt-note store:** it is a plugin-owned atomic
   file, not a host memory or skill write. Host-managed skill and memory changes
   still respect staged approvals and reconciliation.
@@ -501,7 +548,7 @@ cd <HERMES_HOME>/plugins/refine
 python -m tests.run_tests
 ```
 
-The stdlib-only suite (138 tests) installs a fake Hermes host before importing the plugin.
+The stdlib-only suite (197 tests) installs a fake Hermes host before importing the plugin.
 Every database, journal, backup, skill, memory file, ledger, and lock lives
 under a fresh `TemporaryDirectory`; running the suite cannot touch live Hermes
 or profile state. It covers proposal completion, host action mapping,

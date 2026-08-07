@@ -68,6 +68,7 @@ def record_edit(
     *,
     outcome: str = "applied",
     pending_id: str = "",
+    llm_meta: Optional[Dict[str, Any]] = None,
 ) -> None:
     name = str(proposal.get("name", "")).strip()
     if not name:
@@ -114,6 +115,11 @@ def record_edit(
             "outcome": outcome,
             "pending_id": pending_id,
         }
+        # LLM attribution for the audit display — additive.
+        if isinstance(llm_meta, dict) and llm_meta.get("reported_model"):
+            stats[key]["reported_model"] = scrub_text(
+                str(llm_meta["reported_model"])
+            )[:60]
         _save_stats(stats)
 
 
@@ -313,6 +319,9 @@ def format_audit(rows: List[Dict[str, Any]]) -> str:
         )
         expected_outcome = str(row.get("expected_outcome", "") or "—")
         lines.append(f"      expects: {expected_outcome[:57]}")
+        reported_model = str(row.get("reported_model", "") or "")
+        if reported_model:
+            lines.append(f"      model: {reported_model[:40]}")
 
     candidates = [row for row in rows if row["verdict"] in ("unused", "did not help")]
     if candidates:

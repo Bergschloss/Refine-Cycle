@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
@@ -30,6 +31,77 @@ _LOCK_FILE_NAME = ".mutation.lock"
 _LOCK_STALE_SECONDS = 300
 _THREAD_LOCK = threading.RLock()
 _LOCK_STATE = threading.local()
+
+# Owned here rather than in the command layer, because this module owns the
+# store: the same rule then applies to the command, to a hand-edited file, and
+# to any future writer, instead of once per call site.
+#
+# Two shapes, not one. In ``/refine model <provider>/<model>`` the slash is the
+# separator, so each half must not contain one. A model *id*, however, is very
+# often namespaced — ``deepseek/deepseek-chat``, ``anthropic/claude-3.5-sonnet``
+# — so the id rule has to allow it. Applying the token rule to a configured
+# ``llm.model`` would silently discard exactly the ids people pin.
+_MODEL_TOKEN_CHARS = r"[A-Za-z0-9._:\-]{1,120}"
+_MODEL_TOKEN = re.compile(rf"^{_MODEL_TOKEN_CHARS}$")
+_MODEL_ID = re.compile(rf"^{_MODEL_TOKEN_CHARS}(?:/{_MODEL_TOKEN_CHARS})*$")
+
+
+def valid_model_identifier(value: str) -> bool:
+    """Whether text is one slash-free provider/model token, not free-form prose.
+
+    Requires at least one alphanumeric character: ``.`` and ``---`` match the
+    character class but name no model, and pinning one would turn every later
+    pass into a host-side model error.
+    """
+    return bool(_MODEL_TOKEN.fullmatch(value)) and any(
+        char.isalnum() for char in value
+    )
+
+
+def valid_model_id(value: str) -> bool:
+    """Whether text is a model id, allowing the common namespaced form."""
+    return bool(_MODEL_ID.fullmatch(value)) and any(
+        char.isalnum() for char in value
+    )
+
+
+def model_override_field_problem(value: str, *, allow_namespace: bool = False) -> str:
+    """Say why a provider/model value is unusable, or "" when it is fine.
+
+    Set ``allow_namespace`` for a model id, which may be ``vendor/name``; leave it
+    off for a value that came from one side of the command's ``provider/model``
+    split, where a slash cannot appear.
+
+    Returns a reason rather than a bool so the refusal can name which rule failed.
+    "Refusing an unsafe value" reads as a credential accusation for a name that
+    merely had the wrong shape, and vice versa — and the caller must be able to
+    explain the refusal without echoing the value, which may be a pasted secret.
+
+    Public because the Hermes config writes the same field. If the rule lived on
+    the command path only, the identical value would be refused from
+    ``/refine model`` and accepted from ``config.yaml``.
+    """
+    accepted = valid_model_id(value) if allow_namespace else valid_model_identifier(value)
+    if not accepted:
+        return (
+            "it is not a model identifier (letters, digits, '.', '_', ':', '-'"
+            + (", '/'" if allow_namespace else "")
+            + ", at least one alphanumeric)"
+        )
+    # The check that matters most. ``ghp_`` + 36 characters is a valid identifier,
+    # so shape alone would persist a pasted token verbatim while the command echo
+    # reported it redacted — telling the user a value was protected when it
+    # was not. It can also fire on a legitimate name such as
+    # ``my-token-model:latest``; refusing that is the safe side of the trade, and
+    # the message says which rule rejected it.
+    if scrub_text(value) != value:
+        return "it matches a credential pattern, so it is refused rather than stored"
+    return ""
+
+
+def model_override_field_is_safe(value: str, *, allow_namespace: bool = False) -> bool:
+    """Whether a provider/model value may be stored and sent to the host."""
+    return not model_override_field_problem(value, allow_namespace=allow_namespace)
 
 
 def ensure_dirs() -> Path:
@@ -71,42 +143,272 @@ def model_override_read_path() -> Path:
     return journal_dir() / _MODEL_OVERRIDE_FILE_NAME
 
 
-def read_model_override() -> Optional[Dict[str, str]]:
-    """Return the user's command-set model override, or None when absent/corrupt."""
+def _read_model_override_bytes() -> Optional[bytes]:
+    """Return the raw store, or None when there is genuinely no override.
+
+    A missing file is the common case and must stay on the fast path, so it is
+    reported rather than raised: only a *failed* open is worth retrying.
+
+    ``FileNotFoundError`` is absence too, not a failure. It is caught explicitly
+    because the file can vanish between the check and the open — a concurrent
+    ``/refine model auto`` does exactly that — and retrying it would spend the
+    whole budget and then report "could not be read" about a file the user had
+    just deliberately deleted.
+    """
     path = model_override_read_path()
-    if not path.is_file():
-        return None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
+        if not path.is_file():
             return None
-        model = str(data.get("model", "") or "").strip()
-        provider = str(data.get("provider", "") or "").strip()
-        if not model and not provider:
-            return None
-        return {"model": model, "provider": provider}
-    except Exception:
+        return path.read_bytes()
+    except FileNotFoundError:
         return None
+
+
+def read_model_override_state() -> "tuple[Optional[Dict[str, str]], str]":
+    """Return the override and why it is, or is not, in force.
+
+    States: ``absent``, ``ok``, ``rejected`` (present but unusable) and
+    ``unreadable`` (present but could not be read on this attempt — on Windows a
+    concurrent write can deny a read for a moment).
+
+    The last two are kept apart from ``absent`` deliberately. Collapsing them
+    would leave a file that pins one model while every diagnostic reports a
+    different one, with a log line as the only trace — the invisible failure this
+    project treats as worse than an error.
+
+    Never raises: this runs while a proposal call is being assembled, and an
+    exception here would surface as a generic LLM failure rather than as a
+    problem with the override store.
+    """
+    # Bytes, not text: decoding here would raise UnicodeDecodeError, which is not
+    # an OSError, so a store hand-edited in a non-UTF-8 codepage would escape this
+    # function into the proposal call and end every pass as an ordinary no_op.
+    # Decoding below keeps that input in the "rejected" state it belongs to.
+    try:
+        # Only OSError is retried — a sharing denial is the transient case, and it
+        # is measured, not assumed: under a concurrent atomic replace this open is
+        # denied for a moment on Windows a few times per few hundred reads. A
+        # reader that gave up would report "no override" and send the call to a
+        # different model than the one the user pinned.
+        raw = _retry_on_contention(
+            _read_model_override_bytes, _READ_RETRY_BUDGET_SECONDS, OSError
+        )
+    except Exception as exc:
+        # Broad on purpose. "Never raises" has to hold for every exception type,
+        # not just the one expected here: anything escaping would be assembled
+        # into a proposal call and journaled as an ordinary no_op with
+        # success=true, which is the outcome this function exists to prevent.
+        logger.warning("Cannot read the model override: %s", scrub_text(str(exc)))
+        return None, "unreadable"
+    if raw is None:
+        return None, "absent"
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None, "rejected"
+    if not isinstance(data, dict):
+        return None, "rejected"
+    model = str(data.get("model", "") or "").strip()
+    provider = str(data.get("provider", "") or "").strip()
+    if not model and not provider:
+        return None, "rejected"
+    # Validate on the way out as well as on the way in. A hand-edited, partially
+    # written or externally produced store must not inject arbitrary strings into
+    # the host's LLM call arguments.
+    if (provider and not model_override_field_is_safe(provider)) or (
+        model and not model_override_field_is_safe(model, allow_namespace=True)
+    ):
+        logger.warning("Ignoring an unusable model override on disk")
+        return None, "rejected"
+    return {"model": model, "provider": provider}, "ok"
+
+
+def read_model_override() -> Optional[Dict[str, str]]:
+    """Return the user's command-set model override, or None when not in force."""
+    return read_model_override_state()[0]
 
 
 def write_model_override(provider: str, model: str) -> None:
-    """Persist the model override atomically."""
-    import time as _time
+    """Persist the model override atomically, refusing anything unsafe.
 
+    Mirrors ``_write_prompt_notes``: the store refuses unsafe content instead of
+    trusting its caller to have checked. Raises ``ValueError`` so the command
+    layer reports a refusal rather than reporting success over a rejected write.
+    """
+    for name, value, namespaced in (
+        ("provider", provider, False),
+        ("model", model, True),
+    ):
+        problem = (
+            model_override_field_problem(value, allow_namespace=namespaced)
+            if value
+            else ""
+        )
+        if problem:
+            # Names the rule but never the value: the value may be a pasted
+            # credential, and this message is echoed back into the conversation.
+            raise ValueError(f"Refusing to store that {name} because {problem}")
+    if not provider and not model:
+        raise ValueError("Refusing to store an empty model override")
     payload = json.dumps(
-        {"provider": provider, "model": model, "set_ts": _time.time()},
+        {"provider": provider, "model": model, "set_ts": time.time()},
         ensure_ascii=False,
     )
     _atomic_write_text(ensure_dirs() / _MODEL_OVERRIDE_FILE_NAME, payload)
 
 
-def clear_model_override() -> None:
-    """Remove the model override file."""
-    path = journal_dir() / _MODEL_OVERRIDE_FILE_NAME
+def clear_model_override() -> str:
+    """Remove the model override file, reporting what actually happened.
+
+    Returns ``removed``, ``absent`` when there was nothing to remove, or
+    ``failed`` when the file survives — on Windows an unlink can fail with
+    ``PermissionError`` while another session thread holds it open, so it gets the
+    same bounded retry as the read and the write. Confirming "removed" in either
+    of the last two cases would report an action that did not take place.
+
+    The answer comes from the unlink itself rather than from a preceding
+    existence check: with a check first, a ``/refine model x`` from another
+    channel landing in between would be deleted and still reported as "no
+    override was set".
+
+    The store is deliberately not locked: the mutation lock is held for a whole
+    refine pass, and making a settings command queue behind one would be worse
+    than the race it removes. Last writer wins, which for a single-user setting
+    command is the expected outcome.
+    """
+    path = model_override_read_path()
     try:
-        path.unlink(missing_ok=True)
-    except Exception:
-        pass
+        _retry_on_contention(path.unlink, _UNLINK_RETRY_BUDGET_SECONDS)
+        return "removed"
+    except FileNotFoundError:
+        return "absent"
+    except Exception as exc:
+        logger.warning("Cannot remove the model override: %s", scrub_text(str(exc)))
+        try:
+            return "failed" if path.exists() else "removed"
+        except OSError:
+            return "failed"
+
+
+# ── legacy journal directory migration ─────────────────────────────────────
+
+_MIGRATION_MARKER = ".migrated_from"
+_MIGRATION_FILES = [
+    _JOURNAL_FILE_NAME,
+    "skill_stats.json",
+    _PROMPT_NOTES_FILE_NAME,
+    _MODEL_OVERRIDE_FILE_NAME,
+]
+_MIGRATION_DIRS = [_BACKUPS_DIR_NAME]
+
+
+def migrate_legacy_journal_dir(
+    *,
+    _new_dir: "Optional[Path]" = None,
+    _legacy_dir: "Optional[Path]" = None,
+) -> str:
+    """One-time, idempotent migration of runtime data to the new default location.
+
+    Returns one of:
+      user_configured — the user explicitly set journal_dir, so we do nothing.
+      not_needed      — nothing to migrate (new install or already migrated).
+      migrated        — files copied, old dir renamed.
+      failed          — something went wrong; refine continues from wherever data
+                        actually exists.
+
+    Never deletes data. The old directory is renamed, not removed.
+    Must be called under the mutation lock (taken internally) so two processes
+    cannot race and double-copy.
+    """
+    try:
+        from . import config as _cfg
+    except ImportError:
+        import config as _cfg  # type: ignore
+
+    # If the user set journal_dir explicitly, their choice takes priority.
+    entry = _cfg._get_refine_entry()
+    if entry.get("journal_dir"):
+        return "user_configured"
+
+    new_dir = _new_dir if _new_dir is not None else _cfg.journal_dir()
+    legacy = _legacy_dir if _legacy_dir is not None else _cfg.legacy_journal_dir()
+
+    # If the legacy dir doesn't exist or has no runtime files, nothing to move.
+    if not legacy.is_dir():
+        return "not_needed"
+
+    has_data = any(
+        (legacy / name).exists()
+        for name in _MIGRATION_FILES + _MIGRATION_DIRS
+    )
+    if not has_data:
+        return "not_needed"
+
+    # If the new dir already has a journal, the migration already happened or
+    # someone manually moved things. Don't overwrite.
+    if (new_dir / _JOURNAL_FILE_NAME).is_file():
+        return "not_needed"
+
+    # If the marker says we already renamed, don't do it again.
+    if (new_dir / _MIGRATION_MARKER).is_file():
+        return "not_needed"
+
+    with _THREAD_LOCK:
+        # Re-check after lock acquisition — another thread may have migrated.
+        if (new_dir / _JOURNAL_FILE_NAME).is_file():
+            return "not_needed"
+        if (new_dir / _MIGRATION_MARKER).is_file():
+            return "not_needed"
+
+        import shutil as _shutil
+
+        try:
+            new_dir.mkdir(parents=True, exist_ok=True)
+
+            # Copy files.
+            for name in _MIGRATION_FILES:
+                src = legacy / name
+                if src.is_file():
+                    _shutil.copy2(str(src), str(new_dir / name))
+
+            # Copy backup directory.
+            src_backups = legacy / _BACKUPS_DIR_NAME
+            if src_backups.is_dir():
+                dst_backups = new_dir / _BACKUPS_DIR_NAME
+                dst_backups.mkdir(exist_ok=True)
+                for item in src_backups.iterdir():
+                    if item.is_file():
+                        _shutil.copy2(str(item), str(dst_backups / item.name))
+
+            # Write marker with the source path and timestamp.
+            marker = new_dir / _MIGRATION_MARKER
+            marker.write_text(
+                json.dumps({
+                    "from": str(legacy),
+                    "ts": time.time(),
+                }),
+                encoding="utf-8",
+            )
+
+            # Rename (not delete) the old directory.
+            ts_suffix = time.strftime("%Y%m%d-%H%M%S")
+            renamed = legacy.parent / f"refine.migrated-{ts_suffix}"
+            try:
+                legacy.rename(renamed)
+            except OSError as exc:
+                # Rename failed — not fatal. The data is already in the new
+                # location and the marker prevents re-migration.
+                logger.warning(
+                    "Legacy journal dir could not be renamed: %s",
+                    scrub_text(str(exc)),
+                )
+
+            return "migrated"
+        except Exception as exc:
+            logger.warning(
+                "Journal directory migration failed: %s", scrub_text(str(exc))
+            )
+            return "failed"
 
 
 def normalize_prompt_note_session_id(session_id: Any) -> str:
@@ -421,6 +723,58 @@ def try_mutation_lock() -> Iterator[bool]:
 # ── durable file I/O ───────────────────────────────────────────────────────
 
 
+# One base owns every store-contention budget, so they cannot drift apart. The
+# write waits longest because it races a *reader*, which holds the file for a
+# whole read; a read and an unlink race a single atomic replace, which is orders
+# of magnitude shorter. The write budget is not smaller for a measured reason: a
+# 0.1s write budget lost a two-thread stress race 10 times out of 12, this one
+# lost none in 12. Every budget is spent only under actual contention, and their
+# sum stays well inside the timeout host callbacks use for the mutation lock.
+_CONTENTION_BUDGET_SECONDS = 0.5
+_WRITE_RETRY_BUDGET_SECONDS = _CONTENTION_BUDGET_SECONDS
+_READ_RETRY_BUDGET_SECONDS = _CONTENTION_BUDGET_SECONDS / 5
+_UNLINK_RETRY_BUDGET_SECONDS = _CONTENTION_BUDGET_SECONDS / 5
+_RETRY_MAX_DELAY = 0.05
+
+
+def _retry_on_contention(operation, budget: float, errors=PermissionError):
+    """Run a store operation, tolerating a momentary Windows sharing denial.
+
+    On Windows a file operation fails while another handle on the target is open,
+    and every store here is read lock-free from the per-turn hook path of a
+    gateway that serves several channels at once. POSIX does not fail this way, so
+    this is inert there.
+
+    This does not paper over the race: nothing about the operation's atomicity
+    changes, only its scheduling, and once the budget is spent the original error
+    is raised unchanged rather than swallowed.
+    """
+    deadline = time.monotonic() + budget
+    delay = 0.005
+    while True:
+        try:
+            return operation()
+        except errors:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(min(delay, _RETRY_MAX_DELAY))
+            delay *= 2
+
+
+def _replace_with_retry(temp_name: str, path: Path) -> None:
+    """Atomically replace the target, tolerating a concurrent reader on Windows.
+
+    This sits under ``_atomic_write_text``, so it covers every store written that
+    way — prompt notes and skill snapshots as well as the model override. That is
+    deliberate: all of them are read lock-free from hook paths, so all of them can
+    lose the same race, and fixing it once at the writer is better than three
+    times at the call sites.
+    """
+    _retry_on_contention(
+        lambda: os.replace(temp_name, path), _WRITE_RETRY_BUDGET_SECONDS
+    )
+
+
 def _atomic_write_text(path: Path, content: str) -> None:
     """Atomically replace backup/stat files; journals use append-only writes."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -430,7 +784,7 @@ def _atomic_write_text(path: Path, content: str) -> None:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp_name, path)
+        _replace_with_retry(temp_name, path)
     except Exception:
         try:
             os.unlink(temp_name)
@@ -547,6 +901,7 @@ def _new_entry(
     recovery: Optional[Dict[str, Any]] = None,
     group: Optional[Dict[str, Any]] = None,
     snapshot: Optional[Dict[str, Any]] = None,
+    llm_meta: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     entry = {
         "id": uuid.uuid4().hex[:12],
@@ -560,15 +915,13 @@ def _new_entry(
         "recovery": recovery or {},
         "error": error,
     }
-    # Carrying the pre-edit content in the record itself is what makes rollback
-    # independent of a backup file still being on disk.
     if snapshot:
         entry["snapshot"] = snapshot
-    # A multi-edit transaction stays one durable record per edit, so rollback,
-    # reconciliation, dedup, and the daily edit budget keep working unchanged.
-    # ``group`` only reports which edits belonged together.
     if group:
         entry["group"] = group
+    # LLM attribution — additive, old entries without it read fine.
+    if llm_meta and isinstance(llm_meta, dict):
+        entry["llm_meta"] = llm_meta
     return entry
 
 
@@ -584,6 +937,7 @@ def log(
     recovery: Optional[Dict[str, Any]] = None,
     group: Optional[Dict[str, Any]] = None,
     snapshot: Optional[Dict[str, Any]] = None,
+    llm_meta: Optional[Dict[str, Any]] = None,
 ) -> str:
     entry = _new_entry(
         trigger=trigger,
@@ -596,6 +950,7 @@ def log(
         recovery=recovery,
         group=group,
         snapshot=snapshot,
+        llm_meta=llm_meta,
     )
     _append_entry(entry)
     return entry["id"]
@@ -611,6 +966,7 @@ def prepare(
     recovery: Optional[Dict[str, Any]] = None,
     group: Optional[Dict[str, Any]] = None,
     snapshot: Optional[Dict[str, Any]] = None,
+    llm_meta: Optional[Dict[str, Any]] = None,
 ) -> str:
     return log(
         trigger=trigger,
@@ -622,6 +978,7 @@ def prepare(
         recovery=recovery,
         group=group,
         snapshot=snapshot,
+        llm_meta=llm_meta,
     )
 
 

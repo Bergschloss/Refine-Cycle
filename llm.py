@@ -3,6 +3,8 @@
 import json
 import logging
 import re
+import threading
+import time
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 from agent.plugin_llm import (
@@ -30,6 +32,30 @@ MAX_SUMMARY_CHARS = 300
 _CHARS_PER_TOKEN = 3
 _PROPOSAL_ENVELOPE_TOKENS = 1024
 
+# Last LLM call metadata — set by _propose_structured and review_fallback so
+# core.py can read reported_model, output_tokens and latency after calling
+# propose(). Thread-local because the gateway may run concurrent refine passes.
+_call_meta = threading.local()
+
+
+def last_call_meta() -> Dict[str, Any]:
+    """Return metadata from the most recent complete_structured call in this thread."""
+    return getattr(_call_meta, "value", {})
+
+
+def _record_call_meta(result: Any, started: float) -> None:
+    """Capture result metadata; tolerant of any result shape."""
+    meta: Dict[str, Any] = {"latency_ms": int((time.time() - started) * 1000)}
+    model = getattr(result, "model", None)
+    if model:
+        meta["reported_model"] = str(model)
+    usage = getattr(result, "usage", None)
+    if usage:
+        tokens = getattr(usage, "output_tokens", None)
+        if isinstance(tokens, (int, float)) and tokens > 0:
+            meta["output_tokens"] = int(tokens)
+    _call_meta.value = meta
+
 
 def _pinned_target() -> Dict[str, str]:
     """Provider/model to request, when the config pins them.
@@ -38,11 +64,17 @@ def _pinned_target() -> Dict[str, str]:
     A pinned value makes the target deterministic instead; the host's trust
     gate still decides whether the request is honored.
 
-    This function filters the effective target through trust flags so that a
-    plugin installation without ``allow_model_override`` silently falls back to
-    the host default instead of causing PluginLlmTrustError on every call.
+    Never raises. It is evaluated while the call arguments are being assembled,
+    before any failure-tagging path exists, so an exception here would be reported
+    as a generic LLM failure and journaled as an ordinary no_op with success=true.
     """
-    effective = config.effective_llm_target()
+    try:
+        effective = config.effective_llm_target()
+    except Exception as exc:
+        logger.warning(
+            "Cannot resolve the refine model target: %s", scrub_text(str(exc))
+        )
+        return {}
     target: Dict[str, str] = {}
     provider = effective.get("provider", "")
     model = effective.get("model", "")
@@ -261,6 +293,7 @@ def _propose_structured(
     input_blocks: List[PluginLlmInput],
     *,
     max_tokens: int = PROPOSAL_MAX_TOKENS,
+    target: Optional[Dict[str, str]] = None,
 ) -> Any:
     """Invoke the model only with recursively sanitized text inputs."""
     safe_blocks: List[PluginLlmInput] = []
@@ -269,6 +302,7 @@ def _propose_structured(
         if text is None:
             raise TypeError("Refine accepts only text model inputs")
         safe_blocks.append(PluginLlmTextInput(text=scrub_text(str(text))))
+    resolved_target = target if target is not None else _pinned_target()
     common = dict(
         instructions=scrub_text(str(instructions)),
         input=safe_blocks,
@@ -276,15 +310,17 @@ def _propose_structured(
         purpose="refine",
         temperature=0.0,
         max_tokens=max_tokens,
-        **_pinned_target(),
+        **resolved_target,
     )
     system_prompt = scrub_text(REFINE_SYSTEM_PROMPT)
+    call_started = time.time()
     try:
         result = llm.complete_structured(
             system_prompt=system_prompt,
             json_schema=sanitize(REFINE_PROPOSAL_SCHEMA),
             **common,
         )
+        _record_call_meta(result, call_started)
         reply = _salvage_parsed(result, requested_max_tokens=max_tokens)
         return reply.parsed or _incomplete_proposal(reply)
     except PluginLlmTrustError:
@@ -300,6 +336,7 @@ def _propose_structured(
             json_mode=True,
             **common,
         )
+        _record_call_meta(result, call_started)
         reply = _salvage_parsed(result, requested_max_tokens=max_tokens)
         return reply.parsed or _incomplete_proposal(reply)
 
@@ -318,9 +355,10 @@ def _ensure_dict(parsed: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
-def review_fallback(llm: PluginLlm, evidence_text: str) -> Dict[str, Any]:
+def review_fallback(llm: PluginLlm, evidence_text: str, *, target: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """Return one conservative reviewer verdict; all failures decline safely."""
     safe_evidence = scrub_text(str(evidence_text))
+    resolved_target = target if target is not None else _pinned_target()
     instructions = (
         "Assess this trajectory only for a durable lesson worth persisting. "
         "Return the required JSON object.\n\n=== RECENT TRAJECTORY ===\n"
@@ -335,7 +373,7 @@ def review_fallback(llm: PluginLlm, evidence_text: str) -> Dict[str, Any]:
             purpose="refine",
             temperature=0.0,
             max_tokens=REVIEWER_MAX_TOKENS,
-            **_pinned_target(),
+            **resolved_target,
         )
         reply = _salvage_parsed(result, requested_max_tokens=REVIEWER_MAX_TOKENS)
         if reply.failure:
@@ -775,6 +813,7 @@ def propose(
     purpose: str = "refine",
     run_context: str = "",
     skill_content_loader: Optional[Callable[[str], Optional[str]]] = None,
+    target: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Propose one edit; skill patches are regenerated from safe full content."""
     try:
@@ -861,6 +900,7 @@ def propose(
                 [PluginLlmTextInput(text=instructions)],
                 # The first reply may legitimately carry one permitted body per edit.
                 max_tokens=proposal_max_tokens(max_edits),
+                target=target,
             )
         )
         if parsed is None:

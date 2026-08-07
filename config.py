@@ -7,7 +7,7 @@ All values have sensible defaults — config.yaml only provides overrides.
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +170,21 @@ def cross_session_enabled() -> bool:
     return get_bool("cross_session_enabled", True)
 
 
+def skip_session_sources() -> List[str]:
+    """Session sources to skip for automatic and manual refinement.
+
+    A session whose ``source`` column matches one of these values is not
+    analysed. Intended for machine-generated sessions (cron, batch) whose
+    trajectory is noise rather than signal. Invalid config (not a list of
+    strings) falls back to the default rather than raising.
+    """
+    entry = _get_refine_entry()
+    val = entry.get("skip_session_sources")
+    if isinstance(val, list) and all(isinstance(item, str) for item in val):
+        return [item.strip().lower() for item in val if item.strip()]
+    return ["cron"]
+
+
 def cross_session_days() -> int:
     return get_int("cross_session_days", 7, min_val=1)
 
@@ -235,10 +250,13 @@ def llm_allow_provider_override() -> bool:
 def live_main_target() -> Dict[str, str]:
     """Best-effort read of the host's live main provider/model.
 
-    Uses an internal Hermes API (``_read_main_provider`` / ``_read_main_model``
-    in ``agent.auxiliary_client``). When unavailable — import fails, function
-    removed — returns ``{}`` silently. The caller must not treat a failure
-    here as an error; it merely means no live model information is available.
+    Uses a private Hermes API (``_read_main_provider`` / ``_read_main_model`` in
+    ``agent.auxiliary_client``) because the host exposes no public accessor. Both
+    names were confirmed present in a real installation; a private name can still
+    move, so the import is guarded and yields no live value on failure. The caller
+    must not treat that as an error — it only means no live model is available,
+    and ``effective_llm_target`` then reports ``host_default`` instead of naming a
+    target it cannot confirm.
     """
     try:
         from agent.auxiliary_client import _read_main_provider, _read_main_model
@@ -255,7 +273,7 @@ def live_main_target() -> Dict[str, str]:
         return {}
 
 
-def effective_llm_target() -> Dict[str, str]:
+def effective_llm_target() -> Dict[str, Any]:
     """Resolve one effective model/provider target for refine.
 
     Priority:
@@ -264,49 +282,101 @@ def effective_llm_target() -> Dict[str, str]:
       3. Live Hermes main model (best-effort, internal API)
       4. Nothing — let the host decide
 
-    Returns ``{"provider": ..., "model": ..., "source": ...}``.
-    Provider/model may be empty strings; source is always set.
+    A command override fills any field it leaves unset from the config, because a
+    configured provider is an explicit instruction the command did not revoke;
+    dropping it would send the new model to whatever default the host picks.
+
+    An unset field is deliberately **not** filled from the live model. Omitting a
+    field already means "let Hermes resolve it", and Hermes resolves it to the
+    live value — naming it here would claim the user chose something they did not,
+    and would spend a trust flag to reach the same result.
+
+    A configured ``llm.model`` may be namespaced (``vendor/name``); a provider may
+    not. Both are checked against the same rule the override store applies, so a
+    value refused from ``/refine model`` cannot slip in through ``config.yaml``.
+
+    Returns ``{"provider": ..., "model": ..., "source": ..., "issues": [...]}``.
+    Provider/model may be empty strings; ``source`` is always set; ``issues`` lists
+    every configured or stored value that was discarded, and why. It is a list
+    rather than one string because several can fail at once, and reporting only
+    the last would have the user fix one and rediscover the next.
     """
     try:
         from . import journal
     except ImportError:
         import journal  # type: ignore
 
-    # 1. Command override
-    override = journal.read_model_override()
+    issues: list = []
+    cfg_provider = llm_provider()
+    cfg_model = llm_model()
+    # The override store refuses unusable values. The config writes the same
+    # field, so it meets the same rule here — otherwise the check would hold on
+    # one path and not the other, and a value refused from /refine model would be
+    # accepted from config.yaml. The reason is reported without the value, which
+    # may be a pasted credential.
+    for key, value, namespaced in (
+        ("provider", cfg_provider, False),
+        ("model", cfg_model, True),
+    ):
+        problem = (
+            journal.model_override_field_problem(value, allow_namespace=namespaced)
+            if value
+            else ""
+        )
+        if problem:
+            issues.append(f"config llm.{key} was ignored because {problem}")
+            if key == "provider":
+                cfg_provider = ""
+            else:
+                cfg_model = ""
+
+    # 1. Command override, with the config filling any field it leaves unset.
+    override, state = journal.read_model_override_state()
+    if state == "rejected":
+        issues.append("model_override.json is present but unusable, so it was ignored")
+    elif state == "unreadable":
+        issues.append("model_override.json could not be read, so it was not applied")
     if override:
         return {
-            "provider": override.get("provider", ""),
-            "model": override.get("model", ""),
+            "provider": override.get("provider", "") or cfg_provider,
+            "model": override.get("model", "") or cfg_model,
             "source": "command",
+            "issues": issues,
         }
 
     # 2. Config
-    cfg_provider = llm_provider()
-    cfg_model = llm_model()
     if cfg_provider or cfg_model:
         return {
             "provider": cfg_provider,
             "model": cfg_model,
             "source": "config",
+            "issues": issues,
         }
 
-    # 3. Live Hermes main model
+    # 3. Live Hermes main model. Not put through the rule above: the value comes
+    # from the host's own runtime, not from user input, and refusing the host's
+    # answer would leave refine with no target at all.
     live = live_main_target()
     if live.get("model") or live.get("provider"):
         return {
             "provider": live.get("provider", ""),
             "model": live.get("model", ""),
             "source": "live",
+            "issues": issues,
         }
 
     # 4. Nothing
-    return {"provider": "", "model": "", "source": "host_default"}
+    return {"provider": "", "model": "", "source": "host_default", "issues": issues}
 
 
 def journal_dir() -> Path:
-    default = hermes_home() / "plugins" / "refine"
+    default = hermes_home() / "refine"
     return Path(get_str("journal_dir", str(default)))
+
+
+def legacy_journal_dir() -> Path:
+    """The old default before Part C moved runtime data out of the plugin dir."""
+    return hermes_home() / "plugins" / "refine"
 
 
 def prompt_notes_enabled() -> bool:

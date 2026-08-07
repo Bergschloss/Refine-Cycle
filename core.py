@@ -5,10 +5,11 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from agent.plugin_llm import PluginLlm
 
@@ -20,6 +21,64 @@ except ImportError:
     from sanitization import sanitize, scrub_text  # noqa: F811
 
 logger = logging.getLogger(__name__)
+
+# ── session identity ───────────────────────────────────────────────────────
+# The host does not pass session_id to slash-command handlers (contract is
+# fn(raw_args) -> str|None). But pre_llm_call and post_llm_call hooks do
+# receive it every turn. This module remembers the last value seen, so that a
+# manual /refine command running in the same process can resolve it.
+
+_LAST_SESSION_ID = ""
+_LAST_SESSION_LOCK = threading.Lock()
+
+
+def note_session_id(session_id: str) -> None:
+    """Record the session id seen from a host hook. Thread-safe, one value."""
+    global _LAST_SESSION_ID
+    if not isinstance(session_id, str) or not session_id.strip():
+        return
+    clean = session_id.strip()
+    # Reject anything that scrubbing would alter — it might be content, not an id.
+    if scrub_text(clean) != clean or len(clean) > 128:
+        return
+    with _LAST_SESSION_LOCK:
+        _LAST_SESSION_ID = clean
+
+
+def _noted_session_id() -> str:
+    with _LAST_SESSION_LOCK:
+        return _LAST_SESSION_ID
+
+
+def host_session_id() -> str:
+    """Best-effort read of the host's current session id via ContextVar/env.
+
+    Available in CLI and cron; returns "" in the gateway (which sets session_key,
+    not session_id, into the context). Guarded: any failure → "".
+    """
+    try:
+        from gateway.session_context import get_session_env
+        value = get_session_env("HERMES_SESSION_ID", "")
+        return value.strip() if isinstance(value, str) else ""
+    except Exception:
+        return ""
+
+
+def resolve_session_id(explicit: str = "") -> Tuple[str, str]:
+    """Resolve which session to analyse.
+
+    Returns (session_id, how) where how ∈ {explicit, host_env, hook, unknown}.
+    When unknown, the caller must refuse rather than guess.
+    """
+    if explicit and explicit.strip():
+        return explicit.strip(), "explicit"
+    env_id = host_session_id()
+    if env_id:
+        return env_id, "host_env"
+    hook_id = _noted_session_id()
+    if hook_id:
+        return hook_id, "hook"
+    return "", "unknown"
 
 
 def scrub_proposal(proposal: Dict[str, Any]) -> Dict[str, Any]:
@@ -43,14 +102,22 @@ def _open_db() -> Optional[sqlite3.Connection]:
         return None
 
 
-def _get_recent_session_id(connection: sqlite3.Connection) -> Optional[str]:
+def _get_session_source(session_id: str) -> str:
+    """Read-only lookup of a session's source column. Returns "" on any failure."""
+    if not session_id:
+        return ""
+    connection = _open_db()
+    if not connection:
+        return ""
     try:
         row = connection.execute(
-            "SELECT id FROM sessions ORDER BY started_at DESC LIMIT 1"
+            "SELECT source FROM sessions WHERE id = ?", (session_id,)
         ).fetchone()
-        return row["id"] if row else None
+        return str(row["source"] or "") if row else ""
     except Exception:
-        return None
+        return ""
+    finally:
+        connection.close()
 
 
 def _structured_error_status(content: str) -> Optional[bool]:
@@ -127,7 +194,6 @@ def _is_correction(content: str) -> bool:
 
 
 def collect_evidence(session_id: Optional[str] = None, limit: int = 60) -> Dict[str, Any]:
-    connection = _open_db()
     empty = {
         "messages": [],
         "error_count": 0,
@@ -135,17 +201,22 @@ def collect_evidence(session_id: Optional[str] = None, limit: int = 60) -> Dict[
         "error_patterns": [],
         "user_corrections": [],
         "session_id": "",
+        "session_id_source": "unknown",
     }
+    resolved, how = resolve_session_id(session_id or "")
+    if not resolved:
+        empty["session_id_source"] = how
+        return empty
+    connection = _open_db()
     if not connection:
+        empty["session_id"] = resolved
+        empty["session_id_source"] = how
         return empty
     try:
-        session_id = session_id or _get_recent_session_id(connection)
-        if not session_id:
-            return empty
         rows = connection.execute(
             "SELECT role, content, tool_name, timestamp FROM messages "
             "WHERE session_id = ? AND active = 1 ORDER BY timestamp DESC LIMIT ?",
-            (session_id, limit),
+            (resolved, limit),
         ).fetchall()
         messages: List[Dict[str, Any]] = []
         tool_errors: List[Dict[str, Any]] = []
@@ -178,7 +249,8 @@ def collect_evidence(session_id: Optional[str] = None, limit: int = 60) -> Dict[
             "tool_errors": tool_errors[-10:],
             "error_patterns": patterns.extract_patterns(error_items),
             "user_corrections": corrections[-5:],
-            "session_id": session_id,
+            "session_id": resolved,
+            "session_id_source": how,
         }
     finally:
         connection.close()
@@ -406,6 +478,25 @@ def refine_status() -> Dict[str, Any]:
     jdir = config.journal_dir()
     jdir_state = _journal_dir_state(jdir)
 
+    # The effective model belongs in this report. A pinned model that no provider
+    # serves turns every pass into an ordinary no_op, and without it here the
+    # report would answer "blockers: none" while nothing can possibly succeed.
+    try:
+        target = config.effective_llm_target()
+    except Exception:
+        # "unknown", not "host_default": a config key or override file may still
+        # pin something, and this report must not claim a resolution it failed to
+        # perform.
+        target = {
+            "provider": "", "model": "", "source": "unknown",
+            "issues": ["the effective model could not be resolved"],
+        }
+    try:
+        model_allowed = config.llm_allow_model_override()
+        provider_allowed = config.llm_allow_provider_override()
+    except Exception:
+        model_allowed = provider_allowed = False
+
     # Read journal-derived numbers only when a journal actually exists, so a
     # mistyped journal_dir is reported rather than silently created.
     journal_present = False
@@ -500,6 +591,76 @@ def refine_status() -> Dict[str, Any]:
                 "cannot confirm refinement is able to run"
             ),
         })
+    target_issues = [str(item) for item in target.get("issues", []) if item]
+    if target_issues:
+        # A discarded value must not be visible only in a log line: the file or
+        # config key still pins something while this report names another target.
+        warnings.append({
+            "code": "model_target_issue",
+            "message": "; ".join(target_issues),
+        })
+    if target["source"] == "command":
+        warnings.append({
+            "code": "model_override_active",
+            # Deliberately does not say the override pinned each field: when it
+            # sets only one, the other comes from the config and survives
+            # '/refine model auto'. Claiming otherwise would describe a state
+            # this report did not verify.
+            "message": (
+                "A '/refine model' override is in force; the effective target is "
+                f"{target['model'] or '(host default)'}"
+                + (f" on provider {target['provider']}" if target["provider"] else "")
+                + ". '/refine model auto' removes the override; any value also set "
+                  "in plugins.entries.refine.llm stays in effect after that"
+            ),
+        })
+    # A value the host will refuse is dropped before the call, so it can only be
+    # noticed here. Reported per field, because the denied one may be either.
+    if target["source"] in ("command", "config"):
+        if target["model"] and not model_allowed:
+            warnings.append({
+                "code": "model_override_trust_denied",
+                "message": (
+                    f"Model {target['model']} is set but host trust denies model "
+                    "overrides, so it is dropped before the call; set "
+                    "plugins.entries.refine.llm.allow_model_override to apply it"
+                ),
+            })
+        if target["provider"] and not provider_allowed:
+            warnings.append({
+                "code": "provider_override_trust_denied",
+                "message": (
+                    f"Provider {target['provider']} is set but host trust denies "
+                    "provider overrides, so it is dropped before the call; set "
+                    "plugins.entries.refine.llm.allow_provider_override to apply it"
+                ),
+            })
+
+    # Session identity — what /refine would analyse if triggered now.
+    sid, sid_source = resolve_session_id()
+    session_message_count = 0
+    if sid:
+        try:
+            conn = _open_db()
+            if conn:
+                try:
+                    row = conn.execute(
+                        "SELECT COUNT(*) n FROM messages WHERE session_id=? AND active=1",
+                        (sid,),
+                    ).fetchone()
+                    session_message_count = row["n"] if row else 0
+                finally:
+                    conn.close()
+        except Exception:
+            pass
+    if sid_source == "unknown":
+        blockers.append({
+            "code": "session_unknown",
+            "message": (
+                "Cannot identify the current session. Neither the host environment "
+                "nor a recent hook provided a session id."
+            ),
+        })
 
     return {
         "config_readable": config_readable,
@@ -514,12 +675,21 @@ def refine_status() -> Dict[str, Any]:
         "max_edits_per_day": max_edits,
         "journal_present": journal_present,
         "journal_readable": journal_readable,
-        # The real path, because the report tells the user to move files in and
-        # out of it. Truncating it to a tilde made it unusable in a shell.
         "journal_dir": str(jdir),
         "journal_dir_state": jdir_state,
         "journal_dir_state_text": _JOURNAL_DIR_STATE_TEXT.get(jdir_state, jdir_state),
         "journal_dir_is_plugin_source": plugin_source_collision,
+        "session_id": sid,
+        "session_id_source": sid_source,
+        "session_message_count": session_message_count,
+        "session_source": _get_session_source(sid) if sid else "",
+        "skip_session_sources": config.skip_session_sources(),
+        "llm_model": target["model"],
+        "llm_provider": target["provider"],
+        "llm_target_source": target["source"],
+        "llm_target_issues": target_issues,
+        "llm_model_allowed": model_allowed,
+        "llm_provider_allowed": provider_allowed,
         "blockers": blockers,
         "blocker_codes": [b["code"] for b in blockers],
         "warnings": warnings,
@@ -750,6 +920,7 @@ def _skill_baseline_conflict(
 
 
 def _journal_nonmutation(**kwargs: Any) -> Optional[str]:
+    """Write a non-mutating journal entry. Accepts all journal.log kwargs including llm_meta."""
     try:
         return journal.log(**kwargs)
     except Exception as exc:
@@ -771,6 +942,7 @@ def _refine_once(
     reason: str = "",
     session_id: Optional[str] = None,
     auto: bool = False,
+    dry_run: bool = False,
 ) -> Dict[str, Any]:
     trigger = "auto" if auto else "manual"
     started = time.time()
@@ -783,11 +955,50 @@ def _refine_once(
             f"Applied/pending/prepared today: {journal.count_today_applied()}.",
         }
 
+    # Resolve the LLM target once per pass so every call within it uses the same
+    # model. This makes the choice deterministic and attributable in the journal.
+    try:
+        _effective = config.effective_llm_target()
+        _run_target: Dict[str, str] = {}
+        if _effective.get("provider") and config.llm_allow_provider_override():
+            _run_target["provider"] = _effective["provider"]
+        if _effective.get("model") and config.llm_allow_model_override():
+            _run_target["model"] = _effective["model"]
+        _run_target_source = _effective.get("source", "host_default")
+        _run_target_issues = [str(i) for i in _effective.get("issues", []) if i]
+    except Exception:
+        _run_target = {}
+        _run_target_source = "unknown"
+        _run_target_issues = ["the effective model could not be resolved"]
+
     evidence_limit = 60
     if config.min_signal_required() and config.reviewer_fallback_enabled():
         evidence_limit = max(evidence_limit, config.reviewer_min_messages())
     evidence = collect_evidence(session_id=session_id, limit=evidence_limit)
     session = evidence.get("session_id", "")
+    session_source = evidence.get("session_id_source", "unknown")
+    if not session and session_source == "unknown":
+        return {
+            "success": False,
+            "outcome": "session_unknown",
+            "message": "Cannot identify the current session; refine did not run.",
+            "evidence": evidence,
+            "reversible": False,
+        }
+    # Source filter: skip machine-generated sessions whose trajectory is noise.
+    skip_sources = config.skip_session_sources()
+    session_db_source = _get_session_source(session)
+    if session_db_source and session_db_source.lower() in skip_sources:
+        return {
+            "success": True,
+            "outcome": "skipped_session_source",
+            "message": (
+                f"Session source '{session_db_source}' is in skip_session_sources; "
+                "refine did not run."
+            ),
+            "evidence": evidence,
+            "reversible": False,
+        }
     if len(evidence.get("messages", [])) < 3:
         return {
             "success": True,
@@ -817,7 +1028,7 @@ def _refine_once(
             and _reviewer_cooldown_elapsed()
         )
         if should_review:
-            reviewer = _llm.review_fallback(llm, evidence_text)
+            reviewer = _llm.review_fallback(llm, evidence_text, target=_run_target)
             rationale = scrub_text(str(reviewer.get("rationale", "")))
             decision = "approved" if reviewer.get("should_refine") else "declined"
             reviewer_reason = f"Reviewer {decision}: {rationale}"
@@ -901,7 +1112,20 @@ def _refine_once(
         purpose="refine",
         run_context=proposal_context,
         skill_content_loader=journal.read_skill_content,
+        target=_run_target,
     )
+    # Capture metadata from the LLM call that produced this proposal.
+    llm_meta = _llm.last_call_meta()
+    _run_llm_meta = {
+        "requested_provider": _run_target.get("provider", ""),
+        "requested_model": _run_target.get("model", ""),
+        "target_source": _run_target_source,
+        **{k: v for k, v in llm_meta.items() if k in (
+            "reported_model", "latency_ms", "output_tokens"
+        )},
+    }
+    if _run_target_issues:
+        _run_llm_meta["target_issues"] = _run_target_issues
     proposal = sanitize(proposal)
     proposal = dict(
         proposal,
@@ -928,6 +1152,7 @@ def _refine_once(
             proposal=proposal,
             outcome="llm_incomplete",
             error=failure_message,
+            llm_meta=_run_llm_meta,
         )
         response = {
             "success": False,
@@ -947,6 +1172,86 @@ def _refine_once(
         "errors": evidence.get("error_count", 0),
     }
 
+    # ── Dry-run exit: show what would happen, apply nothing ────────────────
+    if dry_run:
+        import difflib as _difflib
+
+        dry_proposal = proposal
+        if proposal.get("action") == "multi":
+            # Normalize each edit so the user sees the final form.
+            edits = [
+                _normalize_edit(sanitize(edit), session)
+                for edit in proposal.get("edits", [])
+                if isinstance(edit, dict)
+            ]
+            dry_proposal = dict(proposal, edits=edits)
+        else:
+            dry_proposal = _normalize_edit(proposal, session)
+
+        # Build a diff for patch proposals.
+        diff_text = ""
+        max_diff_chars = _llm.MAX_CONTENT_CHARS
+        truncated = False
+
+        def _build_diff(name: str, new_content: str) -> str:
+            old_content = journal.read_skill_content(name) or ""
+            old_lines = old_content.splitlines()
+            new_lines = new_content.splitlines()
+            diff_lines = list(_difflib.unified_diff(
+                old_lines, new_lines, fromfile=f"a/{name}", tofile=f"b/{name}", lineterm=""
+            ))
+            return "\n".join(diff_lines)
+
+        if dry_proposal.get("action") == "patch" and dry_proposal.get("kind") == "skill":
+            name = str(dry_proposal.get("name", ""))
+            content = str(dry_proposal.get("content", ""))
+            if name and content:
+                raw_diff = _build_diff(name, content)
+                if len(raw_diff) > max_diff_chars:
+                    diff_text = scrub_text(raw_diff[:max_diff_chars]) + "\n… [truncated]"
+                    truncated = True
+                else:
+                    diff_text = scrub_text(raw_diff)
+        elif dry_proposal.get("action") == "multi":
+            diff_parts = []
+            for edit in dry_proposal.get("edits", []):
+                if edit.get("action") == "patch" and edit.get("kind") == "skill":
+                    name = str(edit.get("name", ""))
+                    content = str(edit.get("content", ""))
+                    if name and content:
+                        diff_parts.append(_build_diff(name, content))
+            if diff_parts:
+                combined = "\n".join(diff_parts)
+                if len(combined) > max_diff_chars:
+                    diff_text = scrub_text(combined[:max_diff_chars]) + "\n… [truncated]"
+                    truncated = True
+                else:
+                    diff_text = scrub_text(combined)
+
+        # Journal the dry run so /refine audit shows it was considered.
+        _journal_nonmutation(
+            trigger=trigger,
+            reason=safe_reason or "dry-run",
+            session_id=session,
+            proposal=dry_proposal,
+            outcome="dry_run",
+            llm_meta=_run_llm_meta,
+        )
+
+        return {
+            "success": True,
+            "outcome": "dry_run",
+            "message": "Dry run: proposal shown, nothing applied.",
+            "proposal": dry_proposal,
+            "diff": diff_text,
+            "diff_truncated": truncated,
+            "evidence": evidence_summary,
+            "llm_called": True,
+            "llm_meta": _run_llm_meta,
+            "reversible": False,
+            "edits_applied": 0,
+        }
+
     if proposal.get("action") == "multi":
         transaction = _apply_transaction(
             proposal,
@@ -954,8 +1259,10 @@ def _refine_once(
             safe_reason=safe_reason,
             session=session,
             started=started,
+            llm_meta=_run_llm_meta,
         )
         transaction["evidence"] = evidence_summary
+        transaction["llm_meta"] = _run_llm_meta
         return transaction
 
     proposal = _normalize_edit(proposal, session)
@@ -967,6 +1274,7 @@ def _refine_once(
             session_id=session,
             proposal=proposal,
             outcome="no_op",
+            llm_meta=_run_llm_meta,
         )
         if not entry_id:
             return {
@@ -981,6 +1289,7 @@ def _refine_once(
             "proposal": proposal,
             "evidence": evidence,
             "reversible": False,
+            "llm_meta": _run_llm_meta,
         }
 
     response = _apply_edit(
@@ -989,8 +1298,10 @@ def _refine_once(
         safe_reason=safe_reason,
         session=session,
         started=started,
+        llm_meta=_run_llm_meta,
     )
     response["evidence"] = evidence_summary
+    response["llm_meta"] = _run_llm_meta
     return response
 
 
@@ -1002,6 +1313,7 @@ def _apply_edit(
     session: str,
     started: float,
     group: Optional[Dict[str, Any]] = None,
+    llm_meta: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Validate, back up, apply, and finalize exactly one edit.
 
@@ -1267,6 +1579,7 @@ def _apply_edit(
                 entry_id,
                 outcome=outcome,
                 pending_id=pending_id,
+                llm_meta=llm_meta,
             )
         except Exception as exc:
             logger.warning("Cannot record edit in ledger: %s", exc)
@@ -1332,6 +1645,7 @@ def _apply_transaction(
     safe_reason: str,
     session: str,
     started: float,
+    llm_meta: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Apply one multi-edit proposal as a sequence of independent durable edits.
 
@@ -1465,6 +1779,7 @@ def _apply_transaction(
             session=session,
             started=started,
             group=edit_group(index),
+            llm_meta=llm_meta,
         )
         results.append(item)
         if not item.get("success"):
@@ -1592,11 +1907,20 @@ def refine_run(
     reason: str = "",
     session_id: Optional[str] = None,
     auto: bool = False,
+    dry_run: bool = False,
 ) -> Dict[str, Any]:
     """Serialize a run, reconcile approvals, and preserve every recovery id."""
     started = time.time()
     with journal.mutation_lock():
         _reconcile_pending()
+
+        if dry_run:
+            # Dry-run: one proposal pass, no apply, no budget consumed.
+            return _refine_once(
+                llm, reason=scrub_text(reason), session_id=session_id,
+                auto=auto, dry_run=True,
+            )
+
         runs: List[Dict[str, Any]] = []
         # ``max_edits_per_run`` bounds proposal passes; ``max_edits_per_proposal``
         # bounds edits inside one transaction; the daily edit budget bounds edits

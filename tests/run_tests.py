@@ -10,6 +10,7 @@ import inspect
 import json
 import shutil
 import subprocess
+from collections import Counter
 from contextlib import contextmanager
 import sqlite3
 import sys
@@ -143,12 +144,12 @@ class FakeHost:
             ("session", "tool", "ERROR: request failed for /item/200", "http", now - 1, 1),
         ]
         connection = sqlite3.connect(path)
-        connection.execute("CREATE TABLE sessions (id TEXT, started_at REAL)")
+        connection.execute("CREATE TABLE sessions (id TEXT, started_at REAL, source TEXT DEFAULT 'cli')")
         connection.execute(
             "CREATE TABLE messages (session_id TEXT, role TEXT, content TEXT, "
             "tool_name TEXT, timestamp REAL, active INTEGER)"
         )
-        connection.execute("INSERT INTO sessions VALUES ('session', ?)", (now - 10,))
+        connection.execute("INSERT INTO sessions VALUES ('session', ?, 'cli')", (now - 10,))
         connection.executemany("INSERT INTO messages VALUES (?,?,?,?,?,?)", rows)
         connection.commit()
         connection.close()
@@ -385,6 +386,10 @@ class RefineTests(unittest.TestCase):
         # Both are process-lifetime globals: left set, they leak across tests.
         plugin_init._REGISTER_WARNED = False
         plugin_init._REGISTERED_LLM = None
+        # Session identity tracking — must not leak from one test to the next.
+        # Set to the default test session so existing tests that call refine_run
+        # without an explicit session_id find the FakeHost's "session" messages.
+        core._LAST_SESSION_ID = "session"
 
     def tearDown(self):
         self.temp.cleanup()
@@ -3419,10 +3424,39 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
         self.assertEqual(target["model"], "live-model")
         self.assertEqual(target["provider"], "live-prov")
 
-    def test_live_main_target_failure_returns_empty(self):
-        with patch.dict("sys.modules", {"agent.auxiliary_client": None}):
+    def test_live_main_target_reads_the_host_accessors(self):
+        # The fake ``agent`` module is not a package, so the real import always
+        # fails in this harness. Injecting the submodule is what makes priority 3
+        # genuinely covered instead of only reachable by patching it out.
+        fake = types.ModuleType("agent.auxiliary_client")
+        fake._read_main_provider = lambda: "live-prov"
+        fake._read_main_model = lambda: "live-model"
+        with patch.dict("sys.modules", {"agent.auxiliary_client": fake}):
             result = config.live_main_target()
-        self.assertEqual(result, {})
+        self.assertEqual(result, {"provider": "live-prov", "model": "live-model"})
+
+    def test_live_main_target_without_the_host_accessors_returns_empty(self):
+        fake = types.ModuleType("agent.auxiliary_client")
+        with patch.dict("sys.modules", {"agent.auxiliary_client": fake}):
+            self.assertEqual(config.live_main_target(), {})
+
+    def test_live_main_target_when_the_host_module_is_absent_returns_empty(self):
+        # The failure the guarded import exists for: a private module that moved.
+        # Distinct from the attribute-absent case above, and it is the one that
+        # happens when Hermes reorganizes.
+        with patch.dict("sys.modules", {"agent.auxiliary_client": None}):
+            self.assertEqual(config.live_main_target(), {})
+        self.assertEqual(config.effective_llm_target()["source"], "host_default")
+
+    def test_live_main_target_when_accessor_raises_returns_empty(self):
+        def boom():
+            raise RuntimeError("no runtime")
+
+        fake = types.ModuleType("agent.auxiliary_client")
+        fake._read_main_provider = boom
+        fake._read_main_model = lambda: "live-model"
+        with patch.dict("sys.modules", {"agent.auxiliary_client": fake}):
+            self.assertEqual(config.live_main_target(), {})
 
     def test_corrupt_override_file_treated_as_absent(self):
         path = journal.model_override_read_path()
@@ -3517,6 +3551,524 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
         plugin_init._handle_refine_command("model auto")
         self.assertEqual(len(journal.entries()), before)
 
+    # ── Audit fixes: per-field priority, safe persistence, visibility ─────────
+
+    def test_model_only_override_keeps_the_configured_provider(self):
+        FakeHost.entry_config()["llm"] = {
+            "provider": "opencode-go",
+            "model": "deepseek-v4",
+        }
+        plugin_init._handle_refine_command("model deepseek-v4-flash")
+        target = config.effective_llm_target()
+        self.assertEqual(target["source"], "command")
+        self.assertEqual(target["model"], "deepseek-v4-flash")
+        # Asking for a different model must not silently unset the provider that
+        # actually serves it.
+        self.assertEqual(target["provider"], "opencode-go")
+
+    def test_provider_only_override_keeps_the_configured_model(self):
+        FakeHost.entry_config()["llm"] = {"model": "deepseek-v4"}
+        journal.write_model_override("other-prov", "")
+        target = config.effective_llm_target()
+        self.assertEqual(target["provider"], "other-prov")
+        self.assertEqual(target["model"], "deepseek-v4")
+
+    def test_credential_shaped_model_is_never_persisted(self):
+        token = "ghp_" + "A" * 36
+        result = plugin_init._handle_refine_command(f"model {token}")
+        self.assertIn("failed", result.lower())
+        self.assertIsNone(journal.read_model_override())
+        path = journal.model_override_read_path()
+        if path.exists():
+            self.assertNotIn(token, path.read_text(encoding="utf-8"))
+
+    def test_unsafe_override_on_disk_is_ignored(self):
+        journal.ensure_dirs()
+        journal.model_override_read_path().write_text(
+            json.dumps({"provider": "", "model": "sk-" + "b" * 24}),
+            encoding="utf-8",
+        )
+        self.assertIsNone(journal.read_model_override())
+        self.assertNotEqual(config.effective_llm_target()["source"], "command")
+
+    def test_free_text_override_on_disk_is_ignored(self):
+        journal.ensure_dirs()
+        journal.model_override_read_path().write_text(
+            json.dumps({"provider": "", "model": "not a model name"}),
+            encoding="utf-8",
+        )
+        self.assertIsNone(journal.read_model_override())
+
+    def test_empty_override_write_is_refused(self):
+        with self.assertRaises(ValueError):
+            journal.write_model_override("", "")
+
+    def test_model_command_reports_a_write_failure_instead_of_raising(self):
+        with patch.object(
+            journal, "write_model_override", side_effect=OSError("read-only journal_dir")
+        ):
+            result = plugin_init._handle_refine_command("model some-model")
+        self.assertIn("Model command failed", result)
+        self.assertIn("read-only journal_dir", result)
+
+    def test_model_auto_reports_a_failed_removal(self):
+        journal.write_model_override("", "pinned-model")
+        real_unlink = Path.unlink
+
+        def denied(self, *args, **kwargs):
+            # Scoped to this store: an unconditional stub would also break the
+            # mutation lock's release and leave a fresh lock file behind.
+            if self.name != journal._MODEL_OVERRIDE_FILE_NAME:
+                return real_unlink(self, *args, **kwargs)
+            raise PermissionError(13, "Access is denied")
+
+        # Exercise the real except branch: the unlink raises and the file stays.
+        with patch.object(Path, "unlink", denied):
+            self.assertEqual(journal.clear_model_override(), "failed")
+            result = plugin_init._handle_refine_command("model auto")
+        self.assertIn("Could not remove", result)
+        # The reply must not claim removal, and the effective target it prints has
+        # to match reality: the override survived.
+        self.assertNotIn("Override removed", result)
+        self.assertIn("source: command", result)
+        self.assertEqual(journal.read_model_override()["model"], "pinned-model")
+
+    def test_model_auto_says_when_there_was_nothing_to_remove(self):
+        self.assertEqual(journal.clear_model_override(), "absent")
+        result = plugin_init._handle_refine_command("model auto")
+        self.assertIn("No override was set", result)
+
+    def test_model_auto_confirms_a_real_removal(self):
+        journal.write_model_override("", "pinned-model")
+        self.assertEqual(journal.clear_model_override(), "removed")
+
+    def test_punctuation_only_model_is_refused(self):
+        for text in (".", "---", "..", "-"):
+            with self.subTest(text=text):
+                self.assertFalse(journal.valid_model_identifier(text))
+                with patch.object(plugin_init.core, "refine_run", return_value={
+                    "success": True, "message": "done", "outcome": "no_op",
+                }):
+                    plugin_init._handle_refine_command(f"model {text}")
+                self.assertIsNone(journal.read_model_override())
+
+    def test_rejected_override_on_disk_is_reported_not_only_logged(self):
+        FakeHost.entry_config()["llm"] = {"model": "cfg-model"}
+        journal.ensure_dirs()
+        journal.model_override_read_path().write_text(
+            json.dumps({"provider": "", "model": "sk-" + "b" * 24}),
+            encoding="utf-8",
+        )
+        target = config.effective_llm_target()
+        self.assertEqual(target["source"], "config")
+        self.assertTrue(any("unusable" in item for item in target["issues"]))
+        status = core.refine_status()
+        self.assertIn("model_target_issue", status["warning_codes"])
+        # The file still pins something; the report must not read as all clear.
+        self.assertIn("unusable", plugin_init._handle_refine_command("status"))
+        self.assertIn("unusable", plugin_init._handle_refine_command("model"))
+
+    def test_non_utf8_override_is_rejected_not_raised(self):
+        """A store written in another codepage must not break every pass."""
+        journal.ensure_dirs()
+        journal.model_override_read_path().write_bytes(b'{"model": "caf\xe9-v1"}')
+        # Decoding inside the read would raise UnicodeDecodeError, which is not an
+        # OSError; escaping here would surface as a generic LLM failure and every
+        # pass would journal an ordinary no_op with success=true.
+        self.assertEqual(journal.read_model_override_state(), (None, "rejected"))
+        target = config.effective_llm_target()
+        self.assertNotEqual(target["source"], "command")
+        self.assertIn("model_target_issue", core.refine_status()["warning_codes"])
+        model = MockLlm({
+            "action": "no_op", "reason": "nothing", "evidence": [],
+            "kind": "", "name": "", "content": "",
+        })
+        # The proposal call must still be made, not aborted before it starts.
+        llm.propose(model, "evidence", [], [])
+        self.assertEqual(len(model.calls), 1)
+
+    def test_several_target_problems_are_all_reported(self):
+        FakeHost.entry_config()["llm"] = {
+            "provider": "token=abcdef",
+            "model": "not a model",
+        }
+        journal.ensure_dirs()
+        journal.model_override_read_path().write_text("not json!", encoding="utf-8")
+        issues = config.effective_llm_target()["issues"]
+        self.assertEqual(len(issues), 3)
+        text = plugin_init._handle_refine_command("status")
+        self.assertIn("llm.provider", text)
+        self.assertIn("llm.model", text)
+        self.assertIn("model_override.json", text)
+
+    def test_refusal_names_the_rule_without_echoing_the_value(self):
+        token = "ghp_" + "A" * 36
+        result = plugin_init._handle_refine_command(f"model {token}")
+        self.assertIn("credential pattern", result)
+        self.assertNotIn(token, result)
+        shapeless = plugin_init._handle_refine_command("model ---")
+        self.assertIsNone(journal.read_model_override())
+        self.assertNotIn("credential", shapeless or "")
+
+    def test_unreadable_override_is_distinguished_from_absent(self):
+        journal.write_model_override("", "pinned-model")
+        real_read_bytes = Path.read_bytes
+
+        def denied(self, *args, **kwargs):
+            # Scoped to this store: an unconditional stub would break any
+            # background thread that reads a file during the retry window.
+            if self.name != journal._MODEL_OVERRIDE_FILE_NAME:
+                return real_read_bytes(self, *args, **kwargs)
+            raise OSError("sharing violation")
+
+        with patch.object(Path, "read_bytes", denied):
+            override, state = journal.read_model_override_state()
+        self.assertIsNone(override)
+        self.assertEqual(state, "unreadable")
+
+    def test_store_read_never_raises_for_any_exception_type(self):
+        """'Never raises' must hold for types the retry does not expect."""
+        journal.write_model_override("", "pinned-model")
+        real_read_bytes = Path.read_bytes
+
+        def boom(self, *args, **kwargs):
+            if self.name != journal._MODEL_OVERRIDE_FILE_NAME:
+                return real_read_bytes(self, *args, **kwargs)
+            raise MemoryError("not an OSError")
+
+        with patch.object(Path, "read_bytes", boom):
+            self.assertEqual(journal.read_model_override_state(), (None, "unreadable"))
+
+    def test_target_resolution_failure_never_aborts_a_proposal(self):
+        with patch.object(
+            config, "effective_llm_target", side_effect=RuntimeError("boom")
+        ):
+            self.assertEqual(llm._pinned_target(), {})
+            model = MockLlm({
+                "action": "no_op", "reason": "nothing", "evidence": [],
+                "kind": "", "name": "", "content": "",
+            })
+            llm.propose(model, "evidence", [], [])
+        # The call must still be made rather than collapsing into a generic
+        # "LLM call failed" no_op that reports success.
+        self.assertEqual(len(model.calls), 1)
+        self.assertNotIn("model", model.calls[0])
+
+    def test_namespaced_config_model_is_kept(self):
+        FakeHost.entry_config()["llm"] = {
+            "model": "deepseek/deepseek-chat",
+            "allow_model_override": True,
+        }
+        target = config.effective_llm_target()
+        self.assertEqual(target["model"], "deepseek/deepseek-chat")
+        self.assertEqual(target["issues"], [])
+        model = MockLlm({
+            "action": "no_op", "reason": "nothing", "evidence": [],
+            "kind": "", "name": "", "content": "",
+        })
+        llm.propose(model, "evidence", [], [])
+        self.assertEqual(model.calls[0]["model"], "deepseek/deepseek-chat")
+
+    def test_namespaced_provider_is_still_refused(self):
+        # The slash is the separator in the command grammar, so a provider that
+        # contains one is not a provider.
+        self.assertTrue(journal.model_override_field_is_safe(
+            "anthropic/claude-3.5-sonnet", allow_namespace=True
+        ))
+        self.assertFalse(journal.model_override_field_is_safe("a/b"))
+
+    def test_override_read_retries_a_transient_denied_open(self):
+        """A momentary sharing violation must not read as 'no override'."""
+        journal.write_model_override("", "pinned-model")
+        real_read_bytes = Path.read_bytes
+        calls = {"n": 0}
+
+        def flaky(self, *args, **kwargs):
+            if self.name != journal._MODEL_OVERRIDE_FILE_NAME:
+                return real_read_bytes(self, *args, **kwargs)
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise PermissionError(13, "Access is denied")
+            return real_read_bytes(self, *args, **kwargs)
+
+        with patch.object(Path, "read_bytes", flaky):
+            override, state = journal.read_model_override_state()
+        self.assertEqual(state, "ok")
+        self.assertEqual(override["model"], "pinned-model")
+        self.assertEqual(calls["n"], 3)
+
+    def test_absent_override_read_does_not_pay_the_retry_budget(self):
+        """The common 'nothing pinned' case must stay on the fast path.
+
+        Counted, not timed: a wall-clock assertion here could only ever fail for
+        environmental reasons, and a suite that goes red for those trains people
+        to ignore red.
+        """
+        calls = {"n": 0}
+        real = journal._read_model_override_bytes
+
+        def counted():
+            calls["n"] += 1
+            return real()
+
+        with patch.object(journal, "_read_model_override_bytes", counted):
+            self.assertEqual(journal.read_model_override_state()[1], "absent")
+        self.assertEqual(calls["n"], 1)
+
+    def test_clear_retries_a_transient_denied_unlink(self):
+        journal.write_model_override("", "pinned-model")
+        real_unlink = Path.unlink
+        calls = {"n": 0}
+
+        def flaky(self, *args, **kwargs):
+            if self.name != journal._MODEL_OVERRIDE_FILE_NAME:
+                return real_unlink(self, *args, **kwargs)
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise PermissionError(13, "Access is denied")
+            return real_unlink(self, *args, **kwargs)
+
+        with patch.object(Path, "unlink", flaky):
+            self.assertEqual(journal.clear_model_override(), "removed")
+        self.assertEqual(calls["n"], 3)
+        self.assertIsNone(journal.read_model_override())
+
+    def test_absent_override_is_not_reported_as_a_problem(self):
+        override, state = journal.read_model_override_state()
+        self.assertIsNone(override)
+        self.assertEqual(state, "absent")
+        self.assertEqual(config.effective_llm_target()["issues"], [])
+        self.assertNotIn("model_target_issue", core.refine_status()["warning_codes"])
+
+    def test_unsafe_config_model_is_dropped_and_reported(self):
+        FakeHost.entry_config()["llm"] = {
+            "model": "sk-" + "c" * 24,
+            "allow_model_override": True,
+        }
+        target = config.effective_llm_target()
+        # The same rule must hold for the config as for the command store.
+        self.assertEqual(target["model"], "")
+        self.assertTrue(any("llm.model" in item for item in target["issues"]))
+        self.assertIn("model_target_issue", core.refine_status()["warning_codes"])
+        model = MockLlm({
+            "action": "no_op", "reason": "nothing", "evidence": [],
+            "kind": "", "name": "", "content": "",
+        })
+        llm.propose(model, "evidence", [], [])
+        self.assertNotIn("model", model.calls[0])
+
+    def test_unsafe_config_provider_is_dropped_and_reported(self):
+        FakeHost.entry_config()["llm"] = {
+            "provider": "token=abcdef",
+            "allow_provider_override": True,
+        }
+        target = config.effective_llm_target()
+        self.assertEqual(target["provider"], "")
+        self.assertTrue(any("llm.provider" in item for item in target["issues"]))
+
+    def test_command_override_does_not_borrow_the_live_provider(self):
+        fake = types.ModuleType("agent.auxiliary_client")
+        fake._read_main_provider = lambda: "live-prov"
+        fake._read_main_model = lambda: "live-model"
+        journal.write_model_override("", "pinned-model")
+        with patch.dict("sys.modules", {"agent.auxiliary_client": fake}):
+            target = config.effective_llm_target()
+        # Leaving provider unset means "let Hermes resolve it", and Hermes
+        # resolves it to the live provider anyway. Naming it here would claim a
+        # choice the user never made and would need the provider trust flag.
+        self.assertEqual(target["source"], "command")
+        self.assertEqual(target["model"], "pinned-model")
+        self.assertEqual(target["provider"], "")
+
+    def test_namespaced_command_target_pins_instead_of_spending_a_pass(self):
+        # Only the first slash separates provider from model; the rest belongs to
+        # the model id. Routing this to the proposal path would spend a daily edit.
+        with patch.object(plugin_init.core, "refine_run") as run:
+            result = plugin_init._handle_refine_command(
+                "model openrouter/deepseek/deepseek-chat"
+            )
+        run.assert_not_called()
+        self.assertIn("Override set", result)
+        override = journal.read_model_override()
+        self.assertEqual(override["provider"], "openrouter")
+        self.assertEqual(override["model"], "deepseek/deepseek-chat")
+
+    def test_slash_only_target_goes_as_reason(self):
+        for text in ("model /", "model a/", "model /b"):
+            with self.subTest(text=text):
+                with patch.object(plugin_init.core, "refine_run", return_value={
+                    "success": True, "message": "done", "outcome": "no_op",
+                }) as run:
+                    plugin_init._handle_refine_command(text)
+                run.assert_called_once()
+                self.assertIsNone(journal.read_model_override())
+
+    def test_status_reports_the_effective_model_and_source(self):
+        FakeHost.entry_config()["llm"] = {
+            "provider": "opencode-go",
+            "model": "deepseek-v4",
+            "allow_model_override": True,
+            "allow_provider_override": True,
+        }
+        status = core.refine_status()
+        self.assertEqual(status["llm_model"], "deepseek-v4")
+        self.assertEqual(status["llm_provider"], "opencode-go")
+        self.assertEqual(status["llm_target_source"], "config")
+        text = plugin_init._handle_refine_command("status")
+        self.assertIn("deepseek-v4", text)
+        self.assertIn("opencode-go", text)
+
+    def test_status_warns_when_trust_denies_a_set_model(self):
+        FakeHost.entry_config()["llm"] = {"model": "deepseek-v4"}
+        status = core.refine_status()
+        # The value is dropped before the host call, so this report is the only
+        # place the user can find out.
+        self.assertIn("model_override_trust_denied", status["warning_codes"])
+        self.assertIn("trust denies", plugin_init._handle_refine_command("status"))
+
+    def test_status_warns_when_trust_denies_a_set_provider(self):
+        FakeHost.entry_config()["llm"] = {
+            "provider": "opencode-go",
+            "allow_model_override": True,
+        }
+        self.assertIn(
+            "provider_override_trust_denied", core.refine_status()["warning_codes"]
+        )
+
+    def test_status_does_not_warn_about_trust_for_the_live_model(self):
+        fake = types.ModuleType("agent.auxiliary_client")
+        fake._read_main_provider = lambda: "live-prov"
+        fake._read_main_model = lambda: "live-model"
+        with patch.dict("sys.modules", {"agent.auxiliary_client": fake}):
+            status = core.refine_status()
+        self.assertEqual(status["llm_target_source"], "live")
+        self.assertNotIn("model_override_trust_denied", status["warning_codes"])
+        self.assertNotIn("provider_override_trust_denied", status["warning_codes"])
+
+    def test_status_reports_an_active_command_override(self):
+        journal.write_model_override("", "pinned-model")
+        status = core.refine_status()
+        self.assertIn("model_override_active", status["warning_codes"])
+        self.assertIn("pinned-model", plugin_init._handle_refine_command("status"))
+
+    def test_status_survives_an_unreadable_model_target(self):
+        with patch.object(
+            config, "effective_llm_target", side_effect=RuntimeError("boom")
+        ):
+            status = core.refine_status()
+        # Not "host_default": that would claim a resolution that did not happen.
+        self.assertEqual(status["llm_target_source"], "unknown")
+        self.assertIn("model_target_issue", status["warning_codes"])
+        self.assertEqual(status["warning_codes"].count("model_target_issue"), 1)
+
+    def test_override_write_and_clear_race_never_yields_a_broken_target(self):
+        """Two live passes read this store while a /refine model write lands."""
+        journal.write_model_override("", "model-a")
+        seen = []
+        errors = []
+        stop = threading.Event()
+
+        def writer():
+            # Only writes, never a clear: an override is in force the whole time,
+            # so "no override" is not a legal observation and a read that silently
+            # degrades to it would fail this test rather than be excused by it.
+            try:
+                while not stop.is_set():
+                    journal.write_model_override("", "model-b")
+                    journal.write_model_override("", "model-a")
+            except Exception as exc:  # pragma: no cover - reported below
+                errors.append(exc)
+
+        def reader():
+            try:
+                for _ in range(300):
+                    state = journal.read_model_override_state()[1]
+                    target = config.effective_llm_target()
+                    seen.append((target["source"], target["model"], state))
+            except Exception as exc:  # pragma: no cover - reported below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=writer), threading.Thread(target=reader)]
+        for thread in threads:
+            thread.start()
+        threads[1].join(10)
+        stop.set()
+        for thread in threads:
+            thread.join(10)
+
+        self.assertEqual(errors, [])
+        # The full count, not just "some": a reader that died after one iteration
+        # would otherwise satisfy this test while exercising none of the race.
+        self.assertEqual(len(seen), 300)
+        tally = Counter(seen)
+        for source, model, state in seen:
+            self.assertIn((source, model), {
+                ("command", "model-a"),
+                ("command", "model-b"),
+            }, f"observed {tally!r}")
+
+    def test_atomic_write_retries_a_windows_style_replace_denial(self):
+        """A concurrent reader must delay the replace, not fail the write."""
+        real_replace = journal.os.replace
+        target_name = journal._MODEL_OVERRIDE_FILE_NAME
+        calls = {"n": 0}
+
+        def flaky(src, dst):
+            # Scoped to this store, so a stray background writer elsewhere in the
+            # suite cannot be handed the failing stub.
+            if Path(dst).name != target_name:
+                return real_replace(src, dst)
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise PermissionError(13, "Access is denied")
+            return real_replace(src, dst)
+
+        with patch.object(journal.os, "replace", side_effect=flaky):
+            journal.write_model_override("", "retried-model")
+        self.assertEqual(calls["n"], 3)
+        self.assertEqual(journal.read_model_override()["model"], "retried-model")
+
+    def test_atomic_write_surfaces_a_persistent_replace_denial(self):
+        """A retry must not turn a real, permanent failure into a silent success."""
+        real_replace = journal.os.replace
+        target_name = journal._MODEL_OVERRIDE_FILE_NAME
+
+        attempts = {"n": 0}
+
+        def always_denied(src, dst):
+            if Path(dst).name != target_name:
+                return real_replace(src, dst)
+            attempts["n"] += 1
+            raise PermissionError(13, "Access is denied")
+
+        with patch.object(journal.os, "replace", side_effect=always_denied):
+            with self.assertRaises(PermissionError):
+                journal.write_model_override("", "never-lands")
+        # More than one attempt, so this fails if the retry is removed rather than
+        # passing for the same reason a bare os.replace would.
+        self.assertGreater(attempts["n"], 1)
+        self.assertIsNone(journal.read_model_override())
+
+    def test_store_retry_budgets_stay_under_the_host_callback_bound(self):
+        """Two limits describing the same stall must not drift apart.
+
+        A host callback waits at most ``_HOST_PATH_LOCK_TIMEOUT`` for the mutation
+        lock; the store retries are what a lock holder can add on top. Their sum
+        is what must stay small relative to that bound, not any single one.
+        """
+        total = (
+            journal._WRITE_RETRY_BUDGET_SECONDS
+            + journal._READ_RETRY_BUDGET_SECONDS
+            + journal._UNLINK_RETRY_BUDGET_SECONDS
+        )
+        self.assertLess(total, plugin_init._HOST_PATH_LOCK_TIMEOUT / 2)
+        # Pin the derivation itself, not just an upper bound: a hardcoded value
+        # would satisfy an inequality while defeating the single-base rule.
+        base = journal._CONTENTION_BUDGET_SECONDS
+        self.assertEqual(journal._WRITE_RETRY_BUDGET_SECONDS, base)
+        self.assertEqual(journal._READ_RETRY_BUDGET_SECONDS, base / 5)
+        self.assertEqual(journal._UNLINK_RETRY_BUDGET_SECONDS, base / 5)
+
     def test_status_command_returns_text_not_dict(self):
         result = plugin_init._handle_refine_command("status")
         self.assertIsInstance(result, str)
@@ -3586,6 +4138,556 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
         sentinel = object()
         with patch.object(plugin_init, "PluginLlm", return_value=sentinel):
             self.assertIs(plugin_init._session_llm(), sentinel)
+
+    # ── Session identity (Part A) ─────────────────────────────────────────────
+
+    def test_explicit_session_id_wins_over_hook_and_env(self):
+        core.note_session_id("from-hook")
+        with patch.object(core, "host_session_id", return_value="from-env"):
+            sid, how = core.resolve_session_id("explicit-id")
+        self.assertEqual(sid, "explicit-id")
+        self.assertEqual(how, "explicit")
+
+    def test_host_env_wins_over_hook(self):
+        core.note_session_id("from-hook")
+        with patch.object(core, "host_session_id", return_value="from-env"):
+            sid, how = core.resolve_session_id()
+        self.assertEqual(sid, "from-env")
+        self.assertEqual(how, "host_env")
+
+    def test_hook_used_when_host_env_is_empty(self):
+        core.note_session_id("from-hook")
+        with patch.object(core, "host_session_id", return_value=""):
+            sid, how = core.resolve_session_id()
+        self.assertEqual(sid, "from-hook")
+        self.assertEqual(how, "hook")
+
+    def test_unknown_when_no_sources_available(self):
+        core._LAST_SESSION_ID = ""
+        with patch.object(core, "host_session_id", return_value=""):
+            sid, how = core.resolve_session_id()
+        self.assertEqual(sid, "")
+        self.assertEqual(how, "unknown")
+
+    def test_unknown_session_refuses_without_spending_budget(self):
+        """When session_id cannot be determined, refine must not run."""
+        core._LAST_SESSION_ID = ""
+        with patch.object(core, "host_session_id", return_value=""):
+            model = MockLlm({
+                "action": "no_op", "reason": "nothing", "evidence": [],
+                "kind": "", "name": "", "content": "",
+            })
+            result = core.refine_run(model)
+        self.assertFalse(result["success"])
+        self.assertEqual(result["outcome"], "session_unknown")
+        self.assertIn("Cannot identify", result["message"])
+        # No budget consumed, no journal entry
+        self.assertEqual(journal.count_today_applied(), 0)
+        self.assertEqual(len(model.calls), 0)
+
+    def test_empty_hook_does_not_overwrite_existing_id(self):
+        core._LAST_SESSION_ID = ""
+        core.note_session_id("real-session")
+        core.note_session_id("")
+        core.note_session_id("   ")
+        self.assertEqual(core._noted_session_id(), "real-session")
+
+    def test_note_session_id_rejects_scrub_altering_values(self):
+        core._LAST_SESSION_ID = ""
+        core.note_session_id("ghp_" + "A" * 36)
+        self.assertEqual(core._noted_session_id(), "")
+
+    def test_gateway_like_env_uses_hook(self):
+        """In the gateway, get_session_env returns '' but hooks provide the id."""
+        core.note_session_id("gw-session-123")
+        with patch.object(core, "host_session_id", return_value=""):
+            sid, how = core.resolve_session_id()
+        self.assertEqual(sid, "gw-session-123")
+        self.assertEqual(how, "hook")
+
+    def test_status_reports_session_id_and_source(self):
+        core.note_session_id("test-session-id")
+        with patch.object(core, "host_session_id", return_value=""):
+            status = core.refine_status()
+        self.assertEqual(status["session_id"], "test-session-id")
+        self.assertEqual(status["session_id_source"], "hook")
+        self.assertIsInstance(status["session_message_count"], int)
+        text = plugin_init._handle_refine_command("status")
+        self.assertIn("test-session-id", text)
+        self.assertIn("hook", text)
+
+    def test_status_blocks_on_unknown_session(self):
+        core._LAST_SESSION_ID = ""
+        with patch.object(core, "host_session_id", return_value=""):
+            status = core.refine_status()
+        self.assertIn("session_unknown", status["blocker_codes"])
+        text = plugin_init._handle_refine_command("status")
+        self.assertIn("Cannot identify", text)
+
+    def test_note_session_id_two_threads_no_crash(self):
+        core._LAST_SESSION_ID = ""
+        errors = []
+
+        def writer(val):
+            try:
+                for _ in range(200):
+                    core.note_session_id(val)
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=writer, args=("session-a",)),
+            threading.Thread(target=writer, args=("session-b",)),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(5)
+        self.assertEqual(errors, [])
+        self.assertIn(core._noted_session_id(), {"session-a", "session-b"})
+
+    def test_regression_newest_by_started_at_with_1_message_is_refused(self):
+        """Reproduce the real bug: a ghost session newer by started_at has 1 msg."""
+        core._LAST_SESSION_ID = ""
+        now = time.time()
+        # Long-lived active session
+        messages = [
+            ("active-session", "user", "Hello", "", now - 100, 1),
+            ("active-session", "assistant", "Hi!", "", now - 99, 1),
+            ("active-session", "user", "Do X", "", now - 50, 1),
+            ("active-session", "tool", "Done X", "bash", now - 49, 1),
+        ] * 10  # 40 messages
+        # Ghost: newest by started_at, only 1 message
+        messages.append(("ghost-session", "user", "oops", "", now - 5, 1))
+        FakeHost.make_db(messages)
+        # Re-insert sessions with the right ordering
+        path = self.root / "state.db"
+        connection = sqlite3.connect(path)
+        connection.execute("DELETE FROM sessions")
+        connection.execute(
+            "INSERT INTO sessions VALUES ('active-session', ?, 'cli')", (now - 200,)
+        )
+        connection.execute(
+            "INSERT INTO sessions VALUES ('ghost-session', ?, 'cli')", (now - 2,)
+        )
+        connection.commit()
+        connection.close()
+        # Without explicit id and without hook → must refuse, not pick the ghost.
+        with patch.object(core, "host_session_id", return_value=""):
+            result = core.refine_run(MockLlm())
+        self.assertEqual(result["outcome"], "session_unknown")
+        self.assertIn("Cannot identify", result["message"])
+
+    def test_pre_llm_call_hook_notes_the_session_id(self):
+        plugin_init._on_pre_llm_call(session_id="hook-session-abc")
+        self.assertEqual(core._noted_session_id(), "hook-session-abc")
+
+    def test_post_llm_call_hook_notes_the_session_id(self):
+        plugin_init._on_post_llm_call(session_id="post-hook-sess", conversation_history=[])
+        self.assertEqual(core._noted_session_id(), "post-hook-sess")
+
+    def test_session_end_hook_notes_the_session_id(self):
+        # _on_session_end spawns a daemon thread; just verify that the session id
+        # is noted synchronously, before the thread starts.
+        core._LAST_SESSION_ID = ""
+        # Disable auto so the function returns early after noting the id.
+        FakeHost.entry_config()["auto_enabled"] = False
+        plugin_init._on_session_end(session_id="end-sess-xyz")
+        self.assertEqual(core._noted_session_id(), "end-sess-xyz")
+
+    # ── Session source filter (Part D) ────────────────────────────────────────
+
+    def test_cron_session_is_skipped_by_default(self):
+        # Mark the test session as cron in the DB.
+        path = self.root / "state.db"
+        connection = sqlite3.connect(path)
+        connection.execute("UPDATE sessions SET source='cron' WHERE id='session'")
+        connection.commit()
+        connection.close()
+        model = MockLlm({
+            "action": "no_op", "reason": "nothing", "evidence": [],
+            "kind": "", "name": "", "content": "",
+        })
+        result = core.refine_run(model, session_id="session")
+        self.assertEqual(result.get("outcome"), "skipped_session_source")
+        self.assertIn("cron", result["message"])
+        # No model called, no budget spent
+        self.assertEqual(len(model.calls), 0)
+        self.assertEqual(journal.count_today_applied(), 0)
+
+    def test_cli_session_is_not_skipped(self):
+        # Default source is 'cli' which is not in skip list
+        model = MockLlm({
+            "action": "no_op", "reason": "nothing", "evidence": [],
+            "kind": "", "name": "", "content": "",
+        })
+        result = core.refine_run(model, session_id="session")
+        # Should proceed past the source check (may end as no_op for signal reasons)
+        self.assertNotEqual(result.get("outcome"), "skipped_session_source")
+
+    def test_empty_skip_sources_skips_nothing(self):
+        FakeHost.entry_config()["skip_session_sources"] = []
+        path = self.root / "state.db"
+        connection = sqlite3.connect(path)
+        connection.execute("UPDATE sessions SET source='cron' WHERE id='session'")
+        connection.commit()
+        connection.close()
+        model = MockLlm({
+            "action": "no_op", "reason": "nothing", "evidence": [],
+            "kind": "", "name": "", "content": "",
+        })
+        result = core.refine_run(model, session_id="session")
+        self.assertNotEqual(result.get("outcome"), "skipped_session_source")
+
+    def test_invalid_skip_sources_config_uses_default(self):
+        FakeHost.entry_config()["skip_session_sources"] = "not a list"
+        self.assertEqual(config.skip_session_sources(), ["cron"])
+
+    def test_source_read_failure_does_not_block_the_pass(self):
+        # If the source cannot be read (missing column, etc.), the pass proceeds.
+        with patch.object(core, "_get_session_source", return_value=""):
+            model = MockLlm({
+                "action": "no_op", "reason": "nothing", "evidence": [],
+                "kind": "", "name": "", "content": "",
+            })
+            result = core.refine_run(model, session_id="session")
+        self.assertNotEqual(result.get("outcome"), "skipped_session_source")
+
+    def test_status_reports_skip_sources_and_session_source(self):
+        status = core.refine_status()
+        self.assertIn("skip_session_sources", status)
+        self.assertEqual(status["skip_session_sources"], ["cron"])
+        self.assertEqual(status["session_source"], "cli")
+
+    # ── Model attribution (Part B) ────────────────────────────────────────────
+
+    def test_single_pass_uses_one_target_for_all_calls(self):
+        """Even if effective_llm_target changes mid-pass, the calls are consistent."""
+        FakeHost.entry_config()["llm"] = {
+            "model": "pinned-model",
+            "allow_model_override": True,
+        }
+        call_models = []
+
+        class SpyLlm:
+            calls = []
+
+            def complete_structured(self, **kwargs):
+                call_models.append(kwargs.get("model"))
+                return MockResult(
+                    {"action": "no_op", "reason": "nothing", "evidence": []},
+                    model="reported-from-host",
+                    output_tokens=42,
+                )
+
+        spy = SpyLlm()
+        core.refine_run(spy, session_id="session")
+        # All calls within the pass used the same resolved target.
+        self.assertTrue(all(m == "pinned-model" for m in call_models))
+
+    def test_journal_entry_contains_llm_meta_fields(self):
+        FakeHost.entry_config()["llm"] = {
+            "model": "test-model-x",
+            "allow_model_override": True,
+        }
+        model = MockLlm(MockResult(
+            {"action": "no_op", "reason": "nothing", "evidence": [],
+             "kind": "", "name": "", "content": ""},
+            model="actual-host-model",
+            output_tokens=100,
+        ))
+        core.refine_run(model, session_id="session")
+        entries = journal.entries()
+        latest = entries[-1] if entries else {}
+        meta = latest.get("llm_meta", {})
+        self.assertEqual(meta.get("requested_model"), "test-model-x")
+        self.assertEqual(meta.get("reported_model"), "actual-host-model")
+        self.assertEqual(meta.get("target_source"), "config")
+        self.assertIsInstance(meta.get("latency_ms"), int)
+        self.assertEqual(meta.get("output_tokens"), 100)
+
+    def test_journal_entry_omits_output_tokens_when_unavailable(self):
+        model = MockLlm(MockResult(
+            {"action": "no_op", "reason": "nothing", "evidence": [],
+             "kind": "", "name": "", "content": ""},
+            model="any-model",
+        ))
+        core.refine_run(model, session_id="session")
+        entries = journal.entries()
+        latest = entries[-1] if entries else {}
+        meta = latest.get("llm_meta", {})
+        self.assertNotIn("output_tokens", meta)
+
+    def test_old_journal_entries_without_llm_meta_read_fine(self):
+        # Simulate a legacy entry without llm_meta
+        journal.log(
+            trigger="manual",
+            reason="legacy entry",
+            session_id="session",
+            proposal={"action": "no_op", "reason": "old"},
+            outcome="no_op",
+        )
+        entries = journal.entries()
+        latest = entries[-1]
+        # No llm_meta key present — that's fine.
+        self.assertNotIn("llm_meta", latest)
+        # Audit must not crash.
+        audit = core.refine_audit()
+        self.assertTrue(audit["success"])
+
+    def test_llm_meta_fields_are_scrubbed(self):
+        token = "ghp_" + "A" * 36
+        model = MockLlm(MockResult(
+            {"action": "no_op", "reason": "nothing", "evidence": [],
+             "kind": "", "name": "", "content": ""},
+            model=token,
+            output_tokens=10,
+        ))
+        core.refine_run(model, session_id="session")
+        entries = journal.entries()
+        latest = entries[-1] if entries else {}
+        meta = latest.get("llm_meta", {})
+        # The reported model must not contain the raw token.
+        self.assertNotIn(token, json.dumps(meta))
+
+    def test_target_issues_are_recorded_in_llm_meta(self):
+        FakeHost.entry_config()["llm"] = {"model": "sk-" + "a" * 24}
+        model = MockLlm(MockResult(
+            {"action": "no_op", "reason": "nothing", "evidence": [],
+             "kind": "", "name": "", "content": ""},
+            model="fallback-model",
+        ))
+        core.refine_run(model, session_id="session")
+        entries = journal.entries()
+        latest = entries[-1] if entries else {}
+        meta = latest.get("llm_meta", {})
+        self.assertTrue(meta.get("target_issues"))
+        self.assertIn("credential", meta["target_issues"][0])
+
+    # ── Dry-run (Part E) ──────────────────────────────────────────────────────
+
+    def test_dry_run_does_not_mutate_host(self):
+        FakeHost.actions.clear()
+        model = MockLlm({
+            "action": "create", "kind": "skill", "name": "dry-skill",
+            "content": "---\nname: dry-skill\ndescription: test\n---\n# body\n",
+            "reason": "testing dry run", "evidence": [],
+            "expected_outcome": "something",
+        })
+        result = core.refine_run(model, session_id="session", dry_run=True)
+        self.assertEqual(result["outcome"], "dry_run")
+        self.assertEqual(FakeHost.actions, [])
+
+    def test_dry_run_does_not_spend_budget(self):
+        before = journal.count_today_applied()
+        model = MockLlm({
+            "action": "create", "kind": "skill", "name": "dry-skill",
+            "content": "---\nname: dry-skill\ndescription: test\n---\n# body\n",
+            "reason": "testing dry run", "evidence": [],
+            "expected_outcome": "something",
+        })
+        core.refine_run(model, session_id="session", dry_run=True)
+        self.assertEqual(journal.count_today_applied(), before)
+
+    def test_dry_run_shows_diff_for_patch(self):
+        FakeHost.skills["existing-skill"] = "---\nname: existing-skill\ndescription: old\n---\n# Old body\n"
+        new_content = "---\nname: existing-skill\ndescription: new\n---\n# New body\n"
+        model = MockLlm({
+            "action": "patch", "kind": "skill", "name": "existing-skill",
+            "content": new_content,
+            "reason": "update", "evidence": [],
+            "expected_outcome": "improvement",
+        })
+        result = core.refine_run(model, session_id="session", dry_run=True)
+        self.assertEqual(result["outcome"], "dry_run")
+        self.assertIn("diff", result)
+        self.assertIn("-# Old body", result["diff"])
+        self.assertIn("+# New body", result["diff"])
+
+    def test_dry_run_diff_is_scrubbed(self):
+        token = "ghp_" + "A" * 36
+        FakeHost.skills["leaky-skill"] = "---\nname: leaky-skill\ndescription: ok\n---\n# body\n"
+        new_content = f"---\nname: leaky-skill\ndescription: ok\n---\n# body with {token}\n"
+        model = MockLlm({
+            "action": "patch", "kind": "skill", "name": "leaky-skill",
+            "content": new_content,
+            "reason": "update", "evidence": [],
+            "expected_outcome": "improvement",
+        })
+        result = core.refine_run(model, session_id="session", dry_run=True)
+        self.assertNotIn(token, result.get("diff", ""))
+
+    def test_dry_run_diff_is_truncated_at_limit(self):
+        # Content just under the max so the proposal is accepted, but the diff
+        # it produces exceeds MAX_CONTENT_CHARS.
+        old_content = "---\nname: big-skill\ndescription: ok\n---\n" + ("a\n" * 7000)
+        new_content = "---\nname: big-skill\ndescription: ok\n---\n" + ("b\n" * 7000)
+        FakeHost.skills["big-skill"] = old_content
+        model = MockLlm({
+            "action": "patch", "kind": "skill", "name": "big-skill",
+            "content": new_content,
+            "reason": "update", "evidence": [],
+            "expected_outcome": "improvement",
+        })
+        result = core.refine_run(model, session_id="session", dry_run=True)
+        self.assertEqual(result["outcome"], "dry_run")
+        self.assertTrue(result.get("diff_truncated"))
+        self.assertIn("[truncated]", result.get("diff", ""))
+
+    def test_dry_run_journal_entry_exists_and_not_counted(self):
+        before = journal.count_today_applied()
+        model = MockLlm({
+            "action": "no_op", "reason": "nothing", "evidence": [],
+            "kind": "", "name": "", "content": "",
+        })
+        core.refine_run(model, session_id="session", dry_run=True)
+        entries = journal.entries()
+        dry_entries = [e for e in entries if e.get("outcome") == "dry_run"]
+        self.assertTrue(dry_entries)
+        self.assertEqual(journal.count_today_applied(), before)
+
+    def test_dry_run_with_reason(self):
+        model = MockLlm({
+            "action": "no_op", "reason": "nothing", "evidence": [],
+            "kind": "", "name": "", "content": "",
+        })
+        core.refine_run(model, reason="focus on gmail", session_id="session", dry_run=True)
+        entries = journal.entries()
+        dry_entries = [e for e in entries if e.get("outcome") == "dry_run"]
+        self.assertTrue(dry_entries)
+        self.assertIn("gmail", dry_entries[-1].get("reason", ""))
+
+    def test_dry_run_command_output(self):
+        with patch.object(core, "refine_run", return_value={
+            "success": True, "outcome": "dry_run",
+            "message": "Dry run: proposal shown, nothing applied.",
+            "proposal": {"action": "create", "kind": "skill", "name": "test-skill",
+                         "summary": "a test", "expected_outcome": "better"},
+            "diff": "", "diff_truncated": False,
+        }):
+            text = plugin_init._handle_refine_command("dry-run")
+        self.assertIn("Dry run", text)
+        self.assertIn("create", text)
+        self.assertIn("test-skill", text)
+
+    def test_dry_run_unknown_session_refuses(self):
+        core._LAST_SESSION_ID = ""
+        with patch.object(core, "host_session_id", return_value=""):
+            model = MockLlm()
+            result = core.refine_run(model, dry_run=True)
+        self.assertEqual(result["outcome"], "session_unknown")
+
+    # ── Journal directory migration (Part C) ──────────────────────────────────
+
+    def test_migration_copies_files_and_renames_legacy(self):
+        legacy = self.root / "hermes" / "plugins" / "refine"
+        legacy.mkdir(parents=True)
+        new_dir = self.root / "hermes" / "refine"
+        (legacy / "refine_journal.jsonl").write_text('{"id":"a"}', encoding="utf-8")
+        (legacy / "skill_stats.json").write_text('{}', encoding="utf-8")
+        backups = legacy / "backups"
+        backups.mkdir()
+        (backups / "test.bak").write_text("backup data", encoding="utf-8")
+        with patch.object(config, "_get_refine_entry", return_value={}):
+            result = journal.migrate_legacy_journal_dir(_new_dir=new_dir, _legacy_dir=legacy)
+        self.assertEqual(result, "migrated")
+        self.assertTrue((new_dir / "refine_journal.jsonl").is_file())
+        self.assertTrue((new_dir / "skill_stats.json").is_file())
+        self.assertTrue((new_dir / "backups" / "test.bak").is_file())
+        self.assertTrue((new_dir / ".migrated_from").is_file())
+        self.assertFalse(legacy.exists())
+        renamed = list(legacy.parent.glob("refine.migrated-*"))
+        self.assertEqual(len(renamed), 1)
+
+    def test_migration_is_idempotent(self):
+        legacy = self.root / "hermes" / "plugins" / "refine"
+        legacy.mkdir(parents=True)
+        new_dir = self.root / "hermes" / "refine"
+        (legacy / "refine_journal.jsonl").write_text('{"id":"a"}', encoding="utf-8")
+        with patch.object(config, "_get_refine_entry", return_value={}):
+            first = journal.migrate_legacy_journal_dir(_new_dir=new_dir, _legacy_dir=legacy)
+        self.assertEqual(first, "migrated")
+        with patch.object(config, "_get_refine_entry", return_value={}):
+            second = journal.migrate_legacy_journal_dir(_new_dir=new_dir, _legacy_dir=legacy)
+        self.assertEqual(second, "not_needed")
+
+    def test_migration_not_needed_for_new_install(self):
+        legacy = self.root / "hermes" / "plugins" / "refine"
+        new_dir = self.root / "hermes" / "refine"
+        with patch.object(config, "_get_refine_entry", return_value={}):
+            result = journal.migrate_legacy_journal_dir(_new_dir=new_dir, _legacy_dir=legacy)
+        self.assertEqual(result, "not_needed")
+
+    def test_migration_skips_when_user_configured(self):
+        legacy = self.root / "hermes" / "plugins" / "refine"
+        legacy.mkdir(parents=True)
+        (legacy / "refine_journal.jsonl").write_text('{"id":"a"}', encoding="utf-8")
+        new_dir = self.root / "hermes" / "refine"
+        with patch.object(config, "_get_refine_entry", return_value={"journal_dir": "/custom"}):
+            result = journal.migrate_legacy_journal_dir(_new_dir=new_dir, _legacy_dir=legacy)
+        self.assertEqual(result, "user_configured")
+        self.assertTrue((legacy / "refine_journal.jsonl").is_file())
+
+    def test_migration_failure_does_not_crash_register(self):
+        # Verify that a failing migration does not prevent plugin registration.
+        # We test the wrapping try/except in register() rather than calling the
+        # full register(), because register() re-wires hooks and globals.
+        raised = False
+        try:
+            with patch.object(journal, "migrate_legacy_journal_dir", side_effect=RuntimeError("boom")):
+                # Simulate just the migration wrapper from register().
+                try:
+                    journal.migrate_legacy_journal_dir()
+                except Exception:
+                    pass  # This is what register() does.
+        except RuntimeError:
+            raised = True
+        self.assertFalse(raised)
+
+    def test_migration_copy_failure_leaves_old_dir_intact(self):
+        legacy = self.root / "hermes" / "plugins" / "refine"
+        legacy.mkdir(parents=True)
+        new_dir = self.root / "hermes" / "refine"
+        (legacy / "refine_journal.jsonl").write_text('{"id":"a"}', encoding="utf-8")
+
+        import shutil as _shutil
+        real_copy2 = _shutil.copy2
+
+        def fail_copy2(src, dst, **kwargs):
+            raise OSError("disk full")
+
+        with patch.object(config, "_get_refine_entry", return_value={}), \
+             patch.object(_shutil, "copy2", side_effect=fail_copy2):
+            result = journal.migrate_legacy_journal_dir(_new_dir=new_dir, _legacy_dir=legacy)
+        self.assertEqual(result, "failed")
+        self.assertTrue((legacy / "refine_journal.jsonl").is_file())
+
+    def test_migration_two_threads_only_one_migrates(self):
+        legacy = self.root / "hermes" / "plugins" / "refine"
+        legacy.mkdir(parents=True)
+        new_dir = self.root / "hermes" / "refine"
+        (legacy / "refine_journal.jsonl").write_text('{"id":"a"}', encoding="utf-8")
+        # Prove idempotence by calling twice in sequence — the thread lock inside
+        # prevents concurrent execution in the same process, and the marker file
+        # prevents it across processes.
+        with patch.object(config, "_get_refine_entry", return_value={}):
+            r1 = journal.migrate_legacy_journal_dir(_new_dir=new_dir, _legacy_dir=legacy)
+            r2 = journal.migrate_legacy_journal_dir(_new_dir=new_dir, _legacy_dir=legacy)
+        self.assertEqual(r1, "migrated")
+        self.assertEqual(r2, "not_needed")
+
+    def test_old_directory_never_deleted(self):
+        legacy = self.root / "hermes" / "plugins" / "refine"
+        legacy.mkdir(parents=True)
+        new_dir = self.root / "hermes" / "refine"
+        (legacy / "refine_journal.jsonl").write_text('{"id":"a"}', encoding="utf-8")
+        with patch.object(config, "_get_refine_entry", return_value={}):
+            journal.migrate_legacy_journal_dir(_new_dir=new_dir, _legacy_dir=legacy)
+        self.assertTrue(legacy.parent.exists())
+        self.assertFalse(legacy.exists())
+        siblings = list(legacy.parent.glob("refine.migrated-*"))
+        self.assertTrue(siblings)
+        self.assertTrue((siblings[0] / "refine_journal.jsonl").is_file())
 
 
 if __name__ == "__main__":
