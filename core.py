@@ -21,6 +21,16 @@ except ImportError:
     from sanitization import sanitize, scrub_text  # noqa: F811
 
 logger = logging.getLogger(__name__)
+_UNTRUSTED_TOOL_TAG = re.compile(
+    r"<\s*/?\s*untrusted_tool_result\s*>", re.IGNORECASE
+)
+_RECORD_SEPARATOR = re.compile(r"[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]+")
+
+
+def _one_line(value: Any) -> str:
+    """Normalize every Unicode line boundary before rendering one record."""
+    return _RECORD_SEPARATOR.sub(" ", str(value)).strip()
+
 
 # ── session identity ───────────────────────────────────────────────────────
 # The host does not pass session_id to slash-command handlers (contract is
@@ -240,9 +250,15 @@ def collect_evidence(session_id: Optional[str] = None, limit: int = 60) -> Dict[
         corrections: List[Dict[str, Any]] = []
         error_items: List[Dict[str, Any]] = []
         for row in reversed(rows):
-            role = str(row["role"] or "")
+            # Every string from SQLite is scrubbed at this single extraction
+            # boundary so evidence, journals, and returned tool results inherit it.
+            role = _one_line(scrub_text(str(row["role"] or "")))[:32].lower()
+            if role not in {"user", "assistant", "tool", "system"}:
+                role = "unknown"
             content = scrub_text(str(row["content"] or ""))
-            tool_name = str(row["tool_name"] or "")
+            tool_name = _one_line(
+                scrub_text(str(row["tool_name"] or ""))
+            )[:120]
             shown = content[:400] + ("…" if len(content) > 400 else "")
             messages.append({"role": role, "content": shown, "tool_name": tool_name})
             if role == "tool" and _is_error_content(content):
@@ -251,10 +267,11 @@ def collect_evidence(session_id: Optional[str] = None, limit: int = 60) -> Dict[
                     if len(content) <= 4000
                     else content[:1000] + "\n…\n" + content[-3000:]
                 )
-                tool_errors.append({"tool": tool_name, "snippet": bounded[:300]})
+                pattern_content = _UNTRUSTED_TOOL_TAG.sub("", bounded)
+                tool_errors.append({"tool": tool_name, "snippet": pattern_content[:300]})
                 error_items.append({
                     "tool": tool_name,
-                    "content": bounded,
+                    "content": pattern_content,
                     "session_id": resolved,
                     "ts": row["timestamp"] or 0,
                 })
@@ -280,16 +297,23 @@ def collect_evidence(session_id: Optional[str] = None, limit: int = 60) -> Dict[
 
 def collect_cross_session_patterns(
     days: Optional[int] = None,
-    max_rows: Optional[int] = 4000,
+    max_rows: Optional[int] = -1,
     *,
     since_ts: Optional[float] = None,
     max_sessions: Optional[int] = None,
+    strict: bool = False,
 ) -> List[Dict[str, Any]]:
     if not config.cross_session_enabled():
+        if strict:
+            raise IOError("Cross-session pattern collection is disabled")
         return []
     connection = _open_db()
     if not connection:
+        if strict:
+            raise IOError("Cross-session database is unavailable")
         return []
+    if max_rows == -1:
+        max_rows = config.cross_session_max_rows()
     since = (
         since_ts
         if since_ts is not None
@@ -318,9 +342,12 @@ def collect_cross_session_patterns(
             else max_sessions
         )
         seen: set = set()
+        rows_seen = 0
 
         def iter_items():
+            nonlocal rows_seen
             for row in cursor:
+                rows_seen += 1
                 sid = scrub_text(str(row["session_id"] or ""))
                 if sid and sid not in seen:
                     if session_cap is not None and len(seen) >= session_cap:
@@ -335,18 +362,29 @@ def collect_cross_session_patterns(
                     else content[:1000] + "\n…\n" + content[-3000:]
                 )
                 yield {
-                    "tool": scrub_text(str(row["tool_name"] or "")),
-                    "content": bounded,
+                    "tool": _one_line(
+                        scrub_text(str(row["tool_name"] or ""))
+                    )[:120],
+                    "content": _UNTRUSTED_TOOL_TAG.sub("", bounded),
                     "session_id": sid,
                     "ts": row["timestamp"] or 0,
                 }
 
         full_audit = since_ts is not None and max_rows is None and max_sessions is None
-        return patterns.extract_patterns(
+        result = patterns.extract_patterns(
             iter_items(), limit=None if full_audit else 10
         )
+        if max_rows is not None and rows_seen >= max_rows:
+            logger.warning(
+                "Cross-session row limit reached (%d); interactive evidence may be truncated",
+                max_rows,
+            )
+        return result
     except Exception as exc:
-        logger.warning("Cross-session query failed: %s", scrub_text(str(exc)))
+        safe_error = scrub_text(str(exc))
+        logger.warning("Cross-session query failed: %s", safe_error)
+        if strict:
+            raise IOError(f"Cross-session query failed: {safe_error}") from exc
         return []
     finally:
         connection.close()
@@ -747,22 +785,40 @@ def refine_status() -> Dict[str, Any]:
 def refine_audit() -> Dict[str, Any]:
     with journal.mutation_lock():
         _reconcile_pending()
-    earliest = ledger.earliest_created_ts()
     try:
-        current = (
-            collect_cross_session_patterns(
+        earliest = ledger.earliest_created_ts()
+    except IOError as exc:
+        safe_error = scrub_text(str(exc))
+        logger.error("Audit ledger read failed: %s", safe_error)
+        return {
+            "success": False,
+            "complete": False,
+            "rows": [],
+            "report": "Audit incomplete: the refine ledger is unreadable; no conclusions were drawn.",
+        }
+
+    complete = True
+    current: Optional[List[Dict[str, Any]]] = []
+    if earliest:
+        try:
+            current = collect_cross_session_patterns(
                 since_ts=earliest,
                 max_rows=None,
                 max_sessions=None,
+                strict=True,
             )
-            if earliest
-            else []
-        )
-    except Exception as exc:
-        logger.error("Audit pattern collection failed: %s", scrub_text(str(exc)))
-        current = []
+        except Exception as exc:
+            logger.error("Audit pattern collection failed: %s", scrub_text(str(exc)))
+            current = None
+            complete = False
     rows = ledger.audit(current)
-    return {"success": True, "rows": rows, "report": ledger.format_audit(rows)}
+    report = ledger.format_audit(rows)
+    if not complete:
+        report = (
+            "⚠ Audit incomplete: trajectory recurrence could not be measured; "
+            "recurrence-dependent verdicts remain unknown.\n\n" + report
+        )
+    return {"success": True, "complete": complete, "rows": rows, "report": report}
 
 
 # ── proposal validation and apply ──────────────────────────────────────────
@@ -806,10 +862,13 @@ def _prompt_note_content_error(
     if any(re.search(blocked_terms, line) for line in lines):
         return "Prompt note must be a narrow conditional policy, not a global or procedural instruction"
     rendered = "Refine notes:\n- " + content
-    if check_rendered_size and len(rendered) > config.prompt_notes_max_chars():
+    per_note_limit = max(
+        1, config.prompt_notes_max_chars() // config.prompt_notes_max_count()
+    )
+    if check_rendered_size and len(rendered) > per_note_limit:
         return (
-            f"Prompt note is too large for its rendered context ({len(rendered)} chars; max "
-            f"{config.prompt_notes_max_chars()})"
+            f"Prompt note is too large for its per-note rendered context budget ({len(rendered)} chars; max "
+            f"{per_note_limit})"
         )
     return None
 
@@ -1125,19 +1184,21 @@ def _refine_once(
     corrections = evidence.get("user_corrections", [])
     lines: List[str] = []
     for message in evidence.get("messages", []):
-        role = message["role"]
-        tag = f"[{role}]"
-        if message.get("tool_name"):
-            tag += f"({message['tool_name']})"
-        content = message["content"][:400]
+        role = _one_line(message["role"])[:32].lower()
+        if role not in {"user", "assistant", "tool", "system"}:
+            role = "unknown"
+        content = _one_line(str(message["content"])[:400])
         if role == "tool":
-            # Strip any attempt to close the boundary tag from within tool output.
-            safe_content = content.replace("</untrusted_tool_result>", "")
+            # Tool metadata is untrusted too: keep the complete physical record
+            # inside one plugin-owned boundary after removing forged variants.
+            tool_name = _one_line(message.get("tool_name", ""))[:120]
+            record = f"tool={tool_name or '?'} | {content}"
+            safe_record = _UNTRUSTED_TOOL_TAG.sub("", record)
             lines.append(
-                f"{tag} <untrusted_tool_result>{safe_content}</untrusted_tool_result>"
+                f"[tool] <untrusted_tool_result>{safe_record}</untrusted_tool_result>"
             )
         else:
-            lines.append(f"{tag} {content}")
+            lines.append(f"[{role}] {content}")
     evidence_text = "\n".join(lines)
     proposal_context = safe_reason
     if config.min_signal_required() and not patterns.has_signal(
@@ -1820,7 +1881,10 @@ def _apply_edit(
                 llm_meta=llm_meta,
             )
         except Exception as exc:
-            logger.warning("Cannot record edit in ledger: %s", exc)
+            logger.warning(
+                "Ledger unreadable; edit was applied but attribution was skipped: %s",
+                scrub_text(str(exc)),
+            )
 
     message = (
         f"done ({time.time() - started:.1f}s) | action={action} kind={kind} "

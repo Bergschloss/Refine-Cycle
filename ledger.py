@@ -49,7 +49,9 @@ def load_stats() -> Dict[str, Any]:
             journal._READ_RETRY_BUDGET_SECONDS,
         )
         data = json.loads(raw)
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            raise ValueError("ledger root must be an object")
+        return data
     except Exception as exc:
         logger.error("Cannot read skill stats: %s", exc)
         raise IOError(f"Ledger unreadable: {scrub_text(str(exc))}") from exc
@@ -63,7 +65,7 @@ def _save_stats(stats: Dict[str, Any]) -> None:
             json.dump(stats, handle, ensure_ascii=False, indent=2)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp_name, path)
+        journal._replace_with_retry(temp_name, path)
     except Exception:
         try:
             os.unlink(temp_name)
@@ -125,11 +127,15 @@ def record_edit(
             "outcome": outcome,
             "pending_id": pending_id,
         }
-        # LLM attribution for the audit display — additive.
+        # LLM attribution for the audit display is additive and survives later
+        # reconciliation calls that carry no model metadata.
+        reported_model = ""
         if isinstance(llm_meta, dict) and llm_meta.get("reported_model"):
-            stats[key]["reported_model"] = scrub_text(
-                str(llm_meta["reported_model"])
-            )[:60]
+            reported_model = scrub_text(str(llm_meta["reported_model"]))[:60]
+        elif isinstance(previous, dict) and previous.get("reported_model"):
+            reported_model = scrub_text(str(previous["reported_model"]))[:60]
+        if reported_model:
+            stats[key]["reported_model"] = reported_model
         _save_stats(stats)
 
 
@@ -186,10 +192,13 @@ def _count_uses_with_scope(name: str, since_ts: float) -> Tuple[Optional[int], s
             return None, "unavailable"
         connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
+            escaped_name = (
+                name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            )
             row = connection.execute(
                 "SELECT COUNT(*) FROM messages WHERE active = 1 "
-                "AND timestamp > ? AND content LIKE ?",
-                (since_ts, f"%{name}%"),
+                "AND timestamp > ? AND (tool_name = ? OR content LIKE ? ESCAPE '\\')",
+                (since_ts, name, f"%/{escaped_name}%"),
             ).fetchone()
             return (int(row[0]) if row else 0), "since_approx"
         finally:
@@ -224,6 +233,7 @@ def unused_skills(min_age_days: int = 14) -> List[str]:
 
 
 def audit(current_patterns: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+    patterns_available = current_patterns is not None
     by_fingerprint = {
         str(item.get("fingerprint", "")): item for item in (current_patterns or [])
     }
@@ -260,7 +270,7 @@ def audit(current_patterns: Optional[List[Dict[str, Any]]] = None) -> List[Dict[
             verdict = "rejected"
         else:
             uses, usage_scope = _count_uses_with_scope(name, created)
-            if fingerprint:
+            if fingerprint and patterns_available:
                 hit = by_fingerprint.get(fingerprint)
                 recurred = bool(hit and (hit.get("last_ts") or 0) > created)
 

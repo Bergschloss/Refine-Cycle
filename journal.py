@@ -3,6 +3,7 @@
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import tempfile
@@ -31,6 +32,10 @@ _LOCK_FILE_NAME = ".mutation.lock"
 _LOCK_STALE_SECONDS = 300
 _THREAD_LOCK = threading.RLock()
 _LOCK_STATE = threading.local()
+# If Windows refuses an owned unlink after the retry budget, remember the exact
+# token. A later acquisition in this same process may then retry removing only
+# its own orphan instead of treating the live PID as a foreign lock forever.
+_ORPHANED_LOCK_TOKENS: Dict[str, str] = {}
 _MIGRATION_INCOMPLETE = ".migration_incomplete"
 _MIGRATION_STATUS: Dict[str, Any] = {
     "outcome": "not_checked",
@@ -347,6 +352,7 @@ def _migration_lock(source: Path, timeout: float = 30.0) -> Iterator[None]:
     payload = json.dumps({"pid": os.getpid(), "created": time.time(), "token": token})
     deadline = time.monotonic() + timeout
     with _THREAD_LOCK:
+        _clear_owned_orphan(lock_path)
         while True:
             try:
                 fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -375,6 +381,7 @@ def _migration_lock(source: Path, timeout: float = 30.0) -> Iterator[None]:
             except FileNotFoundError:
                 pass
             except Exception as exc:
+                _ORPHANED_LOCK_TOKENS[str(lock_path)] = token
                 logger.error(
                     "Could not release refine migration lock: %s",
                     scrub_text(str(exc)),
@@ -534,7 +541,11 @@ def migrate_legacy_journal_dir(
             ts_suffix = time.strftime("%Y%m%d-%H%M%S")
             renamed = legacy.parent / f"refine.migrated-{ts_suffix}"
             try:
-                legacy.rename(renamed)
+                _retry_on_contention(
+                    lambda: legacy.rename(renamed),
+                    _WRITE_RETRY_BUDGET_SECONDS,
+                    OSError,
+                )
             except OSError as exc:
                 rename_warning = scrub_text(str(exc))
                 logger.warning(
@@ -837,8 +848,9 @@ def _acquire_mutation_lock(*, wait: bool, timeout: float = 0.0) -> Iterator[bool
             except FileNotFoundError:
                 pass
             except Exception as exc:
+                _ORPHANED_LOCK_TOKENS[str(path)] = token
                 logger.error(
-                    "Could not release refine mutation lock (process may self-deadlock): %s",
+                    "Could not release refine mutation lock (will retry on next acquisition): %s",
                     scrub_text(str(exc)),
                 )
 
@@ -848,6 +860,7 @@ def _acquire_mutation_lock(*, wait: bool, timeout: float = 0.0) -> Iterator[bool
         while True:
             locked_directory = ensure_dirs()
             lock_path = _mutation_lock_path(locked_directory)
+            _clear_owned_orphan(lock_path)
             while True:
                 try:
                     fd = os.open(
@@ -954,6 +967,31 @@ def _retry_on_contention(operation, budget: float, errors=PermissionError):
             delay *= 2
 
 
+def _clear_owned_orphan(path: Path) -> None:
+    """Retry removal only for a lock token this process failed to release."""
+    key = str(path)
+    token = _ORPHANED_LOCK_TOKENS.get(key)
+    if not token:
+        return
+    try:
+        current = json.loads(
+            _retry_on_contention(
+                lambda: path.read_text(encoding="utf-8"),
+                _READ_RETRY_BUDGET_SECONDS,
+                OSError,
+            )
+        )
+        if current.get("token") != token:
+            _ORPHANED_LOCK_TOKENS.pop(key, None)
+            return
+        _retry_on_contention(path.unlink, _UNLINK_RETRY_BUDGET_SECONDS, OSError)
+        _ORPHANED_LOCK_TOKENS.pop(key, None)
+    except FileNotFoundError:
+        _ORPHANED_LOCK_TOKENS.pop(key, None)
+    except Exception as exc:
+        logger.error("Could not recover owned refine lock: %s", scrub_text(str(exc)))
+
+
 def _replace_with_retry(temp_name: str, path: Path) -> None:
     """Atomically replace the target, tolerating a concurrent reader on Windows.
 
@@ -986,15 +1024,9 @@ def _atomic_write_text(path: Path, content: str) -> None:
         raise
 
 
-def _load_entries() -> List[Dict[str, Any]]:
-    """Stream journal state, skipping corrupt lines and collapsing updates by id.
-
-    Returns [] only when the file is genuinely absent. A transient read failure
-    raises IOError so callers fail closed rather than assuming an empty journal.
-    """
+def _load_entries_state() -> "tuple[List[Dict[str, Any]], str]":
+    """Return collapsed entries plus ``ok``, ``absent``, or ``unreadable``."""
     path = journal_read_path()
-    if not path.is_file():
-        return []
     latest: Dict[str, Dict[str, Any]] = {}
     order: List[str] = []
 
@@ -1008,30 +1040,47 @@ def _load_entries() -> List[Dict[str, Any]]:
                 except json.JSONDecodeError:
                     logger.warning("Skipping corrupt journal line")
                     continue
-                entry_id = str(entry.get("id", ""))
-                if not entry_id:
-                    continue
+                if not isinstance(entry, dict):
+                    raise ValueError("journal record must be an object")
+                entry_id = entry.get("id")
+                if not isinstance(entry_id, str) or not entry_id.strip():
+                    raise ValueError("journal record id must be a non-empty string")
+                timestamp = entry.get("ts")
+                if (
+                    not isinstance(timestamp, (int, float))
+                    or isinstance(timestamp, bool)
+                    or not math.isfinite(float(timestamp))
+                ):
+                    raise ValueError("journal record timestamp must be finite numeric data")
+                if not isinstance(entry.get("outcome"), str) or not entry["outcome"]:
+                    raise ValueError("journal record outcome must be a non-empty string")
+                if not isinstance(entry.get("proposal"), dict):
+                    raise ValueError("journal record proposal must be an object")
                 if entry_id not in latest:
                     order.append(entry_id)
                 latest[entry_id] = entry
 
     try:
         _retry_on_contention(_read, _READ_RETRY_BUDGET_SECONDS)
+    except FileNotFoundError:
+        return [], "absent"
     except Exception as exc:
         logger.error("Failed to read journal: %s", scrub_text(str(exc)))
-        raise IOError(f"Journal unreadable: {scrub_text(str(exc))}") from exc
-    return [latest[entry_id] for entry_id in order]
+        return [], "unreadable"
+    return [latest[entry_id] for entry_id in order], "ok"
+
+
+def _load_entries() -> List[Dict[str, Any]]:
+    """Return journal entries, raising when the store is present but unreadable."""
+    entries_value, state = _load_entries_state()
+    if state == "unreadable":
+        raise IOError("Journal unreadable")
+    return entries_value
 
 
 def _load_entries_safe() -> "tuple[List[Dict[str, Any]], str]":
-    """Return (entries, state) where state is 'ok', 'absent', or 'unreadable'."""
-    path = journal_read_path()
-    if not path.is_file():
-        return [], "absent"
-    try:
-        return _load_entries(), "ok"
-    except IOError:
-        return [], "unreadable"
+    """Compatibility alias for callers that need the explicit read state."""
+    return _load_entries_state()
 
 
 
@@ -1598,6 +1647,10 @@ def reconcile() -> List[Dict[str, Any]]:
     for snapshot in _load_entries():
         entry_id = str(snapshot.get("id", ""))
         outcome = snapshot.get("outcome")
+        if outcome not in {
+            "prepared", "pending_approval", "rollback_prepared", "pending_rollback"
+        }:
+            continue
         proposal = snapshot.get("proposal", {})
         subsystem = "skills" if proposal.get("kind") == "skill" else "memory"
         try:
@@ -1742,6 +1795,12 @@ def rollback_skill(entry_id: str) -> Dict[str, Any]:
 
 
 def rollback_memory(entry_id: str) -> Dict[str, Any]:
+    """Rollback one exact append while holding the shared mutation lock."""
+    with mutation_lock():
+        return _rollback_memory_locked(entry_id)
+
+
+def _rollback_memory_locked(entry_id: str) -> Dict[str, Any]:
     entry = get_entry(entry_id)
     if not is_reversible(entry):
         return {"success": False, "error": f"Journal entry {entry_id} is not a reversible memory edit"}

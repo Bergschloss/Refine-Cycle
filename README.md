@@ -549,7 +549,7 @@ cd <HERMES_HOME>/plugins/refine
 python -m tests.run_tests
 ```
 
-The stdlib-only suite (260 tests) installs a fake Hermes host before importing the plugin.
+The stdlib-only suite (301 tests) installs a fake Hermes host before importing the plugin.
 Every database, journal, backup, skill, memory file, ledger, and lock lives
 under a fresh `TemporaryDirectory`; running the suite cannot touch live Hermes
 or profile state. It covers proposal completion, host action mapping,

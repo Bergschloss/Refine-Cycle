@@ -452,7 +452,12 @@ def _handle_refine_command(raw_args: str) -> Optional[str]:
                 # /refine status exists to diagnose.
                 logger.exception("refine model command failed")
                 return f"❌ Model command failed: {core.scrub_text(str(exc))}"
-        # Fall through to the proposal path below
+        if remainder and ("/" in remainder or " " not in remainder):
+            return (
+                "❌ Invalid model target.\n"
+                "Usage: /refine model [auto | <model> | <provider>/<model>]"
+            )
+        # Prose such as "model of gmail failures" remains a refine reason.
 
     if args == "rollback":
         return (
@@ -532,7 +537,7 @@ def _handle_refine_run(args: dict, **kw) -> str:
         result = core.refine_run(llm=_session_llm(), reason=reason, auto=False)
     except Exception as exc:
         logger.exception("refine_run tool failed")
-        return json.dumps({"success": False, "error": str(exc)})
+        return json.dumps({"success": False, "error": core.scrub_text(str(exc))})
     return json.dumps(result, ensure_ascii=False)
 
 

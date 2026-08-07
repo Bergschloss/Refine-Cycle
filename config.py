@@ -214,6 +214,11 @@ def cross_session_max_sessions() -> int:
     return get_int("cross_session_max_sessions", 25, min_val=1)
 
 
+def cross_session_max_rows() -> int:
+    """Maximum trajectory rows scanned by an interactive refinement pass."""
+    return get_int("cross_session_max_rows", 4000, min_val=1)
+
+
 def dedup_window_days() -> int:
     """Refuse a proposal identical to one already applied within this window."""
     return get_int("dedup_window_days", 7, min_val=1)

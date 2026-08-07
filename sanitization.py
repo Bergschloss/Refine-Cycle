@@ -66,10 +66,9 @@ def _replace_unquoted(match: re.Match) -> str:
     value = match.group("value")
     if value.lower() in _NON_SECRETS or _is_number(value):
         return match.group(0)
-    # A prior pass in the same _scrub_chunk may have already inserted the marker
-    # (e.g. _ENV_SECRET produced API_KEY=[REDACTED]). Do not re-match it.
-    if value.upper().startswith("REDACTED") or value.startswith("[REDACTED"):
-        return match.group(0)
+    # Canonical markers are protected by scrub_text splitting and ``[`` is not
+    # part of this regex's value class. Do not exempt arbitrary credentials
+    # merely because their real value begins with the word "REDACTED".
     return f"{match.group('prefix')}{_REDACTED}"
 
 
