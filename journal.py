@@ -290,6 +290,127 @@ def clear_model_override() -> str:
             return "failed"
 
 
+# ── legacy journal directory migration ─────────────────────────────────────
+
+_MIGRATION_MARKER = ".migrated_from"
+_MIGRATION_FILES = [
+    _JOURNAL_FILE_NAME,
+    "skill_stats.json",
+    _PROMPT_NOTES_FILE_NAME,
+    _MODEL_OVERRIDE_FILE_NAME,
+]
+_MIGRATION_DIRS = [_BACKUPS_DIR_NAME]
+
+
+def migrate_legacy_journal_dir(
+    *,
+    _new_dir: "Optional[Path]" = None,
+    _legacy_dir: "Optional[Path]" = None,
+) -> str:
+    """One-time, idempotent migration of runtime data to the new default location.
+
+    Returns one of:
+      user_configured — the user explicitly set journal_dir, so we do nothing.
+      not_needed      — nothing to migrate (new install or already migrated).
+      migrated        — files copied, old dir renamed.
+      failed          — something went wrong; refine continues from wherever data
+                        actually exists.
+
+    Never deletes data. The old directory is renamed, not removed.
+    Must be called under the mutation lock (taken internally) so two processes
+    cannot race and double-copy.
+    """
+    try:
+        from . import config as _cfg
+    except ImportError:
+        import config as _cfg  # type: ignore
+
+    # If the user set journal_dir explicitly, their choice takes priority.
+    entry = _cfg._get_refine_entry()
+    if entry.get("journal_dir"):
+        return "user_configured"
+
+    new_dir = _new_dir if _new_dir is not None else _cfg.journal_dir()
+    legacy = _legacy_dir if _legacy_dir is not None else _cfg.legacy_journal_dir()
+
+    # If the legacy dir doesn't exist or has no runtime files, nothing to move.
+    if not legacy.is_dir():
+        return "not_needed"
+
+    has_data = any(
+        (legacy / name).exists()
+        for name in _MIGRATION_FILES + _MIGRATION_DIRS
+    )
+    if not has_data:
+        return "not_needed"
+
+    # If the new dir already has a journal, the migration already happened or
+    # someone manually moved things. Don't overwrite.
+    if (new_dir / _JOURNAL_FILE_NAME).is_file():
+        return "not_needed"
+
+    # If the marker says we already renamed, don't do it again.
+    if (new_dir / _MIGRATION_MARKER).is_file():
+        return "not_needed"
+
+    with _THREAD_LOCK:
+        # Re-check after lock acquisition — another thread may have migrated.
+        if (new_dir / _JOURNAL_FILE_NAME).is_file():
+            return "not_needed"
+        if (new_dir / _MIGRATION_MARKER).is_file():
+            return "not_needed"
+
+        import shutil as _shutil
+
+        try:
+            new_dir.mkdir(parents=True, exist_ok=True)
+
+            # Copy files.
+            for name in _MIGRATION_FILES:
+                src = legacy / name
+                if src.is_file():
+                    _shutil.copy2(str(src), str(new_dir / name))
+
+            # Copy backup directory.
+            src_backups = legacy / _BACKUPS_DIR_NAME
+            if src_backups.is_dir():
+                dst_backups = new_dir / _BACKUPS_DIR_NAME
+                dst_backups.mkdir(exist_ok=True)
+                for item in src_backups.iterdir():
+                    if item.is_file():
+                        _shutil.copy2(str(item), str(dst_backups / item.name))
+
+            # Write marker with the source path and timestamp.
+            marker = new_dir / _MIGRATION_MARKER
+            marker.write_text(
+                json.dumps({
+                    "from": str(legacy),
+                    "ts": time.time(),
+                }),
+                encoding="utf-8",
+            )
+
+            # Rename (not delete) the old directory.
+            ts_suffix = time.strftime("%Y%m%d-%H%M%S")
+            renamed = legacy.parent / f"refine.migrated-{ts_suffix}"
+            try:
+                legacy.rename(renamed)
+            except OSError as exc:
+                # Rename failed — not fatal. The data is already in the new
+                # location and the marker prevents re-migration.
+                logger.warning(
+                    "Legacy journal dir could not be renamed: %s",
+                    scrub_text(str(exc)),
+                )
+
+            return "migrated"
+        except Exception as exc:
+            logger.warning(
+                "Journal directory migration failed: %s", scrub_text(str(exc))
+            )
+            return "failed"
+
+
 def normalize_prompt_note_session_id(session_id: Any) -> str:
     """Accept only a stable, already-safe hook/session identifier."""
     raw = str(session_id).strip()

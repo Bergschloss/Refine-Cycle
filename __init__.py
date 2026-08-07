@@ -573,6 +573,12 @@ REFINE_RUN_SCHEMA = {
 def register(ctx) -> None:
     global _REGISTERED_LLM
     _REGISTERED_LLM = _get_llm(ctx)
+    # One-time migration of runtime data out of the plugin install directory.
+    # Must not fail registration — a broken migration just leaves data in place.
+    try:
+        journal.migrate_legacy_journal_dir()
+    except Exception:
+        logger.debug("refine journal migration failed", exc_info=True)
     ctx.register_command(
         "refine",
         _handle_refine_command,

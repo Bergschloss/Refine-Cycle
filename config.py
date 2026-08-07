@@ -370,8 +370,13 @@ def effective_llm_target() -> Dict[str, Any]:
 
 
 def journal_dir() -> Path:
-    default = hermes_home() / "plugins" / "refine"
+    default = hermes_home() / "refine"
     return Path(get_str("journal_dir", str(default)))
+
+
+def legacy_journal_dir() -> Path:
+    """The old default before Part C moved runtime data out of the plugin dir."""
+    return hermes_home() / "plugins" / "refine"
 
 
 def prompt_notes_enabled() -> bool:
