@@ -38,8 +38,8 @@ _UNQUOTED_SECRET = re.compile(
     rf"(?i)(?P<prefix>\b{_SECRET_KEY}\b\s*[:=]\s*)"
     r"(?P<value>[^\s,;\}\]\[]{6,})"
 )
-_BEARER = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9_.+/=-]{8,}")
-_URL_CREDENTIALS = re.compile(r"(https?://)[^/\s:@]+:[^/\s:@]+@")
+_BEARER = re.compile(r"(?i)\bbearer\s+[\"']?[A-Za-z0-9_.+/=-]{8,}[\"']?")
+_URL_CREDENTIALS = re.compile(r"(https?://)[^/\s:@]+(?::[^/\s:@]+)?@")
 _ENV_SECRET = re.compile(
     r"(?m)^(\s*[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*\s*=\s*)\S+$"
 )
@@ -53,9 +53,18 @@ def _replace_quoted(match: re.Match) -> str:
     )
 
 
+def _is_number(value: str) -> bool:
+    """Return True for integer and float literals so they are not redacted."""
+    try:
+        float(value)
+        return True
+    except (ValueError, OverflowError):
+        return False
+
+
 def _replace_unquoted(match: re.Match) -> str:
     value = match.group("value")
-    if value.lower() in _NON_SECRETS or value.isdigit():
+    if value.lower() in _NON_SECRETS or _is_number(value):
         return match.group(0)
     # A prior pass in the same _scrub_chunk may have already inserted the marker
     # (e.g. _ENV_SECRET produced API_KEY=[REDACTED]). Do not re-match it.

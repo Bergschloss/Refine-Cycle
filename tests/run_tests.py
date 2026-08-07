@@ -1566,6 +1566,20 @@ class RefineTests(unittest.TestCase):
         with patch.object(core, "collect_cross_session_patterns", return_value=[]) as collect:
             core.refine_audit()
         collect.assert_called_once_with(since_ts=created, max_rows=None, max_sessions=None)
+    def test_credential_scrubbing_gaps_url_bearer_float(self):
+        """Wave 2.5: token-only URLs, quoted Bearer, and float numbers."""
+        # Token-only URL (no colon in userinfo)
+        self.assertIn("[REDACTED]@", sanitization.scrub_text("https://token12345@host/x"))
+        self.assertNotIn("token12345", sanitization.scrub_text("https://token12345@host/x"))
+        # Quoted Bearer token
+        self.assertNotIn("abcdef123456", sanitization.scrub_text('Bearer "abcdef123456"'))
+        self.assertIn("[REDACTED]", sanitization.scrub_text('Bearer "abcdef123456"'))
+        # Float numbers must NOT be redacted (same as integers)
+        self.assertEqual(sanitization.scrub_text("token=1700000000.5"), "token=1700000000.5")
+        self.assertEqual(sanitization.scrub_text("token=1700000000"), "token=1700000000")
+        # But actual secrets still are
+        self.assertIn("[REDACTED]", sanitization.scrub_text("token=abcSecretValue123"))
+
     def test_scrub_text_does_not_produce_double_bracket_marker(self):
         """Wave 1.4: [REDACTED]] corruption must not occur in any secret form."""
         cases = [
