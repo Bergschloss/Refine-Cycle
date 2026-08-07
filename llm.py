@@ -345,14 +345,60 @@ def _propose_structured(
 def _ensure_dict(parsed: Any) -> Optional[Dict[str, Any]]:
     if isinstance(parsed, dict):
         return sanitize(parsed)
+    if hasattr(parsed, "model_dump"):
+        try:
+            return sanitize(parsed.model_dump())
+        except Exception:
+            pass
+    if hasattr(parsed, "dict") and callable(parsed.dict):
+        try:
+            return sanitize(parsed.dict())
+        except Exception:
+            pass
     if isinstance(parsed, str):
-        match = re.search(r"\{.*\}", parsed, re.S)
-        if match:
-            try:
-                value = json.loads(match.group(0))
-                return sanitize(value) if isinstance(value, dict) else None
-            except json.JSONDecodeError:
-                pass
+        obj = _extract_first_json_object(parsed)
+        if obj is not None:
+            return sanitize(obj) if isinstance(obj, dict) else None
+    return None
+
+
+def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """Find the first complete JSON object using balanced-brace scanning.
+
+    Respects string literals so embedded braces do not confuse the scan.
+    Falls back to the greedy regex only if the scanner finds nothing.
+    """
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escape_next = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if escape_next:
+            escape_next = False
+            continue
+        if char == "\\":
+            if in_string:
+                escape_next = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = text[start:index + 1]
+                try:
+                    value = json.loads(candidate)
+                    return value if isinstance(value, dict) else None
+                except json.JSONDecodeError:
+                    return None
     return None
 
 

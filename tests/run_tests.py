@@ -604,6 +604,21 @@ class RefineTests(unittest.TestCase):
         self.assertEqual(result["failure"], "llm_call_error")
         self.assertEqual(journal.get_entry(result["journal_id"])["outcome"], "llm_error")
 
+    def test_json_extraction_handles_trailing_braces_and_pydantic(self):
+        """Wave 2.7: balanced-brace scanner extracts valid JSON despite trailing }."""
+        # Valid JSON followed by trailing text with a brace
+        text_with_trail = '{"action":"no_op","reason":"x"} trailing } text'
+        result = llm._ensure_dict(text_with_trail)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["action"], "no_op")
+        # Genuinely truncated JSON still returns None
+        self.assertIsNone(llm._ensure_dict('{"action":"no_op"'))
+        # Pydantic-like object with model_dump
+        class FakeModel:
+            def model_dump(self):
+                return {"action": "create", "kind": "skill"}
+        self.assertEqual(llm._ensure_dict(FakeModel())["action"], "create")
+
     def test_reply_parse_failures_are_not_disguised_as_noop(self):
         malformed = core.refine_run(MockLlm(MockResult(
             None, text='{"action":"no_op","reason": invalid}'
