@@ -4359,6 +4359,111 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
         self.assertEqual(status["skip_session_sources"], ["cron"])
         self.assertEqual(status["session_source"], "cli")
 
+    # ── Model attribution (Part B) ────────────────────────────────────────────
+
+    def test_single_pass_uses_one_target_for_all_calls(self):
+        """Even if effective_llm_target changes mid-pass, the calls are consistent."""
+        FakeHost.entry_config()["llm"] = {
+            "model": "pinned-model",
+            "allow_model_override": True,
+        }
+        call_models = []
+
+        class SpyLlm:
+            calls = []
+
+            def complete_structured(self, **kwargs):
+                call_models.append(kwargs.get("model"))
+                return MockResult(
+                    {"action": "no_op", "reason": "nothing", "evidence": []},
+                    model="reported-from-host",
+                    output_tokens=42,
+                )
+
+        spy = SpyLlm()
+        core.refine_run(spy, session_id="session")
+        # All calls within the pass used the same resolved target.
+        self.assertTrue(all(m == "pinned-model" for m in call_models))
+
+    def test_journal_entry_contains_llm_meta_fields(self):
+        FakeHost.entry_config()["llm"] = {
+            "model": "test-model-x",
+            "allow_model_override": True,
+        }
+        model = MockLlm(MockResult(
+            {"action": "no_op", "reason": "nothing", "evidence": [],
+             "kind": "", "name": "", "content": ""},
+            model="actual-host-model",
+            output_tokens=100,
+        ))
+        core.refine_run(model, session_id="session")
+        entries = journal.entries()
+        latest = entries[-1] if entries else {}
+        meta = latest.get("llm_meta", {})
+        self.assertEqual(meta.get("requested_model"), "test-model-x")
+        self.assertEqual(meta.get("reported_model"), "actual-host-model")
+        self.assertEqual(meta.get("target_source"), "config")
+        self.assertIsInstance(meta.get("latency_ms"), int)
+        self.assertEqual(meta.get("output_tokens"), 100)
+
+    def test_journal_entry_omits_output_tokens_when_unavailable(self):
+        model = MockLlm(MockResult(
+            {"action": "no_op", "reason": "nothing", "evidence": [],
+             "kind": "", "name": "", "content": ""},
+            model="any-model",
+        ))
+        core.refine_run(model, session_id="session")
+        entries = journal.entries()
+        latest = entries[-1] if entries else {}
+        meta = latest.get("llm_meta", {})
+        self.assertNotIn("output_tokens", meta)
+
+    def test_old_journal_entries_without_llm_meta_read_fine(self):
+        # Simulate a legacy entry without llm_meta
+        journal.log(
+            trigger="manual",
+            reason="legacy entry",
+            session_id="session",
+            proposal={"action": "no_op", "reason": "old"},
+            outcome="no_op",
+        )
+        entries = journal.entries()
+        latest = entries[-1]
+        # No llm_meta key present — that's fine.
+        self.assertNotIn("llm_meta", latest)
+        # Audit must not crash.
+        audit = core.refine_audit()
+        self.assertTrue(audit["success"])
+
+    def test_llm_meta_fields_are_scrubbed(self):
+        token = "ghp_" + "A" * 36
+        model = MockLlm(MockResult(
+            {"action": "no_op", "reason": "nothing", "evidence": [],
+             "kind": "", "name": "", "content": ""},
+            model=token,
+            output_tokens=10,
+        ))
+        core.refine_run(model, session_id="session")
+        entries = journal.entries()
+        latest = entries[-1] if entries else {}
+        meta = latest.get("llm_meta", {})
+        # The reported model must not contain the raw token.
+        self.assertNotIn(token, json.dumps(meta))
+
+    def test_target_issues_are_recorded_in_llm_meta(self):
+        FakeHost.entry_config()["llm"] = {"model": "sk-" + "a" * 24}
+        model = MockLlm(MockResult(
+            {"action": "no_op", "reason": "nothing", "evidence": [],
+             "kind": "", "name": "", "content": ""},
+            model="fallback-model",
+        ))
+        core.refine_run(model, session_id="session")
+        entries = journal.entries()
+        latest = entries[-1] if entries else {}
+        meta = latest.get("llm_meta", {})
+        self.assertTrue(meta.get("target_issues"))
+        self.assertIn("credential", meta["target_issues"][0])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -920,6 +920,7 @@ def _skill_baseline_conflict(
 
 
 def _journal_nonmutation(**kwargs: Any) -> Optional[str]:
+    """Write a non-mutating journal entry. Accepts all journal.log kwargs including llm_meta."""
     try:
         return journal.log(**kwargs)
     except Exception as exc:
@@ -952,6 +953,22 @@ def _refine_once(
             "message": f"Daily edit limit reached ({config.max_edits_per_day()}). "
             f"Applied/pending/prepared today: {journal.count_today_applied()}.",
         }
+
+    # Resolve the LLM target once per pass so every call within it uses the same
+    # model. This makes the choice deterministic and attributable in the journal.
+    try:
+        _effective = config.effective_llm_target()
+        _run_target: Dict[str, str] = {}
+        if _effective.get("provider") and config.llm_allow_provider_override():
+            _run_target["provider"] = _effective["provider"]
+        if _effective.get("model") and config.llm_allow_model_override():
+            _run_target["model"] = _effective["model"]
+        _run_target_source = _effective.get("source", "host_default")
+        _run_target_issues = [str(i) for i in _effective.get("issues", []) if i]
+    except Exception:
+        _run_target = {}
+        _run_target_source = "unknown"
+        _run_target_issues = ["the effective model could not be resolved"]
 
     evidence_limit = 60
     if config.min_signal_required() and config.reviewer_fallback_enabled():
@@ -1010,7 +1027,7 @@ def _refine_once(
             and _reviewer_cooldown_elapsed()
         )
         if should_review:
-            reviewer = _llm.review_fallback(llm, evidence_text)
+            reviewer = _llm.review_fallback(llm, evidence_text, target=_run_target)
             rationale = scrub_text(str(reviewer.get("rationale", "")))
             decision = "approved" if reviewer.get("should_refine") else "declined"
             reviewer_reason = f"Reviewer {decision}: {rationale}"
@@ -1094,7 +1111,20 @@ def _refine_once(
         purpose="refine",
         run_context=proposal_context,
         skill_content_loader=journal.read_skill_content,
+        target=_run_target,
     )
+    # Capture metadata from the LLM call that produced this proposal.
+    llm_meta = _llm.last_call_meta()
+    _run_llm_meta = {
+        "requested_provider": _run_target.get("provider", ""),
+        "requested_model": _run_target.get("model", ""),
+        "target_source": _run_target_source,
+        **{k: v for k, v in llm_meta.items() if k in (
+            "reported_model", "latency_ms", "output_tokens"
+        )},
+    }
+    if _run_target_issues:
+        _run_llm_meta["target_issues"] = _run_target_issues
     proposal = sanitize(proposal)
     proposal = dict(
         proposal,
@@ -1121,6 +1151,7 @@ def _refine_once(
             proposal=proposal,
             outcome="llm_incomplete",
             error=failure_message,
+            llm_meta=_run_llm_meta,
         )
         response = {
             "success": False,
@@ -1147,8 +1178,10 @@ def _refine_once(
             safe_reason=safe_reason,
             session=session,
             started=started,
+            llm_meta=_run_llm_meta,
         )
         transaction["evidence"] = evidence_summary
+        transaction["llm_meta"] = _run_llm_meta
         return transaction
 
     proposal = _normalize_edit(proposal, session)
@@ -1160,6 +1193,7 @@ def _refine_once(
             session_id=session,
             proposal=proposal,
             outcome="no_op",
+            llm_meta=_run_llm_meta,
         )
         if not entry_id:
             return {
@@ -1174,6 +1208,7 @@ def _refine_once(
             "proposal": proposal,
             "evidence": evidence,
             "reversible": False,
+            "llm_meta": _run_llm_meta,
         }
 
     response = _apply_edit(
@@ -1182,8 +1217,10 @@ def _refine_once(
         safe_reason=safe_reason,
         session=session,
         started=started,
+        llm_meta=_run_llm_meta,
     )
     response["evidence"] = evidence_summary
+    response["llm_meta"] = _run_llm_meta
     return response
 
 
@@ -1195,6 +1232,7 @@ def _apply_edit(
     session: str,
     started: float,
     group: Optional[Dict[str, Any]] = None,
+    llm_meta: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Validate, back up, apply, and finalize exactly one edit.
 
@@ -1460,6 +1498,7 @@ def _apply_edit(
                 entry_id,
                 outcome=outcome,
                 pending_id=pending_id,
+                llm_meta=llm_meta,
             )
         except Exception as exc:
             logger.warning("Cannot record edit in ledger: %s", exc)
@@ -1525,6 +1564,7 @@ def _apply_transaction(
     safe_reason: str,
     session: str,
     started: float,
+    llm_meta: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Apply one multi-edit proposal as a sequence of independent durable edits.
 
@@ -1658,6 +1698,7 @@ def _apply_transaction(
             session=session,
             started=started,
             group=edit_group(index),
+            llm_meta=llm_meta,
         )
         results.append(item)
         if not item.get("success"):

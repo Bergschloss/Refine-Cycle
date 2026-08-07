@@ -780,6 +780,7 @@ def _new_entry(
     recovery: Optional[Dict[str, Any]] = None,
     group: Optional[Dict[str, Any]] = None,
     snapshot: Optional[Dict[str, Any]] = None,
+    llm_meta: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     entry = {
         "id": uuid.uuid4().hex[:12],
@@ -793,15 +794,13 @@ def _new_entry(
         "recovery": recovery or {},
         "error": error,
     }
-    # Carrying the pre-edit content in the record itself is what makes rollback
-    # independent of a backup file still being on disk.
     if snapshot:
         entry["snapshot"] = snapshot
-    # A multi-edit transaction stays one durable record per edit, so rollback,
-    # reconciliation, dedup, and the daily edit budget keep working unchanged.
-    # ``group`` only reports which edits belonged together.
     if group:
         entry["group"] = group
+    # LLM attribution — additive, old entries without it read fine.
+    if llm_meta and isinstance(llm_meta, dict):
+        entry["llm_meta"] = llm_meta
     return entry
 
 
@@ -817,6 +816,7 @@ def log(
     recovery: Optional[Dict[str, Any]] = None,
     group: Optional[Dict[str, Any]] = None,
     snapshot: Optional[Dict[str, Any]] = None,
+    llm_meta: Optional[Dict[str, Any]] = None,
 ) -> str:
     entry = _new_entry(
         trigger=trigger,
@@ -829,6 +829,7 @@ def log(
         recovery=recovery,
         group=group,
         snapshot=snapshot,
+        llm_meta=llm_meta,
     )
     _append_entry(entry)
     return entry["id"]
@@ -844,6 +845,7 @@ def prepare(
     recovery: Optional[Dict[str, Any]] = None,
     group: Optional[Dict[str, Any]] = None,
     snapshot: Optional[Dict[str, Any]] = None,
+    llm_meta: Optional[Dict[str, Any]] = None,
 ) -> str:
     return log(
         trigger=trigger,
@@ -855,6 +857,7 @@ def prepare(
         recovery=recovery,
         group=group,
         snapshot=snapshot,
+        llm_meta=llm_meta,
     )
 
 
