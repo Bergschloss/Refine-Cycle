@@ -942,6 +942,7 @@ def _refine_once(
     reason: str = "",
     session_id: Optional[str] = None,
     auto: bool = False,
+    dry_run: bool = False,
 ) -> Dict[str, Any]:
     trigger = "auto" if auto else "manual"
     started = time.time()
@@ -1170,6 +1171,86 @@ def _refine_once(
         "messages": len(evidence.get("messages", [])),
         "errors": evidence.get("error_count", 0),
     }
+
+    # ── Dry-run exit: show what would happen, apply nothing ────────────────
+    if dry_run:
+        import difflib as _difflib
+
+        dry_proposal = proposal
+        if proposal.get("action") == "multi":
+            # Normalize each edit so the user sees the final form.
+            edits = [
+                _normalize_edit(sanitize(edit), session)
+                for edit in proposal.get("edits", [])
+                if isinstance(edit, dict)
+            ]
+            dry_proposal = dict(proposal, edits=edits)
+        else:
+            dry_proposal = _normalize_edit(proposal, session)
+
+        # Build a diff for patch proposals.
+        diff_text = ""
+        max_diff_chars = _llm.MAX_CONTENT_CHARS
+        truncated = False
+
+        def _build_diff(name: str, new_content: str) -> str:
+            old_content = journal.read_skill_content(name) or ""
+            old_lines = old_content.splitlines()
+            new_lines = new_content.splitlines()
+            diff_lines = list(_difflib.unified_diff(
+                old_lines, new_lines, fromfile=f"a/{name}", tofile=f"b/{name}", lineterm=""
+            ))
+            return "\n".join(diff_lines)
+
+        if dry_proposal.get("action") == "patch" and dry_proposal.get("kind") == "skill":
+            name = str(dry_proposal.get("name", ""))
+            content = str(dry_proposal.get("content", ""))
+            if name and content:
+                raw_diff = _build_diff(name, content)
+                if len(raw_diff) > max_diff_chars:
+                    diff_text = scrub_text(raw_diff[:max_diff_chars]) + "\n… [truncated]"
+                    truncated = True
+                else:
+                    diff_text = scrub_text(raw_diff)
+        elif dry_proposal.get("action") == "multi":
+            diff_parts = []
+            for edit in dry_proposal.get("edits", []):
+                if edit.get("action") == "patch" and edit.get("kind") == "skill":
+                    name = str(edit.get("name", ""))
+                    content = str(edit.get("content", ""))
+                    if name and content:
+                        diff_parts.append(_build_diff(name, content))
+            if diff_parts:
+                combined = "\n".join(diff_parts)
+                if len(combined) > max_diff_chars:
+                    diff_text = scrub_text(combined[:max_diff_chars]) + "\n… [truncated]"
+                    truncated = True
+                else:
+                    diff_text = scrub_text(combined)
+
+        # Journal the dry run so /refine audit shows it was considered.
+        _journal_nonmutation(
+            trigger=trigger,
+            reason=safe_reason or "dry-run",
+            session_id=session,
+            proposal=dry_proposal,
+            outcome="dry_run",
+            llm_meta=_run_llm_meta,
+        )
+
+        return {
+            "success": True,
+            "outcome": "dry_run",
+            "message": "Dry run: proposal shown, nothing applied.",
+            "proposal": dry_proposal,
+            "diff": diff_text,
+            "diff_truncated": truncated,
+            "evidence": evidence_summary,
+            "llm_called": True,
+            "llm_meta": _run_llm_meta,
+            "reversible": False,
+            "edits_applied": 0,
+        }
 
     if proposal.get("action") == "multi":
         transaction = _apply_transaction(
@@ -1826,11 +1907,20 @@ def refine_run(
     reason: str = "",
     session_id: Optional[str] = None,
     auto: bool = False,
+    dry_run: bool = False,
 ) -> Dict[str, Any]:
     """Serialize a run, reconcile approvals, and preserve every recovery id."""
     started = time.time()
     with journal.mutation_lock():
         _reconcile_pending()
+
+        if dry_run:
+            # Dry-run: one proposal pass, no apply, no budget consumed.
+            return _refine_once(
+                llm, reason=scrub_text(reason), session_id=session_id,
+                auto=auto, dry_run=True,
+            )
+
         runs: List[Dict[str, Any]] = []
         # ``max_edits_per_run`` bounds proposal passes; ``max_edits_per_proposal``
         # bounds edits inside one transaction; the daily edit budget bounds edits

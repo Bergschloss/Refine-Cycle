@@ -384,6 +384,42 @@ def _handle_refine_command(raw_args: str) -> Optional[str]:
             lines.extend(f"  ⚠ {item['message']}" for item in status["warnings"])
         return core.scrub_text("\n".join(lines))
 
+    if args == "dry-run" or args.startswith("dry-run "):
+        dry_reason = args[7:].strip()  # len("dry-run") == 7
+        try:
+            result = core.refine_run(
+                llm=_session_llm(), reason=dry_reason, auto=False, dry_run=True
+            )
+        except Exception as exc:
+            logger.exception("refine dry-run failed")
+            return f"❌ Dry-run failed: {core.scrub_text(str(exc))}"
+        if result.get("outcome") == "dry_run":
+            proposal = result.get("proposal", {})
+            lines = ["🔍 Dry run — nothing applied."]
+            if proposal.get("action") and proposal["action"] != "no_op":
+                lines.append(
+                    f"action: {proposal.get('action')} | kind: {proposal.get('kind', '')} "
+                    f"| name: {proposal.get('name', '')}"
+                )
+                if proposal.get("summary"):
+                    lines.append(f"summary: {proposal['summary']}")
+                if proposal.get("expected_outcome"):
+                    lines.append(f"expected: {proposal['expected_outcome']}")
+            else:
+                lines.append(f"action: no_op | reason: {proposal.get('reason', '')}")
+            diff = result.get("diff", "")
+            if diff:
+                lines.append("\n```diff")
+                lines.append(diff)
+                lines.append("```")
+                if result.get("diff_truncated"):
+                    lines.append("(diff truncated)")
+            return core.scrub_text("\n".join(lines))
+        # Non-dry-run outcome (session_unknown, skipped, etc.)
+        if not result.get("success"):
+            return f"❌ {result.get('message', 'Unknown error')}"
+        return result.get("message", "No proposal.")
+
     if args == _MODEL_SUBCOMMAND or args.startswith(_MODEL_SUBCOMMAND + " "):
         remainder = args[len(_MODEL_SUBCOMMAND):].strip()
         # Only treat as a subcommand when:
@@ -542,9 +578,9 @@ def register(ctx) -> None:
         _handle_refine_command,
         description=(
             "Self-improve skills/memory. "
-            "Usage: /refine [reason|audit|status|model [target|auto]|rollback <id>]"
+            "Usage: /refine [reason|audit|status|dry-run|model [target|auto]|rollback <id>]"
         ),
-        args_hint="[reason | audit | status | model [target|auto] | rollback <id>]",
+        args_hint="[reason | audit | status | dry-run | model [target|auto] | rollback <id>]",
     )
     ctx.register_tool(
         "refine_run",

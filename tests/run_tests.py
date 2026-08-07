@@ -4464,6 +4464,119 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
         self.assertTrue(meta.get("target_issues"))
         self.assertIn("credential", meta["target_issues"][0])
 
+    # ── Dry-run (Part E) ──────────────────────────────────────────────────────
+
+    def test_dry_run_does_not_mutate_host(self):
+        FakeHost.actions.clear()
+        model = MockLlm({
+            "action": "create", "kind": "skill", "name": "dry-skill",
+            "content": "---\nname: dry-skill\ndescription: test\n---\n# body\n",
+            "reason": "testing dry run", "evidence": [],
+            "expected_outcome": "something",
+        })
+        result = core.refine_run(model, session_id="session", dry_run=True)
+        self.assertEqual(result["outcome"], "dry_run")
+        self.assertEqual(FakeHost.actions, [])
+
+    def test_dry_run_does_not_spend_budget(self):
+        before = journal.count_today_applied()
+        model = MockLlm({
+            "action": "create", "kind": "skill", "name": "dry-skill",
+            "content": "---\nname: dry-skill\ndescription: test\n---\n# body\n",
+            "reason": "testing dry run", "evidence": [],
+            "expected_outcome": "something",
+        })
+        core.refine_run(model, session_id="session", dry_run=True)
+        self.assertEqual(journal.count_today_applied(), before)
+
+    def test_dry_run_shows_diff_for_patch(self):
+        FakeHost.skills["existing-skill"] = "---\nname: existing-skill\ndescription: old\n---\n# Old body\n"
+        new_content = "---\nname: existing-skill\ndescription: new\n---\n# New body\n"
+        model = MockLlm({
+            "action": "patch", "kind": "skill", "name": "existing-skill",
+            "content": new_content,
+            "reason": "update", "evidence": [],
+            "expected_outcome": "improvement",
+        })
+        result = core.refine_run(model, session_id="session", dry_run=True)
+        self.assertEqual(result["outcome"], "dry_run")
+        self.assertIn("diff", result)
+        self.assertIn("-# Old body", result["diff"])
+        self.assertIn("+# New body", result["diff"])
+
+    def test_dry_run_diff_is_scrubbed(self):
+        token = "ghp_" + "A" * 36
+        FakeHost.skills["leaky-skill"] = "---\nname: leaky-skill\ndescription: ok\n---\n# body\n"
+        new_content = f"---\nname: leaky-skill\ndescription: ok\n---\n# body with {token}\n"
+        model = MockLlm({
+            "action": "patch", "kind": "skill", "name": "leaky-skill",
+            "content": new_content,
+            "reason": "update", "evidence": [],
+            "expected_outcome": "improvement",
+        })
+        result = core.refine_run(model, session_id="session", dry_run=True)
+        self.assertNotIn(token, result.get("diff", ""))
+
+    def test_dry_run_diff_is_truncated_at_limit(self):
+        # Content just under the max so the proposal is accepted, but the diff
+        # it produces exceeds MAX_CONTENT_CHARS.
+        old_content = "---\nname: big-skill\ndescription: ok\n---\n" + ("a\n" * 7000)
+        new_content = "---\nname: big-skill\ndescription: ok\n---\n" + ("b\n" * 7000)
+        FakeHost.skills["big-skill"] = old_content
+        model = MockLlm({
+            "action": "patch", "kind": "skill", "name": "big-skill",
+            "content": new_content,
+            "reason": "update", "evidence": [],
+            "expected_outcome": "improvement",
+        })
+        result = core.refine_run(model, session_id="session", dry_run=True)
+        self.assertEqual(result["outcome"], "dry_run")
+        self.assertTrue(result.get("diff_truncated"))
+        self.assertIn("[truncated]", result.get("diff", ""))
+
+    def test_dry_run_journal_entry_exists_and_not_counted(self):
+        before = journal.count_today_applied()
+        model = MockLlm({
+            "action": "no_op", "reason": "nothing", "evidence": [],
+            "kind": "", "name": "", "content": "",
+        })
+        core.refine_run(model, session_id="session", dry_run=True)
+        entries = journal.entries()
+        dry_entries = [e for e in entries if e.get("outcome") == "dry_run"]
+        self.assertTrue(dry_entries)
+        self.assertEqual(journal.count_today_applied(), before)
+
+    def test_dry_run_with_reason(self):
+        model = MockLlm({
+            "action": "no_op", "reason": "nothing", "evidence": [],
+            "kind": "", "name": "", "content": "",
+        })
+        core.refine_run(model, reason="focus on gmail", session_id="session", dry_run=True)
+        entries = journal.entries()
+        dry_entries = [e for e in entries if e.get("outcome") == "dry_run"]
+        self.assertTrue(dry_entries)
+        self.assertIn("gmail", dry_entries[-1].get("reason", ""))
+
+    def test_dry_run_command_output(self):
+        with patch.object(core, "refine_run", return_value={
+            "success": True, "outcome": "dry_run",
+            "message": "Dry run: proposal shown, nothing applied.",
+            "proposal": {"action": "create", "kind": "skill", "name": "test-skill",
+                         "summary": "a test", "expected_outcome": "better"},
+            "diff": "", "diff_truncated": False,
+        }):
+            text = plugin_init._handle_refine_command("dry-run")
+        self.assertIn("Dry run", text)
+        self.assertIn("create", text)
+        self.assertIn("test-skill", text)
+
+    def test_dry_run_unknown_session_refuses(self):
+        core._LAST_SESSION_ID = ""
+        with patch.object(core, "host_session_id", return_value=""):
+            model = MockLlm()
+            result = core.refine_run(model, dry_run=True)
+        self.assertEqual(result["outcome"], "session_unknown")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
