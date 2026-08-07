@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+_RUNTIME_JOURNAL_DIR: Optional[Path] = None
+_RUNTIME_JOURNAL_COMMIT_MARKER: Optional[Path] = None
 
 
 def hermes_home() -> Path:
@@ -24,6 +26,13 @@ def hermes_home() -> Path:
         from hermes_constants import get_hermes_home
         return Path(get_hermes_home())
     except Exception:
+        env_home = os.environ.get("HERMES_HOME", "").strip()
+        if env_home:
+            return Path(env_home)
+        if os.name == "nt":
+            local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+            if local_app_data:
+                return Path(local_app_data) / "hermes"
         return Path(os.path.expanduser("~/.hermes"))
 
 
@@ -58,20 +67,32 @@ def _get_refine_entry() -> Dict[str, Any]:
 
 
 def get_bool(key: str, default: bool) -> bool:
-    """Read a boolean config key with a default."""
+    """Read a boolean config key with a default. Accepts string representations."""
     entry = _get_refine_entry()
     val = entry.get(key)
     if isinstance(val, bool):
         return val
+    if isinstance(val, str):
+        normalized = val.strip().lower()
+        if normalized in ("true", "yes", "1"):
+            return True
+        if normalized in ("false", "no", "0"):
+            return False
+        logger.warning("Config key '%s' has unrecognized boolean value; using default", key)
     return default
 
 
 def get_int(key: str, default: int, min_val: int = 1) -> int:
-    """Read an integer config key with a default and floor."""
+    """Read an integer config key with a default and floor. Accepts string integers."""
     entry = _get_refine_entry()
     val = entry.get(key)
     if isinstance(val, (int, float)) and not isinstance(val, bool):
         return max(int(val), min_val)
+    if isinstance(val, str):
+        try:
+            return max(int(val.strip()), min_val)
+        except ValueError:
+            logger.warning("Config key '%s' has unrecognized integer value; using default", key)
     return default
 
 
@@ -121,7 +142,7 @@ def auto_turn_interval() -> int:
 
 def auto_cooldown_minutes() -> int:
     """Minimum elapsed time between durable automatic-attempt records."""
-    return get_int("auto_cooldown_minutes", 20)
+    return get_int("auto_cooldown_minutes", 20, min_val=0)
 
 
 def max_edits_per_run() -> int:
@@ -163,7 +184,7 @@ def reviewer_min_messages() -> int:
 
 def reviewer_cooldown_minutes() -> int:
     """Minimum gap between durable reviewer decisions."""
-    return get_int("reviewer_cooldown_minutes", 60)
+    return get_int("reviewer_cooldown_minutes", 60, min_val=0)
 
 
 def cross_session_enabled() -> bool:
@@ -191,6 +212,11 @@ def cross_session_days() -> int:
 
 def cross_session_max_sessions() -> int:
     return get_int("cross_session_max_sessions", 25, min_val=1)
+
+
+def cross_session_max_rows() -> int:
+    """Maximum trajectory rows scanned by an interactive refinement pass."""
+    return get_int("cross_session_max_rows", 4000, min_val=1)
 
 
 def dedup_window_days() -> int:
@@ -369,9 +395,34 @@ def effective_llm_target() -> Dict[str, Any]:
     return {"provider": "", "model": "", "source": "host_default", "issues": issues}
 
 
+def _set_runtime_journal_dir(
+    path: Optional[Path], *, commit_marker: Optional[Path] = None
+) -> None:
+    """Select a fallback store until another process publishes its successor."""
+    global _RUNTIME_JOURNAL_DIR, _RUNTIME_JOURNAL_COMMIT_MARKER
+    _RUNTIME_JOURNAL_DIR = Path(path) if path is not None else None
+    _RUNTIME_JOURNAL_COMMIT_MARKER = (
+        Path(commit_marker) if commit_marker is not None else None
+    )
+
+
 def journal_dir() -> Path:
+    global _RUNTIME_JOURNAL_DIR, _RUNTIME_JOURNAL_COMMIT_MARKER
     default = hermes_home() / "refine"
-    return Path(get_str("journal_dir", str(default)))
+    configured = get_str("journal_dir", "").strip()
+    if configured:
+        return Path(os.path.expandvars(os.path.expanduser(configured)))
+    if _RUNTIME_JOURNAL_DIR is not None:
+        marker = _RUNTIME_JOURNAL_COMMIT_MARKER
+        if marker is not None and marker.is_file():
+            # A different process completed the migration after this one fell
+            # back. Switch before the next path is resolved; do not recreate the
+            # renamed legacy directory.
+            _RUNTIME_JOURNAL_DIR = None
+            _RUNTIME_JOURNAL_COMMIT_MARKER = None
+            return marker.parent
+        return _RUNTIME_JOURNAL_DIR
+    return default
 
 
 def legacy_journal_dir() -> Path:

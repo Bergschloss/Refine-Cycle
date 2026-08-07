@@ -205,14 +205,15 @@ def _on_pre_llm_call(**kwargs) -> Optional[dict]:
         selected = selected[-config.prompt_notes_max_count():]
         while selected:
             rendered = "Refine notes:\n" + "\n".join(
-                f"- {note['content']}" for note in selected
+                "- " + note["content"].replace("\n", "\n  ")
+                for note in selected
             )
             safe_rendered = core.scrub_text(rendered)
             if len(safe_rendered) <= config.prompt_notes_max_chars():
                 return {"context": safe_rendered}
             selected = selected[1:]
     except Exception:
-        logger.debug("refine prompt-note hook failed", exc_info=True)
+        logger.warning("refine prompt-note hook failed", exc_info=True)
     return None
 
 
@@ -347,7 +348,7 @@ def _handle_refine_command(raw_args: str) -> Optional[str]:
             return core.refine_audit().get("report", "No data.")
         except Exception as exc:
             logger.exception("refine audit failed")
-            return f"❌ Audit failed: {exc}"
+            return f"❌ Audit failed: {core.scrub_text(str(exc))}"
 
     if args == "status":
         try:
@@ -365,10 +366,19 @@ def _handle_refine_command(raw_args: str) -> Optional[str]:
             f"session: {status['session_id'] or '(unknown)'}"
             + f" (source: {status['session_id_source']}"
             + f", messages: {status['session_message_count']})",
+            f"session db source: {status['session_source'] or '(empty/unknown)'}",
+            "skipped session sources: "
+            + (", ".join(status["skip_session_sources"]) or "(none)"),
             f"model: {status['llm_model'] or '(host default)'}"
             + (f" @ {status['llm_provider']}" if status["llm_provider"] else "")
             + f" (source: {status['llm_target_source']})",
             f"journal: {status['journal_dir']} ({status['journal_dir_state_text']})",
+            f"migration: {status['migration_outcome']}"
+            + (
+                f" (active: {status['migration'].get('active_dir')})"
+                if status["migration"].get("active_dir")
+                else ""
+            ),
         ]
         if status["cooldown_remaining_minutes"] > 0:
             lines.append(
@@ -396,6 +406,12 @@ def _handle_refine_command(raw_args: str) -> Optional[str]:
         if result.get("outcome") == "dry_run":
             proposal = result.get("proposal", {})
             lines = ["🔍 Dry run — nothing applied."]
+            evidence = result.get("evidence", {})
+            if evidence.get("session_id"):
+                lines.append(
+                    f"session: {evidence['session_id']} "
+                    f"(source: {evidence.get('session_id_source', 'unknown')})"
+                )
             if proposal.get("action") and proposal["action"] != "no_op":
                 lines.append(
                     f"action: {proposal.get('action')} | kind: {proposal.get('kind', '')} "
@@ -436,12 +452,17 @@ def _handle_refine_command(raw_args: str) -> Optional[str]:
                 # /refine status exists to diagnose.
                 logger.exception("refine model command failed")
                 return f"❌ Model command failed: {core.scrub_text(str(exc))}"
-        # Fall through to the proposal path below
+        if remainder and ("/" in remainder or " " not in remainder):
+            return (
+                "❌ Invalid model target.\n"
+                "Usage: /refine model [auto | <model> | <provider>/<model>]"
+            )
+        # Prose such as "model of gmail failures" remains a refine reason.
 
     if args == "rollback":
         return (
             "Usage: /refine rollback <12-character journal_id>\n"
-            "Find ids in <HERMES_HOME>/plugins/refine/refine_journal.jsonl"
+            f"Find ids in {journal.journal_read_path()}"
         )
     rollback_match = _ROLLBACK_COMMAND.fullmatch(args)
     if rollback_match:
@@ -450,17 +471,29 @@ def _handle_refine_command(raw_args: str) -> Optional[str]:
         if result.get("success"):
             return f"✅ Rollback {entry_id}: {result.get('message', 'done')}"
         return f"❌ Rollback failed: {result.get('error', 'unknown error')}"
+    if args.startswith("rollback "):
+        return (
+            "❌ Invalid rollback format. Expected a 12-character hex journal ID.\n"
+            "Usage: /refine rollback <12-character journal_id>\n"
+            f"Find ids in {journal.journal_read_path()}"
+        )
 
     try:
         result = core.refine_run(llm=_session_llm(), reason=args, auto=False)
     except Exception as exc:
         logger.exception("refine command failed")
-        return f"❌ Refine failed: {exc}"
+        return f"❌ Refine failed: {core.scrub_text(str(exc))}"
 
     if not result.get("success") and result.get("outcome") != "partial_success":
         return f"❌ {result.get('message', 'Unknown error')}"
 
     summary = result.get("message", "done")
+    evidence = result.get("evidence", {})
+    if evidence.get("session_id"):
+        summary += (
+            f"\nsession: {evidence['session_id']} "
+            f"(source: {evidence.get('session_id_source', 'unknown')})"
+        )
     if result.get("outcome") == "partial_success":
         summary = "⚠️ " + summary
     proposal = result.get("proposal", {})
@@ -504,7 +537,7 @@ def _handle_refine_run(args: dict, **kw) -> str:
         result = core.refine_run(llm=_session_llm(), reason=reason, auto=False)
     except Exception as exc:
         logger.exception("refine_run tool failed")
-        return json.dumps({"success": False, "error": str(exc)})
+        return json.dumps({"success": False, "error": core.scrub_text(str(exc))})
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -528,6 +561,16 @@ def _on_session_end(
     def _collect_and_run() -> None:
         handed_off = False
         try:
+            session_source, _ = core._get_session_source_status(session_id)
+            if (
+                session_source
+                and session_source.lower() in config.skip_session_sources()
+            ):
+                # Let the normal source gate create the non-budget journal record,
+                # but do not fetch even one trajectory row in this preflight.
+                handed_off = True
+                _run_auto_refine(session_id, cleanup_session_notes=True)
+                return
             evidence = core.collect_evidence(session_id=session_id, limit=30)
             messages = evidence.get("messages", [])
             if len(messages) < config.auto_min_messages():

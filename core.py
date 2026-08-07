@@ -21,6 +21,16 @@ except ImportError:
     from sanitization import sanitize, scrub_text  # noqa: F811
 
 logger = logging.getLogger(__name__)
+_UNTRUSTED_TOOL_TAG = re.compile(
+    r"<\s*/?\s*untrusted_tool_result\s*>", re.IGNORECASE
+)
+_RECORD_SEPARATOR = re.compile(r"[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]+")
+
+
+def _one_line(value: Any) -> str:
+    """Normalize every Unicode line boundary before rendering one record."""
+    return _RECORD_SEPARATOR.sub(" ", str(value)).strip()
+
 
 # ── session identity ───────────────────────────────────────────────────────
 # The host does not pass session_id to slash-command handlers (contract is
@@ -102,22 +112,30 @@ def _open_db() -> Optional[sqlite3.Connection]:
         return None
 
 
-def _get_session_source(session_id: str) -> str:
-    """Read-only lookup of a session's source column. Returns "" on any failure."""
+def _get_session_source_status(session_id: str) -> Tuple[str, str]:
+    """Return a scrubbed source plus ``ok``, ``missing``, or ``error``."""
     if not session_id:
-        return ""
+        return "", "missing"
     connection = _open_db()
     if not connection:
-        return ""
+        return "", "error"
     try:
         row = connection.execute(
             "SELECT source FROM sessions WHERE id = ?", (session_id,)
         ).fetchone()
-        return str(row["source"] or "") if row else ""
-    except Exception:
-        return ""
+        if not row:
+            return "", "missing"
+        return scrub_text(str(row["source"] or "")), "ok"
+    except Exception as exc:
+        logger.warning("Cannot read session source: %s", scrub_text(str(exc)))
+        return "", "error"
     finally:
         connection.close()
+
+
+def _get_session_source(session_id: str) -> str:
+    """Compatibility wrapper for status and callers that only need the value."""
+    return _get_session_source_status(session_id)[0]
 
 
 def _structured_error_status(content: str) -> Optional[bool]:
@@ -213,19 +231,34 @@ def collect_evidence(session_id: Optional[str] = None, limit: int = 60) -> Dict[
         empty["session_id_source"] = how
         return empty
     try:
-        rows = connection.execute(
-            "SELECT role, content, tool_name, timestamp FROM messages "
-            "WHERE session_id = ? AND active = 1 ORDER BY timestamp DESC LIMIT ?",
-            (resolved, limit),
-        ).fetchall()
+        sql = (
+            "SELECT m.role, m.content, m.tool_name, m.timestamp FROM messages m "
+            "LEFT JOIN sessions s ON s.id = m.session_id "
+            "WHERE m.session_id = ? AND m.active = 1"
+        )
+        params: List[Any] = [resolved]
+        skipped_sources = config.skip_session_sources()
+        if skipped_sources:
+            placeholders = ",".join("?" for _ in skipped_sources)
+            sql += f" AND (s.source IS NULL OR LOWER(s.source) NOT IN ({placeholders}))"
+            params.extend(skipped_sources)
+        sql += " ORDER BY m.timestamp DESC LIMIT ?"
+        params.append(limit)
+        rows = connection.execute(sql, tuple(params)).fetchall()
         messages: List[Dict[str, Any]] = []
         tool_errors: List[Dict[str, Any]] = []
         corrections: List[Dict[str, Any]] = []
         error_items: List[Dict[str, Any]] = []
         for row in reversed(rows):
-            role = str(row["role"] or "")
+            # Every string from SQLite is scrubbed at this single extraction
+            # boundary so evidence, journals, and returned tool results inherit it.
+            role = _one_line(scrub_text(str(row["role"] or "")))[:32].lower()
+            if role not in {"user", "assistant", "tool", "system"}:
+                role = "unknown"
             content = scrub_text(str(row["content"] or ""))
-            tool_name = str(row["tool_name"] or "")
+            tool_name = _one_line(
+                scrub_text(str(row["tool_name"] or ""))
+            )[:120]
             shown = content[:400] + ("…" if len(content) > 400 else "")
             messages.append({"role": role, "content": shown, "tool_name": tool_name})
             if role == "tool" and _is_error_content(content):
@@ -234,11 +267,12 @@ def collect_evidence(session_id: Optional[str] = None, limit: int = 60) -> Dict[
                     if len(content) <= 4000
                     else content[:1000] + "\n…\n" + content[-3000:]
                 )
-                tool_errors.append({"tool": tool_name, "snippet": bounded[:300]})
+                pattern_content = _UNTRUSTED_TOOL_TAG.sub("", bounded)
+                tool_errors.append({"tool": tool_name, "snippet": pattern_content[:300]})
                 error_items.append({
                     "tool": tool_name,
-                    "content": bounded,
-                    "session_id": session_id,
+                    "content": pattern_content,
+                    "session_id": resolved,
                     "ts": row["timestamp"] or 0,
                 })
             if role == "user" and _is_correction(content):
@@ -252,32 +286,51 @@ def collect_evidence(session_id: Optional[str] = None, limit: int = 60) -> Dict[
             "session_id": resolved,
             "session_id_source": how,
         }
+    except Exception as exc:
+        logger.warning("Current-session evidence query failed: %s", scrub_text(str(exc)))
+        empty["session_id"] = resolved
+        empty["session_id_source"] = how
+        return empty
     finally:
         connection.close()
 
 
 def collect_cross_session_patterns(
     days: Optional[int] = None,
-    max_rows: Optional[int] = 4000,
+    max_rows: Optional[int] = -1,
     *,
     since_ts: Optional[float] = None,
     max_sessions: Optional[int] = None,
+    strict: bool = False,
 ) -> List[Dict[str, Any]]:
     if not config.cross_session_enabled():
+        if strict:
+            raise IOError("Cross-session pattern collection is disabled")
         return []
     connection = _open_db()
     if not connection:
+        if strict:
+            raise IOError("Cross-session database is unavailable")
         return []
+    if max_rows == -1:
+        max_rows = config.cross_session_max_rows()
     since = (
         since_ts
         if since_ts is not None
         else time.time() - ((days or config.cross_session_days()) * 86400)
     )
     sql = (
-        "SELECT session_id, tool_name, content, timestamp FROM messages "
-        "WHERE role = 'tool' AND active = 1 AND timestamp >= ? ORDER BY timestamp DESC"
+        "SELECT m.session_id, m.tool_name, m.content, m.timestamp FROM messages m "
+        "LEFT JOIN sessions s ON s.id = m.session_id "
+        "WHERE m.role = 'tool' AND m.active = 1 AND m.timestamp >= ?"
     )
     params: List[Any] = [since]
+    skipped_sources = config.skip_session_sources()
+    if skipped_sources:
+        placeholders = ",".join("?" for _ in skipped_sources)
+        sql += f" AND (s.source IS NULL OR LOWER(s.source) NOT IN ({placeholders}))"
+        params.extend(skipped_sources)
+    sql += " ORDER BY m.timestamp DESC"
     if max_rows is not None:
         sql += " LIMIT ?"
         params.append(max_rows)
@@ -289,9 +342,12 @@ def collect_cross_session_patterns(
             else max_sessions
         )
         seen: set = set()
+        rows_seen = 0
 
         def iter_items():
+            nonlocal rows_seen
             for row in cursor:
+                rows_seen += 1
                 sid = scrub_text(str(row["session_id"] or ""))
                 if sid and sid not in seen:
                     if session_cap is not None and len(seen) >= session_cap:
@@ -306,18 +362,29 @@ def collect_cross_session_patterns(
                     else content[:1000] + "\n…\n" + content[-3000:]
                 )
                 yield {
-                    "tool": scrub_text(str(row["tool_name"] or "")),
-                    "content": bounded,
+                    "tool": _one_line(
+                        scrub_text(str(row["tool_name"] or ""))
+                    )[:120],
+                    "content": _UNTRUSTED_TOOL_TAG.sub("", bounded),
                     "session_id": sid,
                     "ts": row["timestamp"] or 0,
                 }
 
         full_audit = since_ts is not None and max_rows is None and max_sessions is None
-        return patterns.extract_patterns(
+        result = patterns.extract_patterns(
             iter_items(), limit=None if full_audit else 10
         )
+        if max_rows is not None and rows_seen >= max_rows:
+            logger.warning(
+                "Cross-session row limit reached (%d); interactive evidence may be truncated",
+                max_rows,
+            )
+        return result
     except Exception as exc:
-        logger.warning("Cross-session query failed: %s", scrub_text(str(exc)))
+        safe_error = scrub_text(str(exc))
+        logger.warning("Cross-session query failed: %s", safe_error)
+        if strict:
+            raise IOError(f"Cross-session query failed: {safe_error}") from exc
         return []
     finally:
         connection.close()
@@ -335,7 +402,8 @@ def _skill_items() -> List[Any]:
         result = raw if not isinstance(raw, str) else json.loads(raw)
         skills = result.get("skills", []) if isinstance(result, dict) else result
         return skills if isinstance(skills, list) else []
-    except Exception:
+    except Exception as exc:
+        logger.warning("Cannot retrieve skill items: %s", scrub_text(str(exc)))
         return []
 
 
@@ -392,7 +460,8 @@ def list_memory_snippets() -> List[str]:
             scrub_text(str(entry))[:120]
             for entry in (store.memory_entries + store.user_entries)[-20:]
         ]
-    except Exception:
+    except Exception as exc:
+        logger.warning("Cannot read memory snippets: %s", scrub_text(str(exc)))
         return []
 
 
@@ -477,6 +546,7 @@ def refine_status() -> Dict[str, Any]:
     max_edits = config.max_edits_per_day()
     jdir = config.journal_dir()
     jdir_state = _journal_dir_state(jdir)
+    migration = journal.migration_status()
 
     # The effective model belongs in this report. A pinned model that no provider
     # serves turns every pass into an ordinary no_op, and without it here the
@@ -562,11 +632,24 @@ def refine_status() -> Dict[str, Any]:
         })
 
     warnings: List[Dict[str, str]] = []
+    if migration.get("outcome") == "failed":
+        warnings.append({
+            "code": "journal_migration_failed",
+            "message": (
+                "Runtime-data migration failed; refine is using the intact legacy "
+                f"store at {migration.get('active_dir') or jdir}"
+            ),
+        })
+    if migration.get("rename_warning"):
+        warnings.append({
+            "code": "journal_migration_rename_failed",
+            "message": "Runtime data migrated, but the legacy directory could not be renamed",
+        })
     plugin_source_collision = False
     try:
         plugin_source_collision = (jdir / "plugin.yaml").is_file()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Cannot inspect plugin source collision: %s", scrub_text(str(exc)))
     if plugin_source_collision:
         warnings.append({
             "code": "journal_dir_is_plugin_source",
@@ -651,8 +734,8 @@ def refine_status() -> Dict[str, Any]:
                     session_message_count = row["n"] if row else 0
                 finally:
                     conn.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Cannot read session message count: %s", scrub_text(str(exc)))
     if sid_source == "unknown":
         blockers.append({
             "code": "session_unknown",
@@ -679,6 +762,8 @@ def refine_status() -> Dict[str, Any]:
         "journal_dir_state": jdir_state,
         "journal_dir_state_text": _JOURNAL_DIR_STATE_TEXT.get(jdir_state, jdir_state),
         "journal_dir_is_plugin_source": plugin_source_collision,
+        "migration": migration,
+        "migration_outcome": migration.get("outcome", "not_checked"),
         "session_id": sid,
         "session_id_source": sid_source,
         "session_message_count": session_message_count,
@@ -700,21 +785,40 @@ def refine_status() -> Dict[str, Any]:
 def refine_audit() -> Dict[str, Any]:
     with journal.mutation_lock():
         _reconcile_pending()
-    earliest = ledger.earliest_created_ts()
     try:
-        current = (
-            collect_cross_session_patterns(
+        earliest = ledger.earliest_created_ts()
+    except IOError as exc:
+        safe_error = scrub_text(str(exc))
+        logger.error("Audit ledger read failed: %s", safe_error)
+        return {
+            "success": False,
+            "complete": False,
+            "rows": [],
+            "report": "Audit incomplete: the refine ledger is unreadable; no conclusions were drawn.",
+        }
+
+    complete = True
+    current: Optional[List[Dict[str, Any]]] = []
+    if earliest:
+        try:
+            current = collect_cross_session_patterns(
                 since_ts=earliest,
                 max_rows=None,
                 max_sessions=None,
+                strict=True,
             )
-            if earliest
-            else []
-        )
-    except Exception:
-        current = []
+        except Exception as exc:
+            logger.error("Audit pattern collection failed: %s", scrub_text(str(exc)))
+            current = None
+            complete = False
     rows = ledger.audit(current)
-    return {"success": True, "rows": rows, "report": ledger.format_audit(rows)}
+    report = ledger.format_audit(rows)
+    if not complete:
+        report = (
+            "⚠ Audit incomplete: trajectory recurrence could not be measured; "
+            "recurrence-dependent verdicts remain unknown.\n\n" + report
+        )
+    return {"success": True, "complete": complete, "rows": rows, "report": report}
 
 
 # ── proposal validation and apply ──────────────────────────────────────────
@@ -752,14 +856,19 @@ def _prompt_note_content_error(
     first_line = lines[0]
     if not re.match(r"(?i)^when\s+[^,\n]{3,200},\s+\S", first_line):
         return "Prompt note must use 'When <specific condition>, <one action>.'"
+    if len(lines) > 1 and not re.match(r"(?i)^when\s+[^,\n]{3,200},\s+\S", lines[1]):
+        return "Every line of a prompt note must use 'When <specific condition>, <one action>.'"
     blocked_terms = r"(?i)\b(?:always|never|ignore|system prompt|instruction|any user|all users|every request|first|then|finally)\b"
     if any(re.search(blocked_terms, line) for line in lines):
         return "Prompt note must be a narrow conditional policy, not a global or procedural instruction"
     rendered = "Refine notes:\n- " + content
-    if check_rendered_size and len(rendered) > config.prompt_notes_max_chars():
+    per_note_limit = max(
+        1, config.prompt_notes_max_chars() // config.prompt_notes_max_count()
+    )
+    if check_rendered_size and len(rendered) > per_note_limit:
         return (
-            f"Prompt note is too large for its rendered context ({len(rendered)} chars; max "
-            f"{config.prompt_notes_max_chars()})"
+            f"Prompt note is too large for its per-note rendered context budget ({len(rendered)} chars; max "
+            f"{per_note_limit})"
         )
     return None
 
@@ -948,11 +1057,87 @@ def _refine_once(
     started = time.time()
     safe_reason = scrub_text(reason)
 
-    if journal.daily_limit_reached():
+    # Fail closed when journal is unreadable: without history the budget, dedup,
+    # and context guards are all bypassed. Must be distinguishable from no_op.
+    _, journal_state = journal._load_entries_safe()
+    if journal_state == "unreadable":
+        return {
+            "success": False,
+            "outcome": "journal_unreadable",
+            "message": "Journal could not be read; refine did not run to avoid bypassing budget limits.",
+            "reversible": False,
+        }
+
+    resolved_session, resolved_source = resolve_session_id(session_id or "")
+    if not resolved_session:
+        evidence = {
+            "messages": [],
+            "error_count": 0,
+            "tool_errors": [],
+            "error_patterns": [],
+            "user_corrections": [],
+            "session_id": "",
+            "session_id_source": resolved_source,
+        }
+        return {
+            "success": False,
+            "outcome": "session_unknown",
+            "message": "Cannot identify the current session; refine did not run.",
+            "evidence": evidence,
+            "reversible": False,
+        }
+
+    # Resolve machine-generated sources before reading any private trajectory.
+    session_db_source, source_lookup_status = _get_session_source_status(
+        resolved_session
+    )
+    skip_sources = config.skip_session_sources()
+    if session_db_source and session_db_source.lower() in skip_sources:
+        proposal = {
+            "action": "no_op",
+            "reason": f"Session source '{session_db_source}' is configured to be skipped.",
+            "expected_outcome": "",
+        }
+        entry_id = _journal_nonmutation(
+            trigger=trigger,
+            reason=safe_reason or proposal["reason"],
+            session_id=resolved_session,
+            proposal=proposal,
+            outcome="skipped_session_source",
+        )
+        response = {
+            "success": bool(entry_id),
+            "outcome": "skipped_session_source",
+            "message": (
+                f"Session source '{session_db_source}' is in skip_session_sources; "
+                "refine did not run."
+            ),
+            "evidence": {
+                "messages": [],
+                "session_id": resolved_session,
+                "session_id_source": resolved_source,
+                "session_source": session_db_source,
+                "source_lookup_status": source_lookup_status,
+            },
+            "reversible": False,
+        }
+        if entry_id:
+            response["journal_id"] = entry_id
+        else:
+            response["message"] += " The skip decision could not be journaled."
+        return response
+
+    if not dry_run and journal.daily_limit_reached():
         return {
             "success": False,
             "message": f"Daily edit limit reached ({config.max_edits_per_day()}). "
             f"Applied/pending/prepared today: {journal.count_today_applied()}.",
+            "evidence": {
+                "session_id": resolved_session,
+                "session_id_source": resolved_source,
+                "session_source": session_db_source,
+                "source_lookup_status": source_lookup_status,
+            },
         }
 
     # Resolve the LLM target once per pass so every call within it uses the same
@@ -970,35 +1155,21 @@ def _refine_once(
         _run_target = {}
         _run_target_source = "unknown"
         _run_target_issues = ["the effective model could not be resolved"]
+    _run_target_unusable = bool(
+        _run_target_issues
+        and not _run_target
+        and _run_target_source in ("unknown", "host_default")
+    )
 
     evidence_limit = 60
     if config.min_signal_required() and config.reviewer_fallback_enabled():
         evidence_limit = max(evidence_limit, config.reviewer_min_messages())
-    evidence = collect_evidence(session_id=session_id, limit=evidence_limit)
-    session = evidence.get("session_id", "")
-    session_source = evidence.get("session_id_source", "unknown")
-    if not session and session_source == "unknown":
-        return {
-            "success": False,
-            "outcome": "session_unknown",
-            "message": "Cannot identify the current session; refine did not run.",
-            "evidence": evidence,
-            "reversible": False,
-        }
-    # Source filter: skip machine-generated sessions whose trajectory is noise.
-    skip_sources = config.skip_session_sources()
-    session_db_source = _get_session_source(session)
-    if session_db_source and session_db_source.lower() in skip_sources:
-        return {
-            "success": True,
-            "outcome": "skipped_session_source",
-            "message": (
-                f"Session source '{session_db_source}' is in skip_session_sources; "
-                "refine did not run."
-            ),
-            "evidence": evidence,
-            "reversible": False,
-        }
+    evidence = collect_evidence(session_id=resolved_session, limit=evidence_limit)
+    evidence["session_id_source"] = resolved_source
+    evidence["session_source"] = session_db_source
+    evidence["source_lookup_status"] = source_lookup_status
+    session = resolved_session
+    session_source = resolved_source
     if len(evidence.get("messages", [])) < 3:
         return {
             "success": True,
@@ -1013,10 +1184,21 @@ def _refine_once(
     corrections = evidence.get("user_corrections", [])
     lines: List[str] = []
     for message in evidence.get("messages", []):
-        tag = f"[{message['role']}]"
-        if message.get("tool_name"):
-            tag += f"({message['tool_name']})"
-        lines.append(f"{tag} {message['content'][:400]}")
+        role = _one_line(message["role"])[:32].lower()
+        if role not in {"user", "assistant", "tool", "system"}:
+            role = "unknown"
+        content = _one_line(str(message["content"])[:400])
+        if role == "tool":
+            # Tool metadata is untrusted too: keep the complete physical record
+            # inside one plugin-owned boundary after removing forged variants.
+            tool_name = _one_line(message.get("tool_name", ""))[:120]
+            record = f"tool={tool_name or '?'} | {content}"
+            safe_record = _UNTRUSTED_TOOL_TAG.sub("", record)
+            lines.append(
+                f"[tool] <untrusted_tool_result>{safe_record}</untrusted_tool_result>"
+            )
+        else:
+            lines.append(f"[{role}] {content}")
     evidence_text = "\n".join(lines)
     proposal_context = safe_reason
     if config.min_signal_required() and not patterns.has_signal(
@@ -1029,9 +1211,40 @@ def _refine_once(
         )
         if should_review:
             reviewer = _llm.review_fallback(llm, evidence_text, target=_run_target)
+            reviewer_call_meta = _llm.last_call_meta()
+            reviewer_llm_meta = {
+                "requested_provider": _run_target.get("provider", ""),
+                "requested_model": _run_target.get("model", ""),
+                "target_source": _run_target_source,
+                **{k: v for k, v in reviewer_call_meta.items() if k in (
+                    "reported_model", "latency_ms", "output_tokens"
+                )},
+            }
+            if _run_target_issues:
+                reviewer_llm_meta["target_issues"] = _run_target_issues
             rationale = scrub_text(str(reviewer.get("rationale", "")))
             decision = "approved" if reviewer.get("should_refine") else "declined"
             reviewer_reason = f"Reviewer {decision}: {rationale}"
+            reviewer_failure = scrub_text(str(reviewer.get("failure", "")).strip())
+            reviewer_target_issue = bool(
+                not reviewer_failure
+                and _run_target_unusable
+                and not reviewer.get("should_refine")
+            )
+            reviewer_outcome = (
+                "llm_error"
+                if reviewer_failure
+                else ("target_issue" if reviewer_target_issue else "no_op")
+            )
+            reviewer_error = (
+                "The reviewer model call failed."
+                if reviewer_failure
+                else (
+                    "The configured refine model target is unusable."
+                    if reviewer_target_issue
+                    else ""
+                )
+            )
             reviewer_entry_id = _journal_nonmutation(
                 trigger="reviewer",
                 reason=reviewer_reason,
@@ -1041,7 +1254,9 @@ def _refine_once(
                     "reason": reviewer_reason,
                     "expected_outcome": "",
                 },
-                outcome="no_op",
+                outcome=reviewer_outcome,
+                error=reviewer_error,
+                llm_meta=reviewer_llm_meta,
             )
             if not reviewer_entry_id:
                 return {
@@ -1052,12 +1267,39 @@ def _refine_once(
                     "evidence": evidence,
                     "reversible": False,
                 }
+            if reviewer_failure:
+                return {
+                    "success": False,
+                    "outcome": "llm_error",
+                    "failure": reviewer_failure,
+                    "message": reviewer_error,
+                    "journal_id": reviewer_entry_id,
+                    "llm_called": True,
+                    "reviewer": "failed",
+                    "evidence": evidence,
+                    "llm_meta": reviewer_llm_meta,
+                    "reversible": False,
+                }
             if not reviewer.get("should_refine"):
                 proposal = {
                     "action": "no_op",
                     "reason": reviewer_reason,
                     "expected_outcome": "",
                 }
+                if reviewer_target_issue:
+                    return {
+                        "success": False,
+                        "outcome": "target_issue",
+                        "failure": "target_configuration",
+                        "message": "The configured refine model target is unusable.",
+                        "journal_id": reviewer_entry_id,
+                        "proposal": proposal,
+                        "llm_called": True,
+                        "reviewer": "declined",
+                        "evidence": evidence,
+                        "llm_meta": reviewer_llm_meta,
+                        "reversible": False,
+                    }
                 return {
                     "success": True,
                     "message": f"No actionable improvement found. {reviewer_reason}",
@@ -1141,21 +1383,29 @@ def _refine_once(
             "no_final_text": (
                 "The model returned only reasoning and no final refine proposal."
             ),
+            "llm_call_error": "The refine model call failed.",
+            "llm_trust_denied": "The host trust policy denied the refine model call.",
         }
         failure_message = failure_messages.get(
             failure, "The refine proposal could not be completed."
+        )
+        failure_outcome = (
+            "llm_error"
+            if failure in ("llm_call_error", "llm_trust_denied")
+            else "llm_incomplete"
         )
         entry_id = _journal_nonmutation(
             trigger=trigger,
             reason=safe_reason or failure_message,
             session_id=session,
             proposal=proposal,
-            outcome="llm_incomplete",
+            outcome=failure_outcome,
             error=failure_message,
             llm_meta=_run_llm_meta,
         )
         response = {
             "success": False,
+            "outcome": failure_outcome,
             "message": failure_message,
             "llm_called": True,
             "failure": failure,
@@ -1168,9 +1418,38 @@ def _refine_once(
         return response
     evidence_summary = {
         "session_id": session,
+        "session_id_source": session_source,
+        "session_source": session_db_source,
+        "source_lookup_status": source_lookup_status,
         "messages": len(evidence.get("messages", [])),
         "errors": evidence.get("error_count", 0),
     }
+
+    if _run_target_unusable and proposal.get("action") == "no_op":
+        failure_message = "The configured refine model target is unusable."
+        entry_id = _journal_nonmutation(
+            trigger=trigger,
+            reason=safe_reason or failure_message,
+            session_id=session,
+            proposal=proposal,
+            outcome="target_issue",
+            error=failure_message,
+            llm_meta=_run_llm_meta,
+        )
+        response = {
+            "success": False,
+            "outcome": "target_issue",
+            "failure": "target_configuration",
+            "message": failure_message,
+            "proposal": proposal,
+            "evidence": evidence_summary,
+            "llm_called": True,
+            "llm_meta": _run_llm_meta,
+            "reversible": False,
+        }
+        if entry_id:
+            response["journal_id"] = entry_id
+        return response
 
     # ── Dry-run exit: show what would happen, apply nothing ────────────────
     if dry_run:
@@ -1229,7 +1508,7 @@ def _refine_once(
                     diff_text = scrub_text(combined)
 
         # Journal the dry run so /refine audit shows it was considered.
-        _journal_nonmutation(
+        dry_run_entry_id = _journal_nonmutation(
             trigger=trigger,
             reason=safe_reason or "dry-run",
             session_id=session,
@@ -1237,11 +1516,24 @@ def _refine_once(
             outcome="dry_run",
             llm_meta=_run_llm_meta,
         )
+        if not dry_run_entry_id:
+            return {
+                "success": False,
+                "outcome": "journal_error",
+                "message": "Dry-run proposal was generated, but its journal write failed.",
+                "proposal": dry_proposal,
+                "evidence": evidence_summary,
+                "llm_called": True,
+                "llm_meta": _run_llm_meta,
+                "reversible": False,
+                "edits_applied": 0,
+            }
 
         return {
             "success": True,
             "outcome": "dry_run",
             "message": "Dry run: proposal shown, nothing applied.",
+            "journal_id": dry_run_entry_id,
             "proposal": dry_proposal,
             "diff": diff_text,
             "diff_truncated": truncated,
@@ -1330,6 +1622,7 @@ def _apply_edit(
             outcome="rejected",
             error=guardrail_error,
             group=group,
+            llm_meta=llm_meta,
         )
         result = {
             "success": False,
@@ -1361,6 +1654,7 @@ def _apply_edit(
                 outcome="conflict",
                 error=conflict_a,
                 group=group,
+                llm_meta=llm_meta,
             )
             result = {
                 "success": False,
@@ -1383,6 +1677,7 @@ def _apply_edit(
                 outcome="error",
                 error=error,
                 group=group,
+                llm_meta=llm_meta,
             )
             return {
                 "success": False,
@@ -1419,6 +1714,7 @@ def _apply_edit(
                 backup_path=retained_backup_path,
                 error=conflict_b,
                 group=group,
+                llm_meta=llm_meta,
             )
             result = {
                 "success": False,
@@ -1451,6 +1747,7 @@ def _apply_edit(
                 outcome="error",
                 error=error,
                 group=group,
+                llm_meta=llm_meta,
             )
             return {
                 "success": False,
@@ -1475,6 +1772,7 @@ def _apply_edit(
                 outcome="error",
                 error=error,
                 group=group,
+                llm_meta=llm_meta,
             )
             return {
                 "success": False,
@@ -1495,6 +1793,7 @@ def _apply_edit(
             recovery=recovery,
             group=group,
             snapshot=snapshot,
+            llm_meta=llm_meta,
         )
     except Exception as exc:
         return {
@@ -1582,7 +1881,10 @@ def _apply_edit(
                 llm_meta=llm_meta,
             )
         except Exception as exc:
-            logger.warning("Cannot record edit in ledger: %s", exc)
+            logger.warning(
+                "Ledger unreadable; edit was applied but attribution was skipped: %s",
+                scrub_text(str(exc)),
+            )
 
     message = (
         f"done ({time.time() - started:.1f}s) | action={action} kind={kind} "
@@ -1664,6 +1966,7 @@ def _apply_transaction(
             proposal=proposal,
             outcome="rejected",
             error=error,
+            llm_meta=llm_meta,
         )
         return {
             "success": False,
@@ -1740,6 +2043,7 @@ def _apply_transaction(
                     outcome="conflict",
                     error=conflict_msg,
                     group=edit_group(index),
+                    llm_meta=llm_meta,
                 )
             else:
                 _journal_nonmutation(
@@ -1750,6 +2054,7 @@ def _apply_transaction(
                     outcome="rejected",
                     error=conflict_msg,
                     group=edit_group(index),
+                    llm_meta=llm_meta,
                 )
         return {
             "success": False,
@@ -1800,6 +2105,7 @@ def _apply_transaction(
             outcome="rejected",
             error=stop_reason or "Edit was not attempted",
             group=edit_group(index),
+            llm_meta=llm_meta,
         )
 
     # "Recoverable" is deliberately wider than "successful": an edit whose host
@@ -1912,7 +2218,15 @@ def refine_run(
     """Serialize a run, reconcile approvals, and preserve every recovery id."""
     started = time.time()
     with journal.mutation_lock():
-        _reconcile_pending()
+        try:
+            _reconcile_pending()
+        except IOError:
+            return {
+                "success": False,
+                "outcome": "journal_unreadable",
+                "message": "Journal could not be read; refine did not run to avoid bypassing budget limits.",
+                "reversible": False,
+            }
 
         if dry_run:
             # Dry-run: one proposal pass, no apply, no budget consumed.

@@ -36,10 +36,10 @@ _QUOTED_SECRET = re.compile(
 )
 _UNQUOTED_SECRET = re.compile(
     rf"(?i)(?P<prefix>\b{_SECRET_KEY}\b\s*[:=]\s*)"
-    r"(?P<value>[^\s,;\}\]]{6,})"
+    r"(?P<value>[^\s,;\}\]\[]{6,})"
 )
-_BEARER = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9_.+/=-]{8,}")
-_URL_CREDENTIALS = re.compile(r"(https?://)[^/\s:@]+:[^/\s:@]+@")
+_BEARER = re.compile(r"(?i)\bbearer\s+[\"']?[A-Za-z0-9_.+/=-]{8,}[\"']?")
+_URL_CREDENTIALS = re.compile(r"(https?://)[^/\s:@]+(?::[^/\s:@]+)?@")
 _ENV_SECRET = re.compile(
     r"(?m)^(\s*[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*\s*=\s*)\S+$"
 )
@@ -53,10 +53,22 @@ def _replace_quoted(match: re.Match) -> str:
     )
 
 
+def _is_number(value: str) -> bool:
+    """Return True for integer and float literals so they are not redacted."""
+    try:
+        float(value)
+        return True
+    except (ValueError, OverflowError):
+        return False
+
+
 def _replace_unquoted(match: re.Match) -> str:
     value = match.group("value")
-    if value.lower() in _NON_SECRETS or value.isdigit():
+    if value.lower() in _NON_SECRETS or _is_number(value):
         return match.group(0)
+    # Canonical markers are protected by scrub_text splitting and ``[`` is not
+    # part of this regex's value class. Do not exempt arbitrary credentials
+    # merely because their real value begins with the word "REDACTED".
     return f"{match.group('prefix')}{_REDACTED}"
 
 
@@ -84,8 +96,15 @@ def sanitize(value: Any) -> Any:
     """Recursively scrub every string in a journal- or model-bound value."""
     if isinstance(value, str):
         return scrub_text(value)
+    if isinstance(value, (bytes, bytearray)):
+        text = value.decode("utf-8", errors="replace")
+        scrubbed = scrub_text(text)
+        return type(value)(scrubbed.encode("utf-8", errors="replace"))
     if isinstance(value, dict):
-        return {scrub_text(str(key)): sanitize(item) for key, item in value.items()}
+        return {
+            (scrub_text(key) if isinstance(key, str) else key): sanitize(item)
+            for key, item in value.items()
+        }
     if isinstance(value, list):
         return [sanitize(item) for item in value]
     if isinstance(value, tuple):

@@ -77,7 +77,9 @@ def normalize_error(content: str) -> str:
 
     # For a traceback, the only stable part is the final exception line; the
     # frames above it are noise that changes with every refactor.
-    if any(marker in text for marker in _TRACEBACK_MARKERS):
+    # Only the unambiguous header proves this is a real traceback; `File "` and
+    # `  at ` alone appear in normal CLI output and must not trigger truncation.
+    if re.search(r"(?m)^Traceback \(most recent call last\):\s*$", text):
         lines = [line.strip() for line in text.splitlines() if line.strip()]
         if lines:
             text = lines[-1]
@@ -88,11 +90,15 @@ def normalize_error(content: str) -> str:
         text = pattern.sub(replacement, text)
 
     text = re.sub(r"\s+", " ", text).strip().lower()
-    return text[:200]
+    return text
 
 
 def fingerprint(tool_name: str, content: str) -> str:
-    """Stable short id for an error shape, scoped by the tool that produced it."""
+    """Stable short id for an error shape, scoped by the tool that produced it.
+
+    Hashes the full normalized text so errors sharing a long prefix but with
+    different tails remain distinct patterns.
+    """
     key = f"{tool_name or ''}|{normalize_error(content)}"
     return hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()[:12]
 
@@ -148,7 +154,7 @@ def extract_patterns(
 
 
 def merge_patterns(*groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Merge pattern lists from different windows, taking the max of counters."""
+    """Merge overlapping current/cross-session windows without double-counting."""
     merged: Dict[str, Dict[str, Any]] = {}
     for group in groups:
         for entry in group or []:
@@ -184,8 +190,12 @@ def has_signal(
     """Return whether a repeated failure or explicit correction is present."""
     if corrections:
         return True
+    session_threshold = min(max(1, min_count), 2)
     for entry in patterns or []:
-        if entry.get("count", 0) >= min_count or entry.get("sessions_seen", 1) >= 2:
+        if (
+            entry.get("count", 0) >= min_count
+            or entry.get("sessions_seen", 1) >= session_threshold
+        ):
             return True
     return False
 
@@ -200,8 +210,16 @@ def format_patterns(patterns: List[Dict[str, Any]], limit: int = 8) -> str:
             "  [{count}x across {sessions} session(s)] {tool} — {sample} (fp:{fp})".format(
                 count=entry.get("count", 1),
                 sessions=entry.get("sessions_seen", 1),
-                tool=entry.get("tool") or "?",
-                sample=scrub_text(str(entry.get("sample") or "")).replace("\n", " ")[:160],
+                tool=re.sub(
+                    r"[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]+",
+                    " ",
+                    scrub_text(str(entry.get("tool") or "?")),
+                ),
+                sample=re.sub(
+                    r"[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]+",
+                    " ",
+                    scrub_text(str(entry.get("sample") or "")),
+                )[:160],
                 fp=scrub_text(str(entry.get("fingerprint", ""))),
             )
         )

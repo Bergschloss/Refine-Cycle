@@ -3,6 +3,7 @@
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import tempfile
@@ -31,6 +32,19 @@ _LOCK_FILE_NAME = ".mutation.lock"
 _LOCK_STALE_SECONDS = 300
 _THREAD_LOCK = threading.RLock()
 _LOCK_STATE = threading.local()
+# If Windows refuses an owned unlink after the retry budget, remember the exact
+# token. A later acquisition in this same process may then retry removing only
+# its own orphan instead of treating the live PID as a foreign lock forever.
+_ORPHANED_LOCK_TOKENS: Dict[str, str] = {}
+_MIGRATION_INCOMPLETE = ".migration_incomplete"
+_MIGRATION_STATUS: Dict[str, Any] = {
+    "outcome": "not_checked",
+    "source": "",
+    "destination": "",
+    "active_dir": "",
+    "rename_warning": "",
+    "error": "",
+}
 
 # Owned here rather than in the command layer, because this module owns the
 # store: the same rule then applies to the command, to a hand-edited file, and
@@ -254,7 +268,8 @@ def write_model_override(provider: str, model: str) -> None:
         {"provider": provider, "model": model, "set_ts": time.time()},
         ensure_ascii=False,
     )
-    _atomic_write_text(ensure_dirs() / _MODEL_OVERRIDE_FILE_NAME, payload)
+    with mutation_lock():
+        _atomic_write_text(ensure_dirs() / _MODEL_OVERRIDE_FILE_NAME, payload)
 
 
 def clear_model_override() -> str:
@@ -266,28 +281,24 @@ def clear_model_override() -> str:
     same bounded retry as the read and the write. Confirming "removed" in either
     of the last two cases would report an action that did not take place.
 
-    The answer comes from the unlink itself rather than from a preceding
-    existence check: with a check first, a ``/refine model x`` from another
-    channel landing in between would be deleted and still reported as "no
-    override was set".
-
-    The store is deliberately not locked: the mutation lock is held for a whole
-    refine pass, and making a settings command queue behind one would be worse
-    than the race it removes. Last writer wins, which for a single-user setting
-    command is the expected outcome.
+    The command participates in the same generation lock as journal writes and
+    migration, so a successful pin cannot be lost (or a cleared pin resurrected)
+    while runtime data is published. The answer comes from the unlink itself
+    rather than from a preceding existence check.
     """
-    path = model_override_read_path()
-    try:
-        _retry_on_contention(path.unlink, _UNLINK_RETRY_BUDGET_SECONDS)
-        return "removed"
-    except FileNotFoundError:
-        return "absent"
-    except Exception as exc:
-        logger.warning("Cannot remove the model override: %s", scrub_text(str(exc)))
+    with mutation_lock():
+        path = model_override_read_path()
         try:
-            return "failed" if path.exists() else "removed"
-        except OSError:
-            return "failed"
+            _retry_on_contention(path.unlink, _UNLINK_RETRY_BUDGET_SECONDS)
+            return "removed"
+        except FileNotFoundError:
+            return "absent"
+        except Exception as exc:
+            logger.warning("Cannot remove the model override: %s", scrub_text(str(exc)))
+            try:
+                return "failed" if path.exists() else "removed"
+            except OSError:
+                return "failed"
 
 
 # ── legacy journal directory migration ─────────────────────────────────────
@@ -302,113 +313,263 @@ _MIGRATION_FILES = [
 _MIGRATION_DIRS = [_BACKUPS_DIR_NAME]
 
 
+def migration_status() -> Dict[str, Any]:
+    """Return the last process-local migration decision for status reporting."""
+    return sanitize(dict(_MIGRATION_STATUS))
+
+
+def _set_migration_status(
+    outcome: str,
+    *,
+    source: Path,
+    destination: Path,
+    active_dir: Path,
+    rename_warning: str = "",
+    error: str = "",
+) -> str:
+    _MIGRATION_STATUS.update({
+        "outcome": outcome,
+        "source": scrub_text(str(source)),
+        "destination": scrub_text(str(destination)),
+        "active_dir": scrub_text(str(active_dir)),
+        "rename_warning": scrub_text(rename_warning),
+        "error": scrub_text(error),
+    })
+    return outcome
+
+
+def _mutation_lock_path(directory: Path) -> Path:
+    """Return a stable sibling lock path that survives directory renames."""
+    directory.parent.mkdir(parents=True, exist_ok=True)
+    return directory.parent / f".{directory.name}{_LOCK_FILE_NAME}"
+
+
+@contextmanager
+def _migration_lock(source: Path, timeout: float = 30.0) -> Iterator[None]:
+    """Serialize migration with writers still using the legacy store."""
+    lock_path = _mutation_lock_path(source)
+    token = uuid.uuid4().hex
+    payload = json.dumps({"pid": os.getpid(), "created": time.time(), "token": token})
+    deadline = time.monotonic() + timeout
+    with _THREAD_LOCK:
+        _clear_owned_orphan(lock_path)
+        while True:
+            try:
+                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                try:
+                    os.write(fd, payload.encode("utf-8"))
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                break
+            except FileExistsError:
+                _try_clear_stale_lock(lock_path)
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"Timed out waiting for refine migration lock: {lock_path}"
+                    )
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            try:
+                current = json.loads(lock_path.read_text(encoding="utf-8"))
+                if current.get("token") == token:
+                    _retry_on_contention(
+                        lock_path.unlink, _UNLINK_RETRY_BUDGET_SECONDS, OSError
+                    )
+            except FileNotFoundError:
+                pass
+            except Exception as exc:
+                _ORPHANED_LOCK_TOKENS[str(lock_path)] = token
+                logger.error(
+                    "Could not release refine migration lock: %s",
+                    scrub_text(str(exc)),
+                )
+
+
 def migrate_legacy_journal_dir(
     *,
     _new_dir: "Optional[Path]" = None,
     _legacy_dir: "Optional[Path]" = None,
 ) -> str:
-    """One-time, idempotent migration of runtime data to the new default location.
+    """Migrate legacy runtime data as one recoverable store generation.
 
-    Returns one of:
-      user_configured — the user explicitly set journal_dir, so we do nothing.
-      not_needed      — nothing to migrate (new install or already migrated).
-      migrated        — files copied, old dir renamed.
-      failed          — something went wrong; refine continues from wherever data
-                        actually exists.
-
-    Never deletes data. The old directory is renamed, not removed.
-    Must be called under the mutation lock (taken internally) so two processes
-    cannot race and double-copy.
+    Data is copied to a sibling staging directory first. Publication is marked
+    incomplete until every artifact is in place, so another process can safely
+    retry after interruption. Any failure keeps the intact legacy directory as
+    the active store for this process; a partial destination is never read.
     """
     try:
         from . import config as _cfg
     except ImportError:
         import config as _cfg  # type: ignore
 
-    # If the user set journal_dir explicitly, their choice takes priority.
     entry = _cfg._get_refine_entry()
-    if entry.get("journal_dir"):
-        return "user_configured"
-
-    new_dir = _new_dir if _new_dir is not None else _cfg.journal_dir()
-    legacy = _legacy_dir if _legacy_dir is not None else _cfg.legacy_journal_dir()
-
-    # If the legacy dir doesn't exist or has no runtime files, nothing to move.
-    if not legacy.is_dir():
-        return "not_needed"
-
-    has_data = any(
-        (legacy / name).exists()
-        for name in _MIGRATION_FILES + _MIGRATION_DIRS
+    configured = entry.get("journal_dir")
+    new_dir = Path(_new_dir if _new_dir is not None else _cfg.hermes_home() / "refine")
+    legacy = Path(
+        _legacy_dir if _legacy_dir is not None else _cfg.legacy_journal_dir()
     )
-    if not has_data:
-        return "not_needed"
+    if isinstance(configured, str) and configured.strip():
+        active = Path(configured)
+        _cfg._set_runtime_journal_dir(None)
+        return _set_migration_status(
+            "user_configured",
+            source=legacy,
+            destination=new_dir,
+            active_dir=active,
+        )
 
-    # If the new dir already has a journal, the migration already happened or
-    # someone manually moved things. Don't overwrite.
-    if (new_dir / _JOURNAL_FILE_NAME).is_file():
-        return "not_needed"
+    marker = new_dir / _MIGRATION_MARKER
+    incomplete = new_dir / _MIGRATION_INCOMPLETE
 
-    # If the marker says we already renamed, don't do it again.
-    if (new_dir / _MIGRATION_MARKER).is_file():
-        return "not_needed"
+    def _legacy_has_data() -> bool:
+        return legacy.is_dir() and any(
+            (legacy / name).exists()
+            for name in _MIGRATION_FILES + _MIGRATION_DIRS
+        )
 
-    with _THREAD_LOCK:
-        # Re-check after lock acquisition — another thread may have migrated.
-        if (new_dir / _JOURNAL_FILE_NAME).is_file():
-            return "not_needed"
-        if (new_dir / _MIGRATION_MARKER).is_file():
-            return "not_needed"
+    def _destination_has_data() -> bool:
+        return new_dir.is_dir() and any(
+            (new_dir / name).exists()
+            for name in _MIGRATION_FILES + _MIGRATION_DIRS
+        )
 
-        import shutil as _shutil
+    if marker.is_file():
+        _cfg._set_runtime_journal_dir(None)
+        return _set_migration_status(
+            "not_needed", source=legacy, destination=new_dir, active_dir=new_dir
+        )
+    if not _legacy_has_data():
+        active = legacy if incomplete.is_file() and legacy.is_dir() else new_dir
+        _cfg._set_runtime_journal_dir(
+            active if active == legacy else None,
+            commit_marker=marker if active == legacy else None,
+        )
+        outcome = "failed" if incomplete.is_file() else "not_needed"
+        return _set_migration_status(
+            outcome,
+            source=legacy,
+            destination=new_dir,
+            active_dir=active,
+            error=(
+                "An incomplete destination exists but the legacy source is unavailable."
+                if outcome == "failed"
+                else ""
+            ),
+        )
 
-        try:
-            new_dir.mkdir(parents=True, exist_ok=True)
+    import shutil as _shutil
 
-            # Copy files.
-            for name in _MIGRATION_FILES:
-                src = legacy / name
-                if src.is_file():
-                    _shutil.copy2(str(src), str(new_dir / name))
+    try:
+        with _migration_lock(legacy):
+            if marker.is_file():
+                _cfg._set_runtime_journal_dir(None)
+                return _set_migration_status(
+                    "not_needed",
+                    source=legacy,
+                    destination=new_dir,
+                    active_dir=new_dir,
+                )
+            if not _legacy_has_data():
+                _cfg._set_runtime_journal_dir(None)
+                return _set_migration_status(
+                    "not_needed",
+                    source=legacy,
+                    destination=new_dir,
+                    active_dir=new_dir,
+                )
+            if _destination_has_data() and not incomplete.is_file():
+                _cfg._set_runtime_journal_dir(None)
+                return _set_migration_status(
+                    "not_needed",
+                    source=legacy,
+                    destination=new_dir,
+                    active_dir=new_dir,
+                )
 
-            # Copy backup directory.
-            src_backups = legacy / _BACKUPS_DIR_NAME
-            if src_backups.is_dir():
-                dst_backups = new_dir / _BACKUPS_DIR_NAME
-                dst_backups.mkdir(exist_ok=True)
-                for item in src_backups.iterdir():
-                    if item.is_file():
-                        _shutil.copy2(str(item), str(dst_backups / item.name))
+            stage = Path(tempfile.mkdtemp(
+                prefix=f".{new_dir.name}.migrate-", dir=str(new_dir.parent)
+            ))
+            try:
+                for name in _MIGRATION_FILES:
+                    src = legacy / name
+                    if src.is_file():
+                        _shutil.copy2(str(src), str(stage / name))
+                src_backups = legacy / _BACKUPS_DIR_NAME
+                if src_backups.is_dir():
+                    dst_backups = stage / _BACKUPS_DIR_NAME
+                    dst_backups.mkdir()
+                    for item in src_backups.iterdir():
+                        if item.is_file():
+                            _shutil.copy2(str(item), str(dst_backups / item.name))
 
-            # Write marker with the source path and timestamp.
-            marker = new_dir / _MIGRATION_MARKER
-            marker.write_text(
-                json.dumps({
-                    "from": str(legacy),
-                    "ts": time.time(),
-                }),
-                encoding="utf-8",
-            )
+                # Force staged bytes before exposing any of them as active data.
+                for staged_file in stage.rglob("*"):
+                    if staged_file.is_file():
+                        with staged_file.open("rb+") as handle:
+                            os.fsync(handle.fileno())
 
-            # Rename (not delete) the old directory.
+                new_dir.mkdir(parents=True, exist_ok=True)
+                _atomic_write_text(
+                    incomplete,
+                    json.dumps({"from": str(legacy), "ts": time.time()}),
+                )
+                for name in _MIGRATION_FILES:
+                    staged = stage / name
+                    if staged.is_file():
+                        os.replace(str(staged), str(new_dir / name))
+                staged_backups = stage / _BACKUPS_DIR_NAME
+                if staged_backups.is_dir():
+                    destination_backups = new_dir / _BACKUPS_DIR_NAME
+                    destination_backups.mkdir(exist_ok=True)
+                    for item in staged_backups.iterdir():
+                        if item.is_file():
+                            os.replace(str(item), str(destination_backups / item.name))
+
+                _atomic_write_text(
+                    marker,
+                    json.dumps({"from": str(legacy), "ts": time.time()}),
+                )
+                incomplete.unlink(missing_ok=True)
+            finally:
+                _shutil.rmtree(stage, ignore_errors=True)
+
+            _cfg._set_runtime_journal_dir(None)
+            rename_warning = ""
             ts_suffix = time.strftime("%Y%m%d-%H%M%S")
             renamed = legacy.parent / f"refine.migrated-{ts_suffix}"
             try:
-                legacy.rename(renamed)
-            except OSError as exc:
-                # Rename failed — not fatal. The data is already in the new
-                # location and the marker prevents re-migration.
-                logger.warning(
-                    "Legacy journal dir could not be renamed: %s",
-                    scrub_text(str(exc)),
+                _retry_on_contention(
+                    lambda: legacy.rename(renamed),
+                    _WRITE_RETRY_BUDGET_SECONDS,
+                    OSError,
                 )
-
-            return "migrated"
-        except Exception as exc:
-            logger.warning(
-                "Journal directory migration failed: %s", scrub_text(str(exc))
+            except OSError as exc:
+                rename_warning = scrub_text(str(exc))
+                logger.warning(
+                    "Legacy journal dir could not be renamed: %s", rename_warning
+                )
+            return _set_migration_status(
+                "migrated",
+                source=legacy,
+                destination=new_dir,
+                active_dir=new_dir,
+                rename_warning=rename_warning,
             )
-            return "failed"
+    except Exception as exc:
+        safe_error = scrub_text(str(exc))
+        logger.warning("Journal directory migration failed: %s", safe_error)
+        # Legacy was never deleted and is the only complete generation.
+        _cfg._set_runtime_journal_dir(legacy, commit_marker=marker)
+        return _set_migration_status(
+            "failed",
+            source=legacy,
+            destination=new_dir,
+            active_dir=legacy,
+            error=safe_error,
+        )
 
 
 def normalize_prompt_note_session_id(session_id: Any) -> str:
@@ -590,6 +751,25 @@ def clear_session_prompt_notes(
 def _pid_is_alive(pid: int) -> bool:
     if pid <= 0:
         return False
+    if os.name == "nt":
+        # ``os.kill(pid, 0)`` is a POSIX existence probe but is not guaranteed
+        # to be signal-free on Windows. Query a process handle instead.
+        try:
+            import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            handle = kernel32.OpenProcess(0x1000, False, pid)  # query limited info
+            if not handle:
+                return ctypes.get_last_error() == 5  # access denied still means alive
+            try:
+                exit_code = ctypes.c_ulong()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    return True  # fail closed: do not clear a lock on uncertainty
+                return exit_code.value == 259  # STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return True
     try:
         os.kill(pid, 0)
         return True
@@ -655,51 +835,77 @@ def _acquire_mutation_lock(*, wait: bool, timeout: float = 0.0) -> Iterator[bool
                 _LOCK_STATE.depth -= 1
             return
 
-        lock_path = ensure_dirs() / _LOCK_FILE_NAME
         token = uuid.uuid4().hex
         payload = json.dumps({"pid": os.getpid(), "created": time.time(), "token": token})
-        while True:
+
+        def _release_owned_lock(path: Path) -> None:
             try:
-                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                current = json.loads(path.read_text(encoding="utf-8"))
+                if current.get("token") == token:
+                    _retry_on_contention(
+                        path.unlink, _UNLINK_RETRY_BUDGET_SECONDS, OSError
+                    )
+            except FileNotFoundError:
+                pass
+            except Exception as exc:
+                _ORPHANED_LOCK_TOKENS[str(path)] = token
+                logger.error(
+                    "Could not release refine mutation lock (will retry on next acquisition): %s",
+                    scrub_text(str(exc)),
+                )
+
+        # A failed migrator can switch from legacy to the committed destination
+        # while it waits. Re-check the active generation after acquiring the
+        # stable sibling lock and retry there before yielding to a writer.
+        while True:
+            locked_directory = ensure_dirs()
+            lock_path = _mutation_lock_path(locked_directory)
+            _clear_owned_orphan(lock_path)
+            while True:
                 try:
-                    os.write(fd, payload.encode("utf-8"))
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-                break
-            except FileExistsError:
-                _try_clear_stale_lock(lock_path)
-                if not wait:
-                    try:
-                        fd = os.open(
-                            str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
-                        )
-                    except FileExistsError:
-                        yield False
-                        return
+                    fd = os.open(
+                        str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+                    )
                     try:
                         os.write(fd, payload.encode("utf-8"))
                         os.fsync(fd)
                     finally:
                         os.close(fd)
                     break
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(f"Timed out waiting for refine mutation lock: {lock_path}")
-                time.sleep(0.05)
+                except FileExistsError:
+                    _try_clear_stale_lock(lock_path)
+                    if not wait:
+                        try:
+                            fd = os.open(
+                                str(lock_path),
+                                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                                0o600,
+                            )
+                        except FileExistsError:
+                            yield False
+                            return
+                        try:
+                            os.write(fd, payload.encode("utf-8"))
+                            os.fsync(fd)
+                        finally:
+                            os.close(fd)
+                        break
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"Timed out waiting for refine mutation lock: {lock_path}"
+                        )
+                    time.sleep(0.05)
+
+            if ensure_dirs() == locked_directory:
+                break
+            _release_owned_lock(lock_path)
 
         _LOCK_STATE.depth = 1
         try:
             yield True
         finally:
             _LOCK_STATE.depth = 0
-            try:
-                current = json.loads(lock_path.read_text(encoding="utf-8"))
-                if current.get("token") == token:
-                    lock_path.unlink()
-            except FileNotFoundError:
-                pass
-            except Exception as exc:
-                logger.warning("Could not release refine mutation lock: %s", scrub_text(str(exc)))
+            _release_owned_lock(lock_path)
     finally:
         _THREAD_LOCK.release()
 
@@ -761,6 +967,31 @@ def _retry_on_contention(operation, budget: float, errors=PermissionError):
             delay *= 2
 
 
+def _clear_owned_orphan(path: Path) -> None:
+    """Retry removal only for a lock token this process failed to release."""
+    key = str(path)
+    token = _ORPHANED_LOCK_TOKENS.get(key)
+    if not token:
+        return
+    try:
+        current = json.loads(
+            _retry_on_contention(
+                lambda: path.read_text(encoding="utf-8"),
+                _READ_RETRY_BUDGET_SECONDS,
+                OSError,
+            )
+        )
+        if current.get("token") != token:
+            _ORPHANED_LOCK_TOKENS.pop(key, None)
+            return
+        _retry_on_contention(path.unlink, _UNLINK_RETRY_BUDGET_SECONDS, OSError)
+        _ORPHANED_LOCK_TOKENS.pop(key, None)
+    except FileNotFoundError:
+        _ORPHANED_LOCK_TOKENS.pop(key, None)
+    except Exception as exc:
+        logger.error("Could not recover owned refine lock: %s", scrub_text(str(exc)))
+
+
 def _replace_with_retry(temp_name: str, path: Path) -> None:
     """Atomically replace the target, tolerating a concurrent reader on Windows.
 
@@ -793,14 +1024,13 @@ def _atomic_write_text(path: Path, content: str) -> None:
         raise
 
 
-def _load_entries() -> List[Dict[str, Any]]:
-    """Stream journal state, skipping corrupt lines and collapsing updates by id."""
+def _load_entries_state() -> "tuple[List[Dict[str, Any]], str]":
+    """Return collapsed entries plus ``ok``, ``absent``, or ``unreadable``."""
     path = journal_read_path()
-    if not path.is_file():
-        return []
     latest: Dict[str, Dict[str, Any]] = {}
     order: List[str] = []
-    try:
+
+    def _read():
         with path.open("r", encoding="utf-8", errors="replace") as handle:
             for line in handle:
                 if not line.strip():
@@ -810,16 +1040,48 @@ def _load_entries() -> List[Dict[str, Any]]:
                 except json.JSONDecodeError:
                     logger.warning("Skipping corrupt journal line")
                     continue
-                entry_id = str(entry.get("id", ""))
-                if not entry_id:
-                    continue
+                if not isinstance(entry, dict):
+                    raise ValueError("journal record must be an object")
+                entry_id = entry.get("id")
+                if not isinstance(entry_id, str) or not entry_id.strip():
+                    raise ValueError("journal record id must be a non-empty string")
+                timestamp = entry.get("ts")
+                if (
+                    not isinstance(timestamp, (int, float))
+                    or isinstance(timestamp, bool)
+                    or not math.isfinite(float(timestamp))
+                ):
+                    raise ValueError("journal record timestamp must be finite numeric data")
+                if not isinstance(entry.get("outcome"), str) or not entry["outcome"]:
+                    raise ValueError("journal record outcome must be a non-empty string")
+                if not isinstance(entry.get("proposal"), dict):
+                    raise ValueError("journal record proposal must be an object")
                 if entry_id not in latest:
                     order.append(entry_id)
                 latest[entry_id] = entry
+
+    try:
+        _retry_on_contention(_read, _READ_RETRY_BUDGET_SECONDS)
+    except FileNotFoundError:
+        return [], "absent"
     except Exception as exc:
-        logger.warning("Failed to read journal: %s", scrub_text(str(exc)))
-        return []
-    return [latest[entry_id] for entry_id in order]
+        logger.error("Failed to read journal: %s", scrub_text(str(exc)))
+        return [], "unreadable"
+    return [latest[entry_id] for entry_id in order], "ok"
+
+
+def _load_entries() -> List[Dict[str, Any]]:
+    """Return journal entries, raising when the store is present but unreadable."""
+    entries_value, state = _load_entries_state()
+    if state == "unreadable":
+        raise IOError("Journal unreadable")
+    return entries_value
+
+
+def _load_entries_safe() -> "tuple[List[Dict[str, Any]], str]":
+    """Compatibility alias for callers that need the explicit read state."""
+    return _load_entries_state()
+
 
 
 def entries() -> List[Dict[str, Any]]:
@@ -1039,13 +1301,21 @@ def is_reversible(entry: Optional[Dict[str, Any]]) -> bool:
 
 
 def count_today_applied() -> int:
-    """Count today's edits that are applied, reserved, or rollback-in-flight."""
+    """Count today's edits that are applied, reserved, or rollback-in-flight.
+
+    Returns max_edits_per_day() when the journal is unreadable, so the budget
+    gate stays closed rather than silently allowing unlimited edits.
+    """
     today = datetime.now(timezone.utc).date()
     consumed = {
         "applied", "pending_approval", "prepared", "rollback_prepared", "pending_rollback"
     }
+    try:
+        all_entries = _load_entries()
+    except IOError:
+        return max_edits_per_day()
     count = 0
-    for entry in _load_entries():
+    for entry in all_entries:
         if entry.get("outcome") not in consumed:
             continue
         try:
@@ -1060,6 +1330,25 @@ def daily_limit_reached() -> bool:
     return count_today_applied() >= max_edits_per_day()
 
 
+def was_applied_recently(proposal: Dict[str, Any], within_days: int) -> bool:
+    """Return True when an identical edit exists or journal is unreadable (fail closed)."""
+    target = proposal_hash(proposal)
+    cutoff = time.time() - (within_days * 86400)
+    consumed = {
+        "applied", "pending_approval", "prepared", "rollback_prepared", "pending_rollback"
+    }
+    try:
+        all_entries = _load_entries()
+    except IOError:
+        return True
+    for entry in all_entries:
+        if entry.get("outcome") not in consumed:
+            continue
+        if (entry.get("ts") or 0) >= cutoff and proposal_hash(entry.get("proposal", {})) == target:
+            return True
+    return False
+
+
 def proposal_hash(proposal: Dict[str, Any]) -> str:
     key = "|".join([
         str(proposal.get("kind", "")),
@@ -1068,19 +1357,6 @@ def proposal_hash(proposal: Dict[str, Any]) -> str:
     ])
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
 
-
-def was_applied_recently(proposal: Dict[str, Any], within_days: int) -> bool:
-    target = proposal_hash(proposal)
-    cutoff = time.time() - (within_days * 86400)
-    consumed = {
-        "applied", "pending_approval", "prepared", "rollback_prepared", "pending_rollback"
-    }
-    for entry in _load_entries():
-        if entry.get("outcome") not in consumed:
-            continue
-        if (entry.get("ts") or 0) >= cutoff and proposal_hash(entry.get("proposal", {})) == target:
-            return True
-    return False
 
 
 # ── recovery metadata and target-state proof ───────────────────────────────
@@ -1213,6 +1489,13 @@ def snapshot_before_content(entry: Dict[str, Any]) -> Optional[str]:
             scrub_text(str(snapshot.get("name", ""))),
         )
     backup_path = Path(str(entry.get("backup_path", "")))
+    if not backup_path.is_file() and backup_path.name:
+        # Pre-snapshot journal entries store an absolute legacy path. Migration
+        # copies backups without rewriting append-only history, so resolve the
+        # same basename in the active generation before declaring it lost.
+        migrated_backup = journal_dir() / _BACKUPS_DIR_NAME / backup_path.name
+        if migrated_backup.is_file():
+            backup_path = migrated_backup
     if not backup_path.is_file():
         return None
     try:
@@ -1364,6 +1647,10 @@ def reconcile() -> List[Dict[str, Any]]:
     for snapshot in _load_entries():
         entry_id = str(snapshot.get("id", ""))
         outcome = snapshot.get("outcome")
+        if outcome not in {
+            "prepared", "pending_approval", "rollback_prepared", "pending_rollback"
+        }:
+            continue
         proposal = snapshot.get("proposal", {})
         subsystem = "skills" if proposal.get("kind") == "skill" else "memory"
         try:
@@ -1508,6 +1795,12 @@ def rollback_skill(entry_id: str) -> Dict[str, Any]:
 
 
 def rollback_memory(entry_id: str) -> Dict[str, Any]:
+    """Rollback one exact append while holding the shared mutation lock."""
+    with mutation_lock():
+        return _rollback_memory_locked(entry_id)
+
+
+def _rollback_memory_locked(entry_id: str) -> Dict[str, Any]:
     entry = get_entry(entry_id)
     if not is_reversible(entry):
         return {"success": False, "error": f"Journal entry {entry_id} is not a reversible memory edit"}
