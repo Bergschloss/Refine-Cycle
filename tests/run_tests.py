@@ -1092,6 +1092,30 @@ class RefineTests(unittest.TestCase):
         self.assertIn("=== PREVIOUS UNUSED SKILLS ===", prompt)
         self.assertIn("old-unused-skill", prompt)
 
+    def test_multi_edit_history_renders_kind_and_summary(self):
+        """Wave 2.13: multi-edit entries in history show 'multi' and their summary."""
+        records = [{
+            "outcome": "applied",
+            "reason": "Fix credential handling",
+            "proposal": {
+                "action": "multi",
+                "kind": "",
+                "name": "",
+                "summary": "Created git-fix and memory entry",
+                "expected_outcome": "No more auth failures",
+                "edits": [
+                    {"action": "create", "kind": "skill", "name": "git-fix"},
+                    {"action": "create", "kind": "memory", "name": "auth-note"},
+                ],
+            },
+        }]
+        rendered = llm._render_refinement_history(records, max_entries=5, max_chars=240)
+        self.assertIn("multi", rendered)
+        self.assertIn("Created git-fix and memory entry", rendered)
+        # The old rendering showed kind="" name="" as two consecutive dashes
+        # separated only by whitespace. The new rendering uses "multi" and summary.
+        self.assertNotIn("multi  \u2014", rendered)
+
     def test_empty_refinement_history_omits_its_prompt_block(self):
         self.assertEqual(journal.recent_refinements(20), [])
         model = MockLlm({"action": "no_op", "reason": "none"})

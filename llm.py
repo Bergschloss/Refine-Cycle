@@ -621,8 +621,6 @@ def _render_refinement_history(
         if not isinstance(proposal, dict):
             continue
         outcome = _overview_text(record.get("outcome", "")) or "unknown"
-        kind = _overview_text(proposal.get("kind", "")) or "—"
-        name = _overview_text(proposal.get("name", "")) or "—"
         reason = _overview_text(record.get("reason", "")) or _overview_text(
             proposal.get("reason", "")
         ) or "—"
@@ -632,6 +630,19 @@ def _render_refinement_history(
         except (TypeError, ValueError):
             version = 0
         version_text = f"v{version}" if version >= 1 else "—"
+
+        # Multi-edit transactions carry kind/name per sub-edit; use summary.
+        action = proposal.get("action", "")
+        edits = proposal.get("edits")
+        if action == "multi" or (isinstance(edits, list) and edits):
+            kind = "multi"
+            summary = _overview_text(proposal.get("summary", ""))
+            edit_count = len(edits) if isinstance(edits, list) else 0
+            name = summary or f"{edit_count} edits"
+        else:
+            kind = _overview_text(proposal.get("kind", "")) or "—"
+            name = _overview_text(proposal.get("name", "")) or "—"
+
         line = (
             f"{outcome:<10} — expects: {expected} — {kind:<6} {name} "
             f"{version_text} — reason: {reason}"
