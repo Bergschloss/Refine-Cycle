@@ -5,10 +5,11 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from agent.plugin_llm import PluginLlm
 
@@ -20,6 +21,64 @@ except ImportError:
     from sanitization import sanitize, scrub_text  # noqa: F811
 
 logger = logging.getLogger(__name__)
+
+# ── session identity ───────────────────────────────────────────────────────
+# The host does not pass session_id to slash-command handlers (contract is
+# fn(raw_args) -> str|None). But pre_llm_call and post_llm_call hooks do
+# receive it every turn. This module remembers the last value seen, so that a
+# manual /refine command running in the same process can resolve it.
+
+_LAST_SESSION_ID = ""
+_LAST_SESSION_LOCK = threading.Lock()
+
+
+def note_session_id(session_id: str) -> None:
+    """Record the session id seen from a host hook. Thread-safe, one value."""
+    global _LAST_SESSION_ID
+    if not isinstance(session_id, str) or not session_id.strip():
+        return
+    clean = session_id.strip()
+    # Reject anything that scrubbing would alter — it might be content, not an id.
+    if scrub_text(clean) != clean or len(clean) > 128:
+        return
+    with _LAST_SESSION_LOCK:
+        _LAST_SESSION_ID = clean
+
+
+def _noted_session_id() -> str:
+    with _LAST_SESSION_LOCK:
+        return _LAST_SESSION_ID
+
+
+def host_session_id() -> str:
+    """Best-effort read of the host's current session id via ContextVar/env.
+
+    Available in CLI and cron; returns "" in the gateway (which sets session_key,
+    not session_id, into the context). Guarded: any failure → "".
+    """
+    try:
+        from gateway.session_context import get_session_env
+        value = get_session_env("HERMES_SESSION_ID", "")
+        return value.strip() if isinstance(value, str) else ""
+    except Exception:
+        return ""
+
+
+def resolve_session_id(explicit: str = "") -> Tuple[str, str]:
+    """Resolve which session to analyse.
+
+    Returns (session_id, how) where how ∈ {explicit, host_env, hook, unknown}.
+    When unknown, the caller must refuse rather than guess.
+    """
+    if explicit and explicit.strip():
+        return explicit.strip(), "explicit"
+    env_id = host_session_id()
+    if env_id:
+        return env_id, "host_env"
+    hook_id = _noted_session_id()
+    if hook_id:
+        return hook_id, "hook"
+    return "", "unknown"
 
 
 def scrub_proposal(proposal: Dict[str, Any]) -> Dict[str, Any]:
@@ -40,16 +99,6 @@ def _open_db() -> Optional[sqlite3.Connection]:
         return connection
     except Exception as exc:
         logger.warning("Cannot open state.db: %s", exc)
-        return None
-
-
-def _get_recent_session_id(connection: sqlite3.Connection) -> Optional[str]:
-    try:
-        row = connection.execute(
-            "SELECT id FROM sessions ORDER BY started_at DESC LIMIT 1"
-        ).fetchone()
-        return row["id"] if row else None
-    except Exception:
         return None
 
 
@@ -127,7 +176,6 @@ def _is_correction(content: str) -> bool:
 
 
 def collect_evidence(session_id: Optional[str] = None, limit: int = 60) -> Dict[str, Any]:
-    connection = _open_db()
     empty = {
         "messages": [],
         "error_count": 0,
@@ -135,17 +183,22 @@ def collect_evidence(session_id: Optional[str] = None, limit: int = 60) -> Dict[
         "error_patterns": [],
         "user_corrections": [],
         "session_id": "",
+        "session_id_source": "unknown",
     }
+    resolved, how = resolve_session_id(session_id or "")
+    if not resolved:
+        empty["session_id_source"] = how
+        return empty
+    connection = _open_db()
     if not connection:
+        empty["session_id"] = resolved
+        empty["session_id_source"] = how
         return empty
     try:
-        session_id = session_id or _get_recent_session_id(connection)
-        if not session_id:
-            return empty
         rows = connection.execute(
             "SELECT role, content, tool_name, timestamp FROM messages "
             "WHERE session_id = ? AND active = 1 ORDER BY timestamp DESC LIMIT ?",
-            (session_id, limit),
+            (resolved, limit),
         ).fetchall()
         messages: List[Dict[str, Any]] = []
         tool_errors: List[Dict[str, Any]] = []
@@ -178,7 +231,8 @@ def collect_evidence(session_id: Optional[str] = None, limit: int = 60) -> Dict[
             "tool_errors": tool_errors[-10:],
             "error_patterns": patterns.extract_patterns(error_items),
             "user_corrections": corrections[-5:],
-            "session_id": session_id,
+            "session_id": resolved,
+            "session_id_source": how,
         }
     finally:
         connection.close()
@@ -564,6 +618,32 @@ def refine_status() -> Dict[str, Any]:
                 ),
             })
 
+    # Session identity — what /refine would analyse if triggered now.
+    sid, sid_source = resolve_session_id()
+    session_message_count = 0
+    if sid:
+        try:
+            conn = _open_db()
+            if conn:
+                try:
+                    row = conn.execute(
+                        "SELECT COUNT(*) n FROM messages WHERE session_id=? AND active=1",
+                        (sid,),
+                    ).fetchone()
+                    session_message_count = row["n"] if row else 0
+                finally:
+                    conn.close()
+        except Exception:
+            pass
+    if sid_source == "unknown":
+        blockers.append({
+            "code": "session_unknown",
+            "message": (
+                "Cannot identify the current session. Neither the host environment "
+                "nor a recent hook provided a session id."
+            ),
+        })
+
     return {
         "config_readable": config_readable,
         "auto_enabled": auto,
@@ -577,12 +657,13 @@ def refine_status() -> Dict[str, Any]:
         "max_edits_per_day": max_edits,
         "journal_present": journal_present,
         "journal_readable": journal_readable,
-        # The real path, because the report tells the user to move files in and
-        # out of it. Truncating it to a tilde made it unusable in a shell.
         "journal_dir": str(jdir),
         "journal_dir_state": jdir_state,
         "journal_dir_state_text": _JOURNAL_DIR_STATE_TEXT.get(jdir_state, jdir_state),
         "journal_dir_is_plugin_source": plugin_source_collision,
+        "session_id": sid,
+        "session_id_source": sid_source,
+        "session_message_count": session_message_count,
         "llm_model": target["model"],
         "llm_provider": target["provider"],
         "llm_target_source": target["source"],
@@ -857,6 +938,15 @@ def _refine_once(
         evidence_limit = max(evidence_limit, config.reviewer_min_messages())
     evidence = collect_evidence(session_id=session_id, limit=evidence_limit)
     session = evidence.get("session_id", "")
+    session_source = evidence.get("session_id_source", "unknown")
+    if not session and session_source == "unknown":
+        return {
+            "success": False,
+            "outcome": "session_unknown",
+            "message": "Cannot identify the current session; refine did not run.",
+            "evidence": evidence,
+            "reversible": False,
+        }
     if len(evidence.get("messages", [])) < 3:
         return {
             "success": True,

@@ -173,6 +173,9 @@ def _start_auto_refine(session_id: str, assistant_turns: int) -> None:
 def _on_pre_llm_call(**kwargs) -> Optional[dict]:
     """Inject bounded plugin-owned notes without reading or changing the base prompt."""
     try:
+        # Record the session id before anything else — this must not be lost
+        # because a later error in prompt-note loading skips the rest.
+        core.note_session_id(kwargs.get("session_id", ""))
         if not config.prompt_notes_enabled():
             return None
         session_id = journal.normalize_prompt_note_session_id(kwargs.get("session_id", ""))
@@ -235,6 +238,7 @@ def _on_session_reset(session_id: str = "", **kwargs) -> None:
 def _on_post_llm_call(
     session_id: str = "", conversation_history: Any = None, **kwargs
 ) -> None:
+    core.note_session_id(session_id)
     _start_auto_refine(session_id, _assistant_turn_count(conversation_history))
 
 
@@ -358,6 +362,9 @@ def _handle_refine_command(raw_args: str) -> Optional[str]:
             f"min messages: {status['auto_min_messages']}",
             f"cooldown: {status['auto_cooldown_minutes']} min",
             f"edits today: {status['edits_today']}/{status['max_edits_per_day']}",
+            f"session: {status['session_id'] or '(unknown)'}"
+            + f" (source: {status['session_id_source']}"
+            + f", messages: {status['session_message_count']})",
             f"model: {status['llm_model'] or '(host default)'}"
             + (f" @ {status['llm_provider']}" if status["llm_provider"] else "")
             + f" (source: {status['llm_target_source']})",
@@ -473,6 +480,7 @@ def _on_session_end(
     **kwargs,
 ) -> None:
     """Run the session-end fallback without blocking or dropping it behind a turn run."""
+    core.note_session_id(session_id)
     _forget_turn_marks(session_id)
     if not config.auto_enabled() or interrupted:
         _clear_session_prompt_notes(session_id, timeout=_HOST_PATH_LOCK_TIMEOUT)

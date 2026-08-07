@@ -386,6 +386,10 @@ class RefineTests(unittest.TestCase):
         # Both are process-lifetime globals: left set, they leak across tests.
         plugin_init._REGISTER_WARNED = False
         plugin_init._REGISTERED_LLM = None
+        # Session identity tracking — must not leak from one test to the next.
+        # Set to the default test session so existing tests that call refine_run
+        # without an explicit session_id find the FakeHost's "session" messages.
+        core._LAST_SESSION_ID = "session"
 
     def tearDown(self):
         self.temp.cleanup()
@@ -4134,6 +4138,162 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
         sentinel = object()
         with patch.object(plugin_init, "PluginLlm", return_value=sentinel):
             self.assertIs(plugin_init._session_llm(), sentinel)
+
+    # ── Session identity (Part A) ─────────────────────────────────────────────
+
+    def test_explicit_session_id_wins_over_hook_and_env(self):
+        core.note_session_id("from-hook")
+        with patch.object(core, "host_session_id", return_value="from-env"):
+            sid, how = core.resolve_session_id("explicit-id")
+        self.assertEqual(sid, "explicit-id")
+        self.assertEqual(how, "explicit")
+
+    def test_host_env_wins_over_hook(self):
+        core.note_session_id("from-hook")
+        with patch.object(core, "host_session_id", return_value="from-env"):
+            sid, how = core.resolve_session_id()
+        self.assertEqual(sid, "from-env")
+        self.assertEqual(how, "host_env")
+
+    def test_hook_used_when_host_env_is_empty(self):
+        core.note_session_id("from-hook")
+        with patch.object(core, "host_session_id", return_value=""):
+            sid, how = core.resolve_session_id()
+        self.assertEqual(sid, "from-hook")
+        self.assertEqual(how, "hook")
+
+    def test_unknown_when_no_sources_available(self):
+        core._LAST_SESSION_ID = ""
+        with patch.object(core, "host_session_id", return_value=""):
+            sid, how = core.resolve_session_id()
+        self.assertEqual(sid, "")
+        self.assertEqual(how, "unknown")
+
+    def test_unknown_session_refuses_without_spending_budget(self):
+        """When session_id cannot be determined, refine must not run."""
+        core._LAST_SESSION_ID = ""
+        with patch.object(core, "host_session_id", return_value=""):
+            model = MockLlm({
+                "action": "no_op", "reason": "nothing", "evidence": [],
+                "kind": "", "name": "", "content": "",
+            })
+            result = core.refine_run(model)
+        self.assertFalse(result["success"])
+        self.assertEqual(result["outcome"], "session_unknown")
+        self.assertIn("Cannot identify", result["message"])
+        # No budget consumed, no journal entry
+        self.assertEqual(journal.count_today_applied(), 0)
+        self.assertEqual(len(model.calls), 0)
+
+    def test_empty_hook_does_not_overwrite_existing_id(self):
+        core._LAST_SESSION_ID = ""
+        core.note_session_id("real-session")
+        core.note_session_id("")
+        core.note_session_id("   ")
+        self.assertEqual(core._noted_session_id(), "real-session")
+
+    def test_note_session_id_rejects_scrub_altering_values(self):
+        core._LAST_SESSION_ID = ""
+        core.note_session_id("ghp_" + "A" * 36)
+        self.assertEqual(core._noted_session_id(), "")
+
+    def test_gateway_like_env_uses_hook(self):
+        """In the gateway, get_session_env returns '' but hooks provide the id."""
+        core.note_session_id("gw-session-123")
+        with patch.object(core, "host_session_id", return_value=""):
+            sid, how = core.resolve_session_id()
+        self.assertEqual(sid, "gw-session-123")
+        self.assertEqual(how, "hook")
+
+    def test_status_reports_session_id_and_source(self):
+        core.note_session_id("test-session-id")
+        with patch.object(core, "host_session_id", return_value=""):
+            status = core.refine_status()
+        self.assertEqual(status["session_id"], "test-session-id")
+        self.assertEqual(status["session_id_source"], "hook")
+        self.assertIsInstance(status["session_message_count"], int)
+        text = plugin_init._handle_refine_command("status")
+        self.assertIn("test-session-id", text)
+        self.assertIn("hook", text)
+
+    def test_status_blocks_on_unknown_session(self):
+        core._LAST_SESSION_ID = ""
+        with patch.object(core, "host_session_id", return_value=""):
+            status = core.refine_status()
+        self.assertIn("session_unknown", status["blocker_codes"])
+        text = plugin_init._handle_refine_command("status")
+        self.assertIn("Cannot identify", text)
+
+    def test_note_session_id_two_threads_no_crash(self):
+        core._LAST_SESSION_ID = ""
+        errors = []
+
+        def writer(val):
+            try:
+                for _ in range(200):
+                    core.note_session_id(val)
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=writer, args=("session-a",)),
+            threading.Thread(target=writer, args=("session-b",)),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(5)
+        self.assertEqual(errors, [])
+        self.assertIn(core._noted_session_id(), {"session-a", "session-b"})
+
+    def test_regression_newest_by_started_at_with_1_message_is_refused(self):
+        """Reproduce the real bug: a ghost session newer by started_at has 1 msg."""
+        core._LAST_SESSION_ID = ""
+        now = time.time()
+        # Long-lived active session
+        messages = [
+            ("active-session", "user", "Hello", "", now - 100, 1),
+            ("active-session", "assistant", "Hi!", "", now - 99, 1),
+            ("active-session", "user", "Do X", "", now - 50, 1),
+            ("active-session", "tool", "Done X", "bash", now - 49, 1),
+        ] * 10  # 40 messages
+        # Ghost: newest by started_at, only 1 message
+        messages.append(("ghost-session", "user", "oops", "", now - 5, 1))
+        FakeHost.make_db(messages)
+        # Re-insert sessions with the right ordering
+        path = self.root / "state.db"
+        connection = sqlite3.connect(path)
+        connection.execute("DELETE FROM sessions")
+        connection.execute(
+            "INSERT INTO sessions VALUES ('active-session', ?)", (now - 200,)
+        )
+        connection.execute(
+            "INSERT INTO sessions VALUES ('ghost-session', ?)", (now - 2,)
+        )
+        connection.commit()
+        connection.close()
+        # Without explicit id and without hook → must refuse, not pick the ghost.
+        with patch.object(core, "host_session_id", return_value=""):
+            result = core.refine_run(MockLlm())
+        self.assertEqual(result["outcome"], "session_unknown")
+        self.assertIn("Cannot identify", result["message"])
+
+    def test_pre_llm_call_hook_notes_the_session_id(self):
+        plugin_init._on_pre_llm_call(session_id="hook-session-abc")
+        self.assertEqual(core._noted_session_id(), "hook-session-abc")
+
+    def test_post_llm_call_hook_notes_the_session_id(self):
+        plugin_init._on_post_llm_call(session_id="post-hook-sess", conversation_history=[])
+        self.assertEqual(core._noted_session_id(), "post-hook-sess")
+
+    def test_session_end_hook_notes_the_session_id(self):
+        # _on_session_end spawns a daemon thread; just verify that the session id
+        # is noted synchronously, before the thread starts.
+        core._LAST_SESSION_ID = ""
+        # Disable auto so the function returns early after noting the id.
+        FakeHost.entry_config()["auto_enabled"] = False
+        plugin_init._on_session_end(session_id="end-sess-xyz")
+        self.assertEqual(core._noted_session_id(), "end-sess-xyz")
 
 
 if __name__ == "__main__":
