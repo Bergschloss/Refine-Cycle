@@ -84,18 +84,14 @@ on Linux and macOS, and `%LOCALAPPDATA%\hermes\plugins\refine\` on Windows.
 Under a Hermes profile it follows that profile; the plugin resolves the location
 through `hermes_constants.get_hermes_home()`.
 
-> **Data safety — set `journal_dir` before you install.** The default
-> `journal_dir` resolves to the plugin install directory itself, so runtime data
-> (`refine_journal.jsonl`, `backups/`, `skill_stats.json`, `prompt_notes.json`)
-> lands in the directory `hermes plugins install --force` deletes. Point
-> `plugins.entries.refine.journal_dir` at a separate path, and move any existing
-> data there **before** a forced reinstall. `/refine status` and a startup log
-> line both warn while the collision exists.
->
-> The default is deliberately left alone rather than silently moved: changing it
-> would strand the journal, backups, and ledger of every existing install, and
-> rollback depends on those records. Point the setting at a new path and move the
-> files yourself, once.
+> **Runtime data location.** The default `journal_dir` is
+> `<HERMES_HOME>/refine`, separate from plugin source. On startup, an install
+> still using the former `<HERMES_HOME>/plugins/refine` default is migrated under
+> a cross-process lock: all artifacts are staged first, a completion marker is
+> published last, and the old directory is renamed rather than deleted. If any
+> copy or publication step fails, the intact legacy directory remains the active
+> store for that process and `/refine status` reports the fallback. An explicitly
+> configured non-empty `journal_dir` is never migrated automatically.
 
 1. Add to Hermes `config.yaml`:
 
@@ -158,6 +154,8 @@ toward the budget it reports.
 /refine focus on Gmail API failures
 /refine audit
 /refine status
+/refine dry-run
+/refine dry-run focus on Gmail API failures
 /refine model
 /refine model deepseek-v4-flash
 /refine model opencode-go/deepseek-v4
@@ -165,9 +163,12 @@ toward the budget it reports.
 /refine rollback 1f2a3b4c5d6e
 ```
 
-`audit`, `status`, `model`, and `rollback <12-character-id>` are exact
-subcommands. `status` reports whether automatic refinement is active, what
-blocks it, which model it will use, and whether the journal directory is safe.
+`audit`, `status`, `dry-run`, `model`, and `rollback <12-character-id>` are
+exact subcommands. `status` reports whether automatic refinement is active,
+which session and database source would be analyzed, configured source skips,
+what blocks refinement, which model it will use, and the active journal/migration
+state. `dry-run [reason]` runs the normal proposal path and journals the preview
+without applying an edit or consuming the daily edit budget.
 
 `model` shows or sets the model refine asks for. Bare `model` prints the
 effective target and whether host trust allows it; `model <name>` or
@@ -405,7 +406,7 @@ All keys live under `plugins.entries.refine`:
 | `max_edits_per_proposal` | int | `3` | Maximum inseparable edits one proposal may apply as a single transaction. `1` disables transactions. |
 | `max_edits_per_day` | int | `3` | Maximum applied, pending, or prepared **edits** per UTC day. This is the blast-radius limit and is re-checked before every edit. |
 | `only_agent_created` | bool | `true` | Only patch agent-created skills. |
-| `journal_dir` | path | `<HERMES_HOME>/plugins/refine` | Journal, lock, ledger, backups, prompt notes, and the `/refine model` override. |
+| `journal_dir` | path | `<HERMES_HOME>/refine` | Journal, lock, ledger, backups, prompt notes, and the `/refine model` override. An empty value uses this default. |
 | `overview_max_entries` | int | `40` | Existing skills and memory snippets listed per kind in a proposal prompt. |
 | `overview_max_chars` | int | `240` | Maximum characters in each structured overview or history line. |
 | `history_max_entries` | int | `20` | Recent create/patch outcomes fed back into a proposal prompt. |
@@ -419,6 +420,7 @@ All keys live under `plugins.entries.refine`:
 | `prompt_notes_max_chars` | int | `600` | Maximum characters in the complete injected note block. |
 | `prompt_notes_default_scope` | str | `global` | Scope for newly created prompt notes: `global` or `session`; invalid values fall back to `global`. |
 | `cross_session_enabled` | bool | `true` | Aggregate failures across recent sessions. |
+| `skip_session_sources` | list[str] | `["cron"]` | Skip matching session sources before any trajectory messages are read; each skip is journaled without consuming edit budget. |
 | `cross_session_days` | int | `7` | Interactive cross-session look-back window. |
 | `cross_session_max_sessions` | int | `25` | Interactive session scan cap. |
 | `dedup_window_days` | int | `7` | Refuse an edit identical to a recent applied, pending, or prepared edit. |
@@ -548,7 +550,7 @@ cd <HERMES_HOME>/plugins/refine
 python -m tests.run_tests
 ```
 
-The stdlib-only suite (197 tests) installs a fake Hermes host before importing the plugin.
+The stdlib-only suite (260 tests) installs a fake Hermes host before importing the plugin.
 Every database, journal, backup, skill, memory file, ledger, and lock lives
 under a fresh `TemporaryDirectory`; running the suite cannot touch live Hermes
 or profile state. It covers proposal completion, host action mapping,

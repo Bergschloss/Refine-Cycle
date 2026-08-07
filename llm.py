@@ -296,6 +296,7 @@ def _propose_structured(
     target: Optional[Dict[str, str]] = None,
 ) -> Any:
     """Invoke the model only with recursively sanitized text inputs."""
+    _call_meta.value = {}
     safe_blocks: List[PluginLlmInput] = []
     for block in input_blocks:
         text = getattr(block, "text", None)
@@ -357,6 +358,7 @@ def _ensure_dict(parsed: Any) -> Optional[Dict[str, Any]]:
 
 def review_fallback(llm: PluginLlm, evidence_text: str, *, target: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """Return one conservative reviewer verdict; all failures decline safely."""
+    _call_meta.value = {}
     safe_evidence = scrub_text(str(evidence_text))
     resolved_target = target if target is not None else _pinned_target()
     instructions = (
@@ -365,6 +367,7 @@ def review_fallback(llm: PluginLlm, evidence_text: str, *, target: Optional[Dict
         f"{safe_evidence[-8000:]}"
     )
     try:
+        call_started = time.time()
         result = llm.complete_structured(
             system_prompt=scrub_text(REVIEWER_FALLBACK_SYSTEM_PROMPT),
             input=[PluginLlmTextInput(text=scrub_text(instructions))],
@@ -375,6 +378,7 @@ def review_fallback(llm: PluginLlm, evidence_text: str, *, target: Optional[Dict
             max_tokens=REVIEWER_MAX_TOKENS,
             **resolved_target,
         )
+        _record_call_meta(result, call_started)
         reply = _salvage_parsed(result, requested_max_tokens=REVIEWER_MAX_TOKENS)
         if reply.failure:
             rationale = (
@@ -390,8 +394,15 @@ def review_fallback(llm: PluginLlm, evidence_text: str, *, target: Optional[Dict
             }
         parsed = _ensure_dict(reply.parsed)
     except Exception as exc:
-        logger.warning("Reviewer fallback failed: %s", scrub_text(str(exc)))
-        parsed = None
+        safe_error = scrub_text(str(exc))
+        logger.warning("Reviewer fallback failed: %s", safe_error)
+        return {
+            "should_refine": False,
+            "rationale": "Reviewer model call failed.",
+            "instructions": "",
+            "failure": "llm_call_error",
+            "error": safe_error,
+        }
     if not parsed or not isinstance(parsed.get("shouldRefine"), bool):
         return {
             "should_refine": False,
@@ -571,6 +582,7 @@ def _finalize_edit(
     *,
     skill_content_loader: Optional[Callable[[str], Optional[str]]] = None,
     allow_content_retry: bool = True,
+    target: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Normalize and complete exactly one edit, shared by single and multi proposals.
 
@@ -581,7 +593,12 @@ def _finalize_edit(
     if allow_content_retry and action == "create" and not content:
         retry_text = instructions + "\n\nA create requires non-empty complete content. Return it now."
         retry = _ensure_dict(
-            _propose_structured(llm, short, [PluginLlmTextInput(text=retry_text)])
+            _propose_structured(
+                llm,
+                short,
+                [PluginLlmTextInput(text=retry_text)],
+                target=target,
+            )
         )
         if retry is not None:
             if retry.get("failure"):
@@ -657,7 +674,12 @@ def _finalize_edit(
             + "\n</current-skill>"
         )
         retry = _ensure_dict(
-            _propose_structured(llm, short, [PluginLlmTextInput(text=patch_prompt)])
+            _propose_structured(
+                llm,
+                short,
+                [PluginLlmTextInput(text=patch_prompt)],
+                target=target,
+            )
         )
         if retry is None:
             return {"action": "no_op", "reason": "LLM did not return a complete skill replacement"}
@@ -709,6 +731,7 @@ def _finalize_edits(
     *,
     max_edits: int,
     skill_content_loader: Optional[Callable[[str], Optional[str]]] = None,
+    target: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Turn a proposed transaction into a bounded list of independent edits.
 
@@ -747,6 +770,7 @@ def _finalize_edits(
             # A create without content is dropped from a transaction instead of
             # spending an extra model call per edit on a retry.
             allow_content_retry=False,
+            target=target,
         )
         if edit.get("failure"):
             return sanitize(edit)
@@ -757,16 +781,16 @@ def _finalize_edits(
                 scrub_text(str(edit.get("reason", "")))[:200],
             )
             continue
-        target = (edit["kind"], edit["name"])
+        claimed_target = (edit["kind"], edit["name"])
         if edit["kind"] != "prompt":
-            if target in claimed:
+            if claimed_target in claimed:
                 dropped += 1
                 logger.warning(
                     "Dropping a refine transaction edit that repeats target %s",
                     scrub_text(f"{edit['kind']}:{edit['name']}"),
                 )
                 continue
-            claimed.add(target)
+            claimed.add(claimed_target)
         edits.append(edit)
 
     if dropped:
@@ -918,6 +942,7 @@ def propose(
                 raw_edits,
                 max_edits=max_edits,
                 skill_content_loader=skill_content_loader,
+                target=target,
             )
         return _finalize_edit(
             llm,
@@ -925,15 +950,24 @@ def propose(
             instructions,
             parsed,
             skill_content_loader=skill_content_loader,
+            target=target,
         )
     except PluginLlmTrustError as exc:
         safe_error = scrub_text(str(exc))
         logger.warning("PluginLlm trust denied: %s", safe_error)
-        return {"action": "no_op", "reason": f"LLM trust policy denied: {safe_error}"}
+        return {
+            "action": "no_op",
+            "reason": f"LLM trust policy denied: {safe_error}",
+            "failure": "llm_trust_denied",
+        }
     except Exception as exc:
         safe_error = scrub_text(str(exc))
         logger.error("LLM proposal failed: %s", safe_error, exc_info=True)
-        return {"action": "no_op", "reason": f"LLM call failed: {safe_error}"}
+        return {
+            "action": "no_op",
+            "reason": f"LLM call failed: {safe_error}",
+            "failure": "llm_call_error",
+        }
 
 
 def _ensure_list(value: Any) -> List[str]:

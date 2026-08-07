@@ -131,6 +131,7 @@ def record_journal_state(entry: Dict[str, Any]) -> None:
         str(entry.get("id", "")),
         outcome=str(entry.get("outcome", "")),
         pending_id=str(entry.get("pending_id", "")),
+        llm_meta=entry.get("llm_meta") if isinstance(entry.get("llm_meta"), dict) else None,
     )
 
 
@@ -282,6 +283,11 @@ def audit(current_patterns: Optional[List[Dict[str, Any]]] = None) -> List[Dict[
             "verdict": verdict,
             "journal_id": meta.get("journal_id", ""),
             "outcome": outcome,
+            "reported_model": (
+                scrub_text(str(meta.get("reported_model", "")))[:60]
+                if meta.get("reported_model")
+                else ""
+            ),
             "expected_outcome": (
                 scrub_text(meta["expected_outcome"]).strip()
                 if isinstance(meta.get("expected_outcome"), str)

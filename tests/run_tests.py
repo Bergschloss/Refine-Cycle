@@ -386,6 +386,11 @@ class RefineTests(unittest.TestCase):
         # Both are process-lifetime globals: left set, they leak across tests.
         plugin_init._REGISTER_WARNED = False
         plugin_init._REGISTERED_LLM = None
+        config._set_runtime_journal_dir(None)
+        journal._MIGRATION_STATUS.update({
+            "outcome": "not_checked", "source": "", "destination": "",
+            "active_dir": "", "rename_warning": "", "error": "",
+        })
         # Session identity tracking — must not leak from one test to the next.
         # Set to the default test session so existing tests that call refine_run
         # without an explicit session_id find the FakeHost's "session" messages.
@@ -474,6 +479,24 @@ class RefineTests(unittest.TestCase):
         )
         self.assertEqual(len(found), 11)
 
+    def test_cross_session_patterns_exclude_skipped_sources_in_sql(self):
+        now = time.time()
+        FakeHost.make_db([
+            ("cli-session", "tool", "ERROR: interactive widget failed", "tool", now - 4, 1),
+            ("cli-session", "tool", "ERROR: interactive widget failed", "tool", now - 3, 1),
+            ("cron-session", "tool", "ERROR: scheduled secret failure", "tool", now - 2, 1),
+            ("cron-session", "tool", "ERROR: scheduled secret failure", "tool", now - 1, 1),
+        ])
+        connection = sqlite3.connect(self.root / "state.db")
+        connection.execute("DELETE FROM sessions")
+        connection.execute("INSERT INTO sessions VALUES ('cli-session', ?, 'cli')", (now - 10,))
+        connection.execute("INSERT INTO sessions VALUES ('cron-session', ?, 'cron')", (now - 10,))
+        connection.commit()
+        connection.close()
+        rendered = json.dumps(core.collect_cross_session_patterns(), ensure_ascii=False)
+        self.assertIn("interactive widget", rendered)
+        self.assertNotIn("scheduled secret", rendered)
+
     def test_proposal_and_reviewer_budgets_are_derived_and_distinct(self):
         self.assertGreaterEqual(
             llm.PROPOSAL_MAX_TOKENS * llm._CHARS_PER_TOKEN,
@@ -530,6 +553,13 @@ class RefineTests(unittest.TestCase):
         with patch.object(plugin_init.core, "refine_run", return_value=result):
             self.assertIn("cut off", plugin_init._handle_refine_command("").lower())
 
+    def test_model_call_failure_is_not_a_successful_noop(self):
+        result = core.refine_run(MockLlm(RuntimeError("model unavailable")))
+        self.assertFalse(result["success"])
+        self.assertEqual(result["outcome"], "llm_error")
+        self.assertEqual(result["failure"], "llm_call_error")
+        self.assertEqual(journal.get_entry(result["journal_id"])["outcome"], "llm_error")
+
     def test_reply_parse_failures_are_not_disguised_as_noop(self):
         malformed = core.refine_run(MockLlm(MockResult(
             None, text='{"action":"no_op","reason": invalid}'
@@ -582,13 +612,14 @@ class RefineTests(unittest.TestCase):
         ))
         with self.assertLogs(llm.logger, "WARNING") as reviewer_logs:
             reviewer_result = core.refine_run(reviewer_model)
-        self.assertTrue(reviewer_result["success"])
-        self.assertEqual(reviewer_result["reviewer"], "declined")
+        self.assertFalse(reviewer_result["success"])
+        self.assertEqual(reviewer_result["reviewer"], "failed")
+        self.assertEqual(reviewer_result["outcome"], "llm_error")
         self.assertEqual(len(reviewer_model.calls), 1)
-        self.assertIn("no final answer", reviewer_result["message"].lower())
+        self.assertIn("reviewer model call failed", reviewer_result["message"].lower())
         self.assertIn("reviewer-reasoning-model", "\n".join(reviewer_logs.output))
         self.assertEqual(
-            journal.get_entry(reviewer_result["journal_id"])["outcome"], "no_op"
+            journal.get_entry(reviewer_result["journal_id"])["outcome"], "llm_error"
         )
         self.assertEqual(
             journal.get_entry(reviewer_result["journal_id"])["proposal"]["expected_outcome"],
@@ -1499,7 +1530,7 @@ class RefineTests(unittest.TestCase):
         self.assertTrue(core.refine_rollback(memory_result["journal_id"])["success"])
 
     def test_new_malformed_lock_is_not_deleted_until_mtime_is_stale(self):
-        lock_path = journal.ensure_dirs() / journal._LOCK_FILE_NAME
+        lock_path = journal._mutation_lock_path(journal.ensure_dirs())
         lock_path.write_bytes(b"")
         modified = 1000.0
         os_module = __import__("os")
@@ -1510,6 +1541,14 @@ class RefineTests(unittest.TestCase):
         with patch.object(journal.time, "time", return_value=modified + 301):
             journal._try_clear_stale_lock(lock_path)
         self.assertFalse(lock_path.exists())
+
+    def test_windows_pid_probe_never_uses_os_kill(self):
+        if config.os.name != "nt":
+            self.skipTest("Windows-specific process probe")
+        with patch.object(
+            journal.os, "kill", side_effect=AssertionError("destructive probe")
+        ):
+            self.assertTrue(journal._pid_is_alive(config.os.getpid()))
 
     def test_forward_approval_reconciles_approved_rejected_and_memory(self):
         FakeHost.stage_writes = True
@@ -2235,6 +2274,31 @@ class RefineTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertFalse(plugin_init._AUTO_THREAD_GUARD.locked())
 
+    def test_session_end_skips_source_before_reading_trajectory(self):
+        FakeHost.entry_config()["auto_enabled"] = True
+        path = self.root / "state.db"
+        connection = sqlite3.connect(path)
+        connection.execute("UPDATE sessions SET source='cron' WHERE id='session'")
+        connection.commit()
+        connection.close()
+        handed_off = threading.Event()
+
+        def run(**kwargs):
+            handed_off.set()
+            return {"success": True, "outcome": "skipped_session_source"}
+
+        with patch.object(
+            plugin_init.core,
+            "collect_evidence",
+            side_effect=AssertionError("trajectory read before source gate"),
+        ), patch.object(plugin_init.core, "refine_run", side_effect=run):
+            plugin_init._on_session_end(session_id="session")
+            self.assertTrue(handed_off.wait(1))
+        deadline = time.monotonic() + 1
+        while plugin_init._AUTO_THREAD_GUARD.locked() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(plugin_init._AUTO_THREAD_GUARD.locked())
+
     def test_session_end_defers_while_a_turn_worker_is_active(self):
         FakeHost.entry_config().update({"auto_enabled": True, "auto_turn_interval": 1})
         messages = [{"role": "user"}] * config.auto_min_messages()
@@ -2354,6 +2418,56 @@ class RefineTests(unittest.TestCase):
         self.assertNotIn(secret, raw)
         self.assertIn("Reviewer declined", journal.get_entry(result["journal_id"])["reason"])
 
+    def test_reviewer_decline_reports_unusable_target(self):
+        now = time.time()
+        FakeHost.make_db([
+            ("session", "user", f"Routine context {index}", "", now - index, 1)
+            for index in range(20)
+        ])
+        FakeHost.entry_config().update({
+            "min_signal_required": True,
+            "reviewer_fallback_enabled": True,
+            "reviewer_min_messages": 20,
+            "llm": {"model": "sk-" + "a" * 24},
+        })
+        model = MockLlm({
+            "shouldRefine": False,
+            "rationale": "No durable lesson.",
+            "instructions": "",
+        })
+        with patch.object(config, "live_main_target", return_value={}):
+            result = core.refine_run(model)
+        self.assertFalse(result["success"])
+        self.assertEqual(result["outcome"], "target_issue")
+        self.assertEqual(journal.get_entry(result["journal_id"])["outcome"], "target_issue")
+
+    def test_reviewer_decline_keeps_valid_live_fallback_noop(self):
+        now = time.time()
+        FakeHost.make_db([
+            ("session", "user", f"Routine context {index}", "", now - index, 1)
+            for index in range(20)
+        ])
+        FakeHost.entry_config().update({
+            "min_signal_required": True,
+            "reviewer_fallback_enabled": True,
+            "reviewer_min_messages": 20,
+            "llm": {"model": "sk-" + "a" * 24},
+        })
+        model = MockLlm({
+            "shouldRefine": False,
+            "rationale": "No durable lesson.",
+            "instructions": "",
+        })
+        with patch.object(
+            config,
+            "live_main_target",
+            return_value={"provider": "live", "model": "live-good-model"},
+        ):
+            result = core.refine_run(model)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["reviewer"], "declined")
+        self.assertEqual(journal.get_entry(result["journal_id"])["outcome"], "no_op")
+
     def test_reviewer_skips_short_disabled_and_cooled_down_sessions(self):
         now = time.time()
         short_rows = [
@@ -2388,7 +2502,7 @@ class RefineTests(unittest.TestCase):
         self.assertFalse(core.refine_run(cooled_model).get("llm_called"))
         self.assertFalse(cooled_model.calls)
 
-    def test_reviewer_garbage_or_failure_declines_without_proposal(self):
+    def test_reviewer_garbage_or_failure_is_not_a_noop(self):
         now = time.time()
         FakeHost.make_db([
             ("session", "user", f"Routine context {index}", "", now - index, 1)
@@ -2401,13 +2515,32 @@ class RefineTests(unittest.TestCase):
         })
         garbage_model = MockLlm("not a verdict")
         result = core.refine_run(garbage_model)
-        self.assertTrue(result["success"])
-        self.assertEqual(result["reviewer"], "declined")
+        self.assertFalse(result["success"])
+        self.assertEqual(result["reviewer"], "failed")
+        self.assertEqual(result["outcome"], "llm_error")
         self.assertEqual(len(garbage_model.calls), 1)
         self.assertFalse(FakeHost.actions)
 
         failed = llm.review_fallback(MockLlm(RuntimeError("reviewer timeout")), "evidence")
         self.assertFalse(failed["should_refine"])
+        self.assertEqual(failed["failure"], "llm_call_error")
+    def test_reviewer_call_exception_is_journaled_as_llm_error(self):
+        now = time.time()
+        FakeHost.make_db([
+            ("session", "user", f"Routine context {index}", "", now - index, 1)
+            for index in range(20)
+        ])
+        FakeHost.entry_config().update({
+            "min_signal_required": True,
+            "reviewer_fallback_enabled": True,
+            "reviewer_min_messages": 20,
+        })
+        result = core.refine_run(MockLlm(RuntimeError("reviewer timeout")))
+        self.assertFalse(result["success"])
+        self.assertEqual(result["outcome"], "llm_error")
+        self.assertEqual(result["reviewer"], "failed")
+        self.assertEqual(journal.get_entry(result["journal_id"])["outcome"], "llm_error")
+
     def test_reviewer_incomplete_approval_declines_without_proposal(self):
         now = time.time()
         FakeHost.make_db([
@@ -4308,12 +4441,16 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
             "action": "no_op", "reason": "nothing", "evidence": [],
             "kind": "", "name": "", "content": "",
         })
-        result = core.refine_run(model, session_id="session")
+        with patch.object(
+            core, "collect_evidence", side_effect=AssertionError("trajectory read")
+        ):
+            result = core.refine_run(model, session_id="session")
         self.assertEqual(result.get("outcome"), "skipped_session_source")
         self.assertIn("cron", result["message"])
         # No model called, no budget spent
         self.assertEqual(len(model.calls), 0)
         self.assertEqual(journal.count_today_applied(), 0)
+        self.assertEqual(journal.entries()[-1]["outcome"], "skipped_session_source")
 
     def test_cli_session_is_not_skipped(self):
         # Default source is 'cli' which is not in skip list
@@ -4345,45 +4482,80 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
 
     def test_source_read_failure_does_not_block_the_pass(self):
         # If the source cannot be read (missing column, etc.), the pass proceeds.
-        with patch.object(core, "_get_session_source", return_value=""):
+        with patch.object(core, "_get_session_source_status", return_value=("", "error")):
             model = MockLlm({
                 "action": "no_op", "reason": "nothing", "evidence": [],
                 "kind": "", "name": "", "content": "",
             })
             result = core.refine_run(model, session_id="session")
         self.assertNotEqual(result.get("outcome"), "skipped_session_source")
+        self.assertEqual(result["evidence"]["source_lookup_status"], "error")
+
+    def test_session_source_is_scrubbed_at_database_boundary(self):
+        token = "ghp_" + "A" * 36
+        path = self.root / "state.db"
+        connection = sqlite3.connect(path)
+        connection.execute("UPDATE sessions SET source=? WHERE id='session'", (token,))
+        connection.commit()
+        connection.close()
+        source, status = core._get_session_source_status("session")
+        self.assertEqual(status, "ok")
+        self.assertNotIn(token, source)
+        self.assertIn("[REDACTED]", source)
+
+    def test_message_query_rechecks_source_filter_atomically(self):
+        path = self.root / "state.db"
+        connection = sqlite3.connect(path)
+        connection.execute("UPDATE sessions SET source='cron' WHERE id='session'")
+        connection.commit()
+        connection.close()
+        model = MockLlm({"action": "no_op", "reason": "should not run"})
+        with patch.object(core, "_get_session_source_status", return_value=("cli", "ok")):
+            result = core.refine_run(model, session_id="session")
+        self.assertEqual(len(result["evidence"].get("messages", [])), 0)
+        self.assertEqual(len(model.calls), 0)
 
     def test_status_reports_skip_sources_and_session_source(self):
         status = core.refine_status()
         self.assertIn("skip_session_sources", status)
         self.assertEqual(status["skip_session_sources"], ["cron"])
         self.assertEqual(status["session_source"], "cli")
+        text = plugin_init._handle_refine_command("status")
+        self.assertIn("session db source: cli", text)
+        self.assertIn("skipped session sources: cron", text)
 
     # ── Model attribution (Part B) ────────────────────────────────────────────
 
     def test_single_pass_uses_one_target_for_all_calls(self):
-        """Even if effective_llm_target changes mid-pass, the calls are consistent."""
+        """Regeneration keeps the target resolved before the first call."""
         FakeHost.entry_config()["llm"] = {
             "model": "pinned-model",
             "allow_model_override": True,
         }
+        FakeHost.add_skill(
+            "target-skill",
+            "---\nname: target-skill\ndescription: old\n---\n# Old\n",
+        )
         call_models = []
 
         class SpyLlm:
-            calls = []
-
             def complete_structured(self, **kwargs):
                 call_models.append(kwargs.get("model"))
-                return MockResult(
-                    {"action": "no_op", "reason": "nothing", "evidence": []},
-                    model="reported-from-host",
-                    output_tokens=42,
-                )
+                if len(call_models) == 1:
+                    FakeHost.entry_config()["llm"]["model"] = "changed-mid-pass"
+                    return MockResult({
+                        "action": "patch", "kind": "skill", "name": "target-skill",
+                        "reason": "update", "evidence": [],
+                    }, model="reported-from-host")
+                return MockResult({
+                    "action": "patch", "kind": "skill", "name": "target-skill",
+                    "content": "---\nname: target-skill\ndescription: new\n---\n# New\n",
+                    "reason": "update", "evidence": [],
+                }, model="reported-from-host", output_tokens=42)
 
-        spy = SpyLlm()
-        core.refine_run(spy, session_id="session")
-        # All calls within the pass used the same resolved target.
-        self.assertTrue(all(m == "pinned-model" for m in call_models))
+        result = core.refine_run(SpyLlm(), session_id="session")
+        self.assertTrue(result["success"])
+        self.assertEqual(call_models, ["pinned-model", "pinned-model"])
 
     def test_journal_entry_contains_llm_meta_fields(self):
         FakeHost.entry_config()["llm"] = {
@@ -4405,6 +4577,26 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
         self.assertEqual(meta.get("target_source"), "config")
         self.assertIsInstance(meta.get("latency_ms"), int)
         self.assertEqual(meta.get("output_tokens"), 100)
+
+    def test_applied_entry_and_audit_preserve_reported_model(self):
+        model = MockLlm(MockResult({
+            "action": "create", "kind": "skill", "name": "attributed-skill",
+            "content": "---\nname: attributed-skill\ndescription: test\n---\n# Body\n",
+            "reason": "test attribution", "evidence": [],
+        }, model="actual-host-model", output_tokens=50))
+        result = core.refine_run(model, session_id="session")
+        self.assertTrue(result["success"])
+        entry = journal.get_entry(result["journal_id"])
+        self.assertEqual(entry["llm_meta"]["reported_model"], "actual-host-model")
+        report = core.refine_audit()["report"]
+        self.assertIn("model: actual-host-model", report)
+
+        entry["outcome"] = "pending_approval"
+        ledger.record_journal_state(entry)
+        row = next(
+            item for item in ledger.audit([]) if item["name"] == "attributed-skill"
+        )
+        self.assertEqual(row["reported_model"], "actual-host-model")
 
     def test_journal_entry_omits_output_tokens_when_unavailable(self):
         model = MockLlm(MockResult(
@@ -4457,12 +4649,32 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
              "kind": "", "name": "", "content": ""},
             model="fallback-model",
         ))
-        core.refine_run(model, session_id="session")
+        result = core.refine_run(model, session_id="session")
+        self.assertFalse(result["success"])
+        self.assertEqual(result["outcome"], "target_issue")
+        self.assertEqual(result["failure"], "target_configuration")
         entries = journal.entries()
         latest = entries[-1] if entries else {}
+        self.assertEqual(latest.get("outcome"), "target_issue")
         meta = latest.get("llm_meta", {})
         self.assertTrue(meta.get("target_issues"))
         self.assertIn("credential", meta["target_issues"][0])
+
+    def test_ignored_bad_target_does_not_fail_valid_live_model_noop(self):
+        FakeHost.entry_config()["llm"] = {"model": "sk-" + "a" * 24}
+        model = MockLlm(MockResult({
+            "action": "no_op", "reason": "nothing", "evidence": [],
+            "kind": "", "name": "", "content": "",
+        }, model="live-good-model"))
+        with patch.object(
+            config,
+            "live_main_target",
+            return_value={"provider": "live", "model": "live-good-model"},
+        ):
+            result = core.refine_run(model, session_id="session")
+        self.assertTrue(result["success"])
+        self.assertNotEqual(result.get("outcome"), "target_issue")
+        self.assertTrue(result["llm_meta"].get("target_issues"))
 
     # ── Dry-run (Part E) ──────────────────────────────────────────────────────
 
@@ -4570,12 +4782,45 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
         self.assertIn("create", text)
         self.assertIn("test-skill", text)
 
+    def test_dry_run_works_after_edit_budget_is_exhausted(self):
+        FakeHost.entry_config()["max_edits_per_day"] = 1
+        journal.log(
+            trigger="manual", reason="spent", session_id="session",
+            proposal={"action": "create", "kind": "skill", "name": "spent"},
+            outcome="applied",
+        )
+        model = MockLlm({
+            "action": "no_op", "reason": "nothing", "evidence": [],
+            "kind": "", "name": "", "content": "",
+        })
+        result = core.refine_run(model, session_id="session", dry_run=True)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["outcome"], "dry_run")
+
+    def test_dry_run_reports_journal_failure(self):
+        model = MockLlm({
+            "action": "no_op", "reason": "nothing", "evidence": [],
+            "kind": "", "name": "", "content": "",
+        })
+        with patch.object(core, "_journal_nonmutation", return_value=None):
+            result = core.refine_run(model, session_id="session", dry_run=True)
+        self.assertFalse(result["success"])
+        self.assertEqual(result["outcome"], "journal_error")
+
     def test_dry_run_unknown_session_refuses(self):
         core._LAST_SESSION_ID = ""
         with patch.object(core, "host_session_id", return_value=""):
             model = MockLlm()
             result = core.refine_run(model, dry_run=True)
         self.assertEqual(result["outcome"], "session_unknown")
+
+    def test_windows_hermes_home_fallback_uses_local_app_data(self):
+        if config.os.name != "nt":
+            self.skipTest("Windows-specific fallback")
+        expected_root = self.root / "LocalAppData"
+        with patch.dict(config.os.environ, {"LOCALAPPDATA": str(expected_root)}), \
+             patch.dict(sys.modules, {"hermes_constants": None}):
+            self.assertEqual(config.hermes_home(), expected_root / "hermes")
 
     # ── Journal directory migration (Part C) ──────────────────────────────────
 
@@ -4598,6 +4843,96 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
         self.assertFalse(legacy.exists())
         renamed = list(legacy.parent.glob("refine.migrated-*"))
         self.assertEqual(len(renamed), 1)
+
+    def test_snapshotless_rollback_survives_migration(self):
+        hermes_root = self.root / "hermes"
+        legacy = hermes_root / "plugins" / "refine"
+        backups = legacy / "backups"
+        backups.mkdir(parents=True)
+        new_dir = hermes_root / "refine"
+        name = "migrated-rollback"
+        old = skill_content(name, "# Old\n\nPreserve this.")
+        new = skill_content(name, "# New\n\nApplied change.")
+        backup = backups / "legacy_skill.bak"
+        backup.write_text(old, encoding="utf-8")
+        entry_id = "abc123def456"
+        entry = {
+            "id": entry_id,
+            "ts": time.time(),
+            "trigger": "manual",
+            "reason": "legacy patch",
+            "session_id": "session",
+            "proposal": {
+                "action": "patch", "kind": "skill", "name": name,
+                "content": new, "reason": "legacy patch",
+            },
+            "outcome": "applied",
+            "backup_path": str(backup),
+            "recovery": {"type": "skill_patch", "name": name},
+            "error": "",
+        }
+        legacy.mkdir(parents=True, exist_ok=True)
+        (legacy / "refine_journal.jsonl").write_text(
+            json.dumps(entry) + "\n", encoding="utf-8"
+        )
+        FakeHost.add_skill(name, new)
+        FakeHost.entry_config().pop("journal_dir", None)
+        with patch.object(config, "hermes_home", return_value=hermes_root):
+            result = journal.migrate_legacy_journal_dir(
+                _new_dir=new_dir, _legacy_dir=legacy
+            )
+            self.assertEqual(result, "migrated")
+            self.assertTrue(core.refine_rollback(entry_id)["success"])
+        self.assertEqual(FakeHost.skills[name], old)
+        self.assertFalse(legacy.exists())
+
+    def test_model_override_write_waits_for_migration_generation(self):
+        hermes_root = self.root / "hermes"
+        legacy = hermes_root / "plugins" / "refine"
+        legacy.mkdir(parents=True)
+        new_dir = hermes_root / "refine"
+        (legacy / "refine_journal.jsonl").write_text("", encoding="utf-8")
+        (legacy / "model_override.json").write_text(
+            json.dumps({"provider": "", "model": "model-a"}), encoding="utf-8"
+        )
+        FakeHost.entry_config().pop("journal_dir", None)
+        copying_override = threading.Event()
+        release_copy = threading.Event()
+        writer_done = threading.Event()
+        migration_result = []
+        import shutil as _shutil
+        real_copy2 = _shutil.copy2
+
+        def pausing_copy(src, dst, **kwargs):
+            result = real_copy2(src, dst, **kwargs)
+            if Path(src).name == "model_override.json":
+                copying_override.set()
+                release_copy.wait(5)
+            return result
+
+        def migrate():
+            migration_result.append(journal.migrate_legacy_journal_dir(
+                _new_dir=new_dir, _legacy_dir=legacy
+            ))
+
+        def write_override():
+            journal.write_model_override("", "model-b")
+            writer_done.set()
+
+        with patch.object(config, "hermes_home", return_value=hermes_root), \
+             patch.object(_shutil, "copy2", side_effect=pausing_copy):
+            migration_thread = threading.Thread(target=migrate)
+            migration_thread.start()
+            self.assertTrue(copying_override.wait(2))
+            writer_thread = threading.Thread(target=write_override)
+            writer_thread.start()
+            self.assertFalse(writer_done.wait(0.1))
+            release_copy.set()
+            migration_thread.join(10)
+            writer_thread.join(10)
+            self.assertTrue(writer_done.is_set())
+            self.assertEqual(journal.read_model_override()["model"], "model-b")
+        self.assertEqual(migration_result, ["migrated"])
 
     def test_migration_is_idempotent(self):
         legacy = self.root / "hermes" / "plugins" / "refine"
@@ -4651,30 +4986,152 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
         (legacy / "refine_journal.jsonl").write_text('{"id":"a"}', encoding="utf-8")
 
         import shutil as _shutil
-        real_copy2 = _shutil.copy2
-
         def fail_copy2(src, dst, **kwargs):
             raise OSError("disk full")
 
         with patch.object(config, "_get_refine_entry", return_value={}), \
              patch.object(_shutil, "copy2", side_effect=fail_copy2):
             result = journal.migrate_legacy_journal_dir(_new_dir=new_dir, _legacy_dir=legacy)
+            self.assertEqual(config.journal_dir(), legacy)
+            self.assertEqual(journal.journal_read_path(), legacy / "refine_journal.jsonl")
         self.assertEqual(result, "failed")
         self.assertTrue((legacy / "refine_journal.jsonl").is_file())
+        self.assertEqual(journal.migration_status()["active_dir"], str(legacy))
+
+    def test_migration_retries_an_incomplete_destination(self):
+        legacy = self.root / "hermes" / "plugins" / "refine"
+        legacy.mkdir(parents=True)
+        new_dir = self.root / "hermes" / "refine"
+        (legacy / "refine_journal.jsonl").write_text('{"id":"a"}', encoding="utf-8")
+        (legacy / "skill_stats.json").write_text('{"kept":true}', encoding="utf-8")
+        real_atomic_write = journal._atomic_write_text
+
+        def fail_final_marker(path, content):
+            if Path(path).name == ".migrated_from":
+                raise OSError("interrupted before commit marker")
+            return real_atomic_write(path, content)
+
+        with patch.object(config, "_get_refine_entry", return_value={}), \
+             patch.object(journal, "_atomic_write_text", side_effect=fail_final_marker):
+            first = journal.migrate_legacy_journal_dir(
+                _new_dir=new_dir, _legacy_dir=legacy
+            )
+            self.assertEqual(config.journal_dir(), legacy)
+        self.assertEqual(first, "failed")
+        self.assertTrue((new_dir / ".migration_incomplete").is_file())
+
+        with patch.object(config, "_get_refine_entry", return_value={}):
+            second = journal.migrate_legacy_journal_dir(
+                _new_dir=new_dir, _legacy_dir=legacy
+            )
+        self.assertEqual(second, "migrated")
+        self.assertFalse((new_dir / ".migration_incomplete").exists())
+        self.assertEqual(
+            (new_dir / "skill_stats.json").read_text(encoding="utf-8"),
+            '{"kept":true}',
+        )
 
     def test_migration_two_threads_only_one_migrates(self):
         legacy = self.root / "hermes" / "plugins" / "refine"
         legacy.mkdir(parents=True)
         new_dir = self.root / "hermes" / "refine"
         (legacy / "refine_journal.jsonl").write_text('{"id":"a"}', encoding="utf-8")
-        # Prove idempotence by calling twice in sequence — the thread lock inside
-        # prevents concurrent execution in the same process, and the marker file
-        # prevents it across processes.
+        barrier = threading.Barrier(2)
+        results = []
+        errors = []
+
+        def migrate():
+            try:
+                barrier.wait(5)
+                results.append(journal.migrate_legacy_journal_dir(
+                    _new_dir=new_dir, _legacy_dir=legacy
+                ))
+            except Exception as exc:
+                errors.append(exc)
+
         with patch.object(config, "_get_refine_entry", return_value={}):
-            r1 = journal.migrate_legacy_journal_dir(_new_dir=new_dir, _legacy_dir=legacy)
-            r2 = journal.migrate_legacy_journal_dir(_new_dir=new_dir, _legacy_dir=legacy)
-        self.assertEqual(r1, "migrated")
-        self.assertEqual(r2, "not_needed")
+            threads = [threading.Thread(target=migrate) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(10)
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(results), ["migrated", "not_needed"])
+        self.assertTrue((new_dir / ".migrated_from").is_file())
+        self.assertFalse((new_dir / ".migration_incomplete").exists())
+
+    def test_migration_process_lock_allows_one_publisher(self):
+        legacy = self.root / "hermes" / "plugins" / "refine"
+        legacy.mkdir(parents=True)
+        new_dir = self.root / "hermes" / "refine"
+        (legacy / "refine_journal.jsonl").write_text('{"id":"a"}', encoding="utf-8")
+        script = (
+            "import config,journal,sys; "
+            "config._get_refine_entry=lambda: {}; "
+            "print(journal.migrate_legacy_journal_dir("
+            "_new_dir=journal.Path(sys.argv[1]), _legacy_dir=journal.Path(sys.argv[2])))"
+        )
+        processes = [
+            subprocess.Popen(
+                [sys.executable, "-c", script, str(new_dir), str(legacy)],
+                cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True,
+            )
+            for _ in range(2)
+        ]
+        results = []
+        for process in processes:
+            stdout, stderr = process.communicate(timeout=15)
+            self.assertEqual(process.returncode, 0, stderr)
+            results.append(stdout.strip().splitlines()[-1])
+        self.assertEqual(sorted(results), ["migrated", "not_needed"])
+        self.assertTrue((new_dir / ".migrated_from").is_file())
+
+    def test_failed_process_switches_after_another_process_migrates(self):
+        legacy = self.root / "hermes" / "plugins" / "refine"
+        legacy.mkdir(parents=True)
+        new_dir = self.root / "hermes" / "refine"
+        marker = new_dir / ".migrated_from"
+        ready = self.root / "fallback-ready"
+        proceed = self.root / "migration-done"
+        (legacy / "refine_journal.jsonl").write_text(
+            '{"id":"before","ts":1,"outcome":"no_op"}\n', encoding="utf-8"
+        )
+        script = "\n".join([
+            "from pathlib import Path",
+            "import config,journal,sys,time",
+            "legacy,new_dir,ready,proceed = map(Path, sys.argv[1:5])",
+            "config._get_refine_entry = lambda: {}",
+            "config.hermes_home = lambda: new_dir.parent",
+            "config._set_runtime_journal_dir(legacy, commit_marker=new_dir / '.migrated_from')",
+            "ready.write_text('ready', encoding='utf-8')",
+            "deadline = time.time() + 15",
+            "while not proceed.exists() and time.time() < deadline: time.sleep(0.02)",
+            "journal.log(trigger='manual', reason='after migration', session_id='s', proposal={'action':'no_op'}, outcome='no_op')",
+            "print(journal.journal_path())",
+        ])
+        process = subprocess.Popen(
+            [sys.executable, "-c", script, str(legacy), str(new_dir), str(ready), str(proceed)],
+            cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(ready.exists())
+        with patch.object(config, "_get_refine_entry", return_value={}):
+            result = journal.migrate_legacy_journal_dir(
+                _new_dir=new_dir, _legacy_dir=legacy
+            )
+        self.assertEqual(result, "migrated")
+        proceed.write_text("go", encoding="utf-8")
+        stdout, stderr = process.communicate(timeout=15)
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertEqual(Path(stdout.strip().splitlines()[-1]), new_dir / "refine_journal.jsonl")
+        self.assertFalse(legacy.exists())
+        self.assertIn(
+            "after migration",
+            (new_dir / "refine_journal.jsonl").read_text(encoding="utf-8"),
+        )
 
     def test_old_directory_never_deleted(self):
         legacy = self.root / "hermes" / "plugins" / "refine"

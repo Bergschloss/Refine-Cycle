@@ -102,22 +102,30 @@ def _open_db() -> Optional[sqlite3.Connection]:
         return None
 
 
-def _get_session_source(session_id: str) -> str:
-    """Read-only lookup of a session's source column. Returns "" on any failure."""
+def _get_session_source_status(session_id: str) -> Tuple[str, str]:
+    """Return a scrubbed source plus ``ok``, ``missing``, or ``error``."""
     if not session_id:
-        return ""
+        return "", "missing"
     connection = _open_db()
     if not connection:
-        return ""
+        return "", "error"
     try:
         row = connection.execute(
             "SELECT source FROM sessions WHERE id = ?", (session_id,)
         ).fetchone()
-        return str(row["source"] or "") if row else ""
-    except Exception:
-        return ""
+        if not row:
+            return "", "missing"
+        return scrub_text(str(row["source"] or "")), "ok"
+    except Exception as exc:
+        logger.warning("Cannot read session source: %s", scrub_text(str(exc)))
+        return "", "error"
     finally:
         connection.close()
+
+
+def _get_session_source(session_id: str) -> str:
+    """Compatibility wrapper for status and callers that only need the value."""
+    return _get_session_source_status(session_id)[0]
 
 
 def _structured_error_status(content: str) -> Optional[bool]:
@@ -213,11 +221,20 @@ def collect_evidence(session_id: Optional[str] = None, limit: int = 60) -> Dict[
         empty["session_id_source"] = how
         return empty
     try:
-        rows = connection.execute(
-            "SELECT role, content, tool_name, timestamp FROM messages "
-            "WHERE session_id = ? AND active = 1 ORDER BY timestamp DESC LIMIT ?",
-            (resolved, limit),
-        ).fetchall()
+        sql = (
+            "SELECT m.role, m.content, m.tool_name, m.timestamp FROM messages m "
+            "LEFT JOIN sessions s ON s.id = m.session_id "
+            "WHERE m.session_id = ? AND m.active = 1"
+        )
+        params: List[Any] = [resolved]
+        skipped_sources = config.skip_session_sources()
+        if skipped_sources:
+            placeholders = ",".join("?" for _ in skipped_sources)
+            sql += f" AND (s.source IS NULL OR LOWER(s.source) NOT IN ({placeholders}))"
+            params.extend(skipped_sources)
+        sql += " ORDER BY m.timestamp DESC LIMIT ?"
+        params.append(limit)
+        rows = connection.execute(sql, tuple(params)).fetchall()
         messages: List[Dict[str, Any]] = []
         tool_errors: List[Dict[str, Any]] = []
         corrections: List[Dict[str, Any]] = []
@@ -252,6 +269,11 @@ def collect_evidence(session_id: Optional[str] = None, limit: int = 60) -> Dict[
             "session_id": resolved,
             "session_id_source": how,
         }
+    except Exception as exc:
+        logger.warning("Current-session evidence query failed: %s", scrub_text(str(exc)))
+        empty["session_id"] = resolved
+        empty["session_id_source"] = how
+        return empty
     finally:
         connection.close()
 
@@ -274,10 +296,17 @@ def collect_cross_session_patterns(
         else time.time() - ((days or config.cross_session_days()) * 86400)
     )
     sql = (
-        "SELECT session_id, tool_name, content, timestamp FROM messages "
-        "WHERE role = 'tool' AND active = 1 AND timestamp >= ? ORDER BY timestamp DESC"
+        "SELECT m.session_id, m.tool_name, m.content, m.timestamp FROM messages m "
+        "LEFT JOIN sessions s ON s.id = m.session_id "
+        "WHERE m.role = 'tool' AND m.active = 1 AND m.timestamp >= ?"
     )
     params: List[Any] = [since]
+    skipped_sources = config.skip_session_sources()
+    if skipped_sources:
+        placeholders = ",".join("?" for _ in skipped_sources)
+        sql += f" AND (s.source IS NULL OR LOWER(s.source) NOT IN ({placeholders}))"
+        params.extend(skipped_sources)
+    sql += " ORDER BY m.timestamp DESC"
     if max_rows is not None:
         sql += " LIMIT ?"
         params.append(max_rows)
@@ -477,6 +506,7 @@ def refine_status() -> Dict[str, Any]:
     max_edits = config.max_edits_per_day()
     jdir = config.journal_dir()
     jdir_state = _journal_dir_state(jdir)
+    migration = journal.migration_status()
 
     # The effective model belongs in this report. A pinned model that no provider
     # serves turns every pass into an ordinary no_op, and without it here the
@@ -562,6 +592,19 @@ def refine_status() -> Dict[str, Any]:
         })
 
     warnings: List[Dict[str, str]] = []
+    if migration.get("outcome") == "failed":
+        warnings.append({
+            "code": "journal_migration_failed",
+            "message": (
+                "Runtime-data migration failed; refine is using the intact legacy "
+                f"store at {migration.get('active_dir') or jdir}"
+            ),
+        })
+    if migration.get("rename_warning"):
+        warnings.append({
+            "code": "journal_migration_rename_failed",
+            "message": "Runtime data migrated, but the legacy directory could not be renamed",
+        })
     plugin_source_collision = False
     try:
         plugin_source_collision = (jdir / "plugin.yaml").is_file()
@@ -679,6 +722,8 @@ def refine_status() -> Dict[str, Any]:
         "journal_dir_state": jdir_state,
         "journal_dir_state_text": _JOURNAL_DIR_STATE_TEXT.get(jdir_state, jdir_state),
         "journal_dir_is_plugin_source": plugin_source_collision,
+        "migration": migration,
+        "migration_outcome": migration.get("outcome", "not_checked"),
         "session_id": sid,
         "session_id_source": sid_source,
         "session_message_count": session_message_count,
@@ -948,11 +993,76 @@ def _refine_once(
     started = time.time()
     safe_reason = scrub_text(reason)
 
-    if journal.daily_limit_reached():
+    resolved_session, resolved_source = resolve_session_id(session_id or "")
+    if not resolved_session:
+        evidence = {
+            "messages": [],
+            "error_count": 0,
+            "tool_errors": [],
+            "error_patterns": [],
+            "user_corrections": [],
+            "session_id": "",
+            "session_id_source": resolved_source,
+        }
+        return {
+            "success": False,
+            "outcome": "session_unknown",
+            "message": "Cannot identify the current session; refine did not run.",
+            "evidence": evidence,
+            "reversible": False,
+        }
+
+    # Resolve machine-generated sources before reading any private trajectory.
+    session_db_source, source_lookup_status = _get_session_source_status(
+        resolved_session
+    )
+    skip_sources = config.skip_session_sources()
+    if session_db_source and session_db_source.lower() in skip_sources:
+        proposal = {
+            "action": "no_op",
+            "reason": f"Session source '{session_db_source}' is configured to be skipped.",
+            "expected_outcome": "",
+        }
+        entry_id = _journal_nonmutation(
+            trigger=trigger,
+            reason=safe_reason or proposal["reason"],
+            session_id=resolved_session,
+            proposal=proposal,
+            outcome="skipped_session_source",
+        )
+        response = {
+            "success": bool(entry_id),
+            "outcome": "skipped_session_source",
+            "message": (
+                f"Session source '{session_db_source}' is in skip_session_sources; "
+                "refine did not run."
+            ),
+            "evidence": {
+                "messages": [],
+                "session_id": resolved_session,
+                "session_id_source": resolved_source,
+                "session_source": session_db_source,
+                "source_lookup_status": source_lookup_status,
+            },
+            "reversible": False,
+        }
+        if entry_id:
+            response["journal_id"] = entry_id
+        else:
+            response["message"] += " The skip decision could not be journaled."
+        return response
+
+    if not dry_run and journal.daily_limit_reached():
         return {
             "success": False,
             "message": f"Daily edit limit reached ({config.max_edits_per_day()}). "
             f"Applied/pending/prepared today: {journal.count_today_applied()}.",
+            "evidence": {
+                "session_id": resolved_session,
+                "session_id_source": resolved_source,
+                "session_source": session_db_source,
+                "source_lookup_status": source_lookup_status,
+            },
         }
 
     # Resolve the LLM target once per pass so every call within it uses the same
@@ -970,35 +1080,21 @@ def _refine_once(
         _run_target = {}
         _run_target_source = "unknown"
         _run_target_issues = ["the effective model could not be resolved"]
+    _run_target_unusable = bool(
+        _run_target_issues
+        and not _run_target
+        and _run_target_source in ("unknown", "host_default")
+    )
 
     evidence_limit = 60
     if config.min_signal_required() and config.reviewer_fallback_enabled():
         evidence_limit = max(evidence_limit, config.reviewer_min_messages())
-    evidence = collect_evidence(session_id=session_id, limit=evidence_limit)
-    session = evidence.get("session_id", "")
-    session_source = evidence.get("session_id_source", "unknown")
-    if not session and session_source == "unknown":
-        return {
-            "success": False,
-            "outcome": "session_unknown",
-            "message": "Cannot identify the current session; refine did not run.",
-            "evidence": evidence,
-            "reversible": False,
-        }
-    # Source filter: skip machine-generated sessions whose trajectory is noise.
-    skip_sources = config.skip_session_sources()
-    session_db_source = _get_session_source(session)
-    if session_db_source and session_db_source.lower() in skip_sources:
-        return {
-            "success": True,
-            "outcome": "skipped_session_source",
-            "message": (
-                f"Session source '{session_db_source}' is in skip_session_sources; "
-                "refine did not run."
-            ),
-            "evidence": evidence,
-            "reversible": False,
-        }
+    evidence = collect_evidence(session_id=resolved_session, limit=evidence_limit)
+    evidence["session_id_source"] = resolved_source
+    evidence["session_source"] = session_db_source
+    evidence["source_lookup_status"] = source_lookup_status
+    session = resolved_session
+    session_source = resolved_source
     if len(evidence.get("messages", [])) < 3:
         return {
             "success": True,
@@ -1029,9 +1125,40 @@ def _refine_once(
         )
         if should_review:
             reviewer = _llm.review_fallback(llm, evidence_text, target=_run_target)
+            reviewer_call_meta = _llm.last_call_meta()
+            reviewer_llm_meta = {
+                "requested_provider": _run_target.get("provider", ""),
+                "requested_model": _run_target.get("model", ""),
+                "target_source": _run_target_source,
+                **{k: v for k, v in reviewer_call_meta.items() if k in (
+                    "reported_model", "latency_ms", "output_tokens"
+                )},
+            }
+            if _run_target_issues:
+                reviewer_llm_meta["target_issues"] = _run_target_issues
             rationale = scrub_text(str(reviewer.get("rationale", "")))
             decision = "approved" if reviewer.get("should_refine") else "declined"
             reviewer_reason = f"Reviewer {decision}: {rationale}"
+            reviewer_failure = scrub_text(str(reviewer.get("failure", "")).strip())
+            reviewer_target_issue = bool(
+                not reviewer_failure
+                and _run_target_unusable
+                and not reviewer.get("should_refine")
+            )
+            reviewer_outcome = (
+                "llm_error"
+                if reviewer_failure
+                else ("target_issue" if reviewer_target_issue else "no_op")
+            )
+            reviewer_error = (
+                "The reviewer model call failed."
+                if reviewer_failure
+                else (
+                    "The configured refine model target is unusable."
+                    if reviewer_target_issue
+                    else ""
+                )
+            )
             reviewer_entry_id = _journal_nonmutation(
                 trigger="reviewer",
                 reason=reviewer_reason,
@@ -1041,7 +1168,9 @@ def _refine_once(
                     "reason": reviewer_reason,
                     "expected_outcome": "",
                 },
-                outcome="no_op",
+                outcome=reviewer_outcome,
+                error=reviewer_error,
+                llm_meta=reviewer_llm_meta,
             )
             if not reviewer_entry_id:
                 return {
@@ -1052,12 +1181,39 @@ def _refine_once(
                     "evidence": evidence,
                     "reversible": False,
                 }
+            if reviewer_failure:
+                return {
+                    "success": False,
+                    "outcome": "llm_error",
+                    "failure": reviewer_failure,
+                    "message": reviewer_error,
+                    "journal_id": reviewer_entry_id,
+                    "llm_called": True,
+                    "reviewer": "failed",
+                    "evidence": evidence,
+                    "llm_meta": reviewer_llm_meta,
+                    "reversible": False,
+                }
             if not reviewer.get("should_refine"):
                 proposal = {
                     "action": "no_op",
                     "reason": reviewer_reason,
                     "expected_outcome": "",
                 }
+                if reviewer_target_issue:
+                    return {
+                        "success": False,
+                        "outcome": "target_issue",
+                        "failure": "target_configuration",
+                        "message": "The configured refine model target is unusable.",
+                        "journal_id": reviewer_entry_id,
+                        "proposal": proposal,
+                        "llm_called": True,
+                        "reviewer": "declined",
+                        "evidence": evidence,
+                        "llm_meta": reviewer_llm_meta,
+                        "reversible": False,
+                    }
                 return {
                     "success": True,
                     "message": f"No actionable improvement found. {reviewer_reason}",
@@ -1141,21 +1297,29 @@ def _refine_once(
             "no_final_text": (
                 "The model returned only reasoning and no final refine proposal."
             ),
+            "llm_call_error": "The refine model call failed.",
+            "llm_trust_denied": "The host trust policy denied the refine model call.",
         }
         failure_message = failure_messages.get(
             failure, "The refine proposal could not be completed."
+        )
+        failure_outcome = (
+            "llm_error"
+            if failure in ("llm_call_error", "llm_trust_denied")
+            else "llm_incomplete"
         )
         entry_id = _journal_nonmutation(
             trigger=trigger,
             reason=safe_reason or failure_message,
             session_id=session,
             proposal=proposal,
-            outcome="llm_incomplete",
+            outcome=failure_outcome,
             error=failure_message,
             llm_meta=_run_llm_meta,
         )
         response = {
             "success": False,
+            "outcome": failure_outcome,
             "message": failure_message,
             "llm_called": True,
             "failure": failure,
@@ -1168,9 +1332,38 @@ def _refine_once(
         return response
     evidence_summary = {
         "session_id": session,
+        "session_id_source": session_source,
+        "session_source": session_db_source,
+        "source_lookup_status": source_lookup_status,
         "messages": len(evidence.get("messages", [])),
         "errors": evidence.get("error_count", 0),
     }
+
+    if _run_target_unusable and proposal.get("action") == "no_op":
+        failure_message = "The configured refine model target is unusable."
+        entry_id = _journal_nonmutation(
+            trigger=trigger,
+            reason=safe_reason or failure_message,
+            session_id=session,
+            proposal=proposal,
+            outcome="target_issue",
+            error=failure_message,
+            llm_meta=_run_llm_meta,
+        )
+        response = {
+            "success": False,
+            "outcome": "target_issue",
+            "failure": "target_configuration",
+            "message": failure_message,
+            "proposal": proposal,
+            "evidence": evidence_summary,
+            "llm_called": True,
+            "llm_meta": _run_llm_meta,
+            "reversible": False,
+        }
+        if entry_id:
+            response["journal_id"] = entry_id
+        return response
 
     # ── Dry-run exit: show what would happen, apply nothing ────────────────
     if dry_run:
@@ -1229,7 +1422,7 @@ def _refine_once(
                     diff_text = scrub_text(combined)
 
         # Journal the dry run so /refine audit shows it was considered.
-        _journal_nonmutation(
+        dry_run_entry_id = _journal_nonmutation(
             trigger=trigger,
             reason=safe_reason or "dry-run",
             session_id=session,
@@ -1237,11 +1430,24 @@ def _refine_once(
             outcome="dry_run",
             llm_meta=_run_llm_meta,
         )
+        if not dry_run_entry_id:
+            return {
+                "success": False,
+                "outcome": "journal_error",
+                "message": "Dry-run proposal was generated, but its journal write failed.",
+                "proposal": dry_proposal,
+                "evidence": evidence_summary,
+                "llm_called": True,
+                "llm_meta": _run_llm_meta,
+                "reversible": False,
+                "edits_applied": 0,
+            }
 
         return {
             "success": True,
             "outcome": "dry_run",
             "message": "Dry run: proposal shown, nothing applied.",
+            "journal_id": dry_run_entry_id,
             "proposal": dry_proposal,
             "diff": diff_text,
             "diff_truncated": truncated,
@@ -1330,6 +1536,7 @@ def _apply_edit(
             outcome="rejected",
             error=guardrail_error,
             group=group,
+            llm_meta=llm_meta,
         )
         result = {
             "success": False,
@@ -1361,6 +1568,7 @@ def _apply_edit(
                 outcome="conflict",
                 error=conflict_a,
                 group=group,
+                llm_meta=llm_meta,
             )
             result = {
                 "success": False,
@@ -1383,6 +1591,7 @@ def _apply_edit(
                 outcome="error",
                 error=error,
                 group=group,
+                llm_meta=llm_meta,
             )
             return {
                 "success": False,
@@ -1419,6 +1628,7 @@ def _apply_edit(
                 backup_path=retained_backup_path,
                 error=conflict_b,
                 group=group,
+                llm_meta=llm_meta,
             )
             result = {
                 "success": False,
@@ -1451,6 +1661,7 @@ def _apply_edit(
                 outcome="error",
                 error=error,
                 group=group,
+                llm_meta=llm_meta,
             )
             return {
                 "success": False,
@@ -1475,6 +1686,7 @@ def _apply_edit(
                 outcome="error",
                 error=error,
                 group=group,
+                llm_meta=llm_meta,
             )
             return {
                 "success": False,
@@ -1495,6 +1707,7 @@ def _apply_edit(
             recovery=recovery,
             group=group,
             snapshot=snapshot,
+            llm_meta=llm_meta,
         )
     except Exception as exc:
         return {
@@ -1664,6 +1877,7 @@ def _apply_transaction(
             proposal=proposal,
             outcome="rejected",
             error=error,
+            llm_meta=llm_meta,
         )
         return {
             "success": False,
@@ -1740,6 +1954,7 @@ def _apply_transaction(
                     outcome="conflict",
                     error=conflict_msg,
                     group=edit_group(index),
+                    llm_meta=llm_meta,
                 )
             else:
                 _journal_nonmutation(
@@ -1750,6 +1965,7 @@ def _apply_transaction(
                     outcome="rejected",
                     error=conflict_msg,
                     group=edit_group(index),
+                    llm_meta=llm_meta,
                 )
         return {
             "success": False,
@@ -1800,6 +2016,7 @@ def _apply_transaction(
             outcome="rejected",
             error=stop_reason or "Edit was not attempted",
             group=edit_group(index),
+            llm_meta=llm_meta,
         )
 
     # "Recoverable" is deliberately wider than "successful": an edit whose host

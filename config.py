@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+_RUNTIME_JOURNAL_DIR: Optional[Path] = None
+_RUNTIME_JOURNAL_COMMIT_MARKER: Optional[Path] = None
 
 
 def hermes_home() -> Path:
@@ -24,6 +26,10 @@ def hermes_home() -> Path:
         from hermes_constants import get_hermes_home
         return Path(get_hermes_home())
     except Exception:
+        if os.name == "nt":
+            local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+            if local_app_data:
+                return Path(local_app_data) / "hermes"
         return Path(os.path.expanduser("~/.hermes"))
 
 
@@ -369,9 +375,34 @@ def effective_llm_target() -> Dict[str, Any]:
     return {"provider": "", "model": "", "source": "host_default", "issues": issues}
 
 
+def _set_runtime_journal_dir(
+    path: Optional[Path], *, commit_marker: Optional[Path] = None
+) -> None:
+    """Select a fallback store until another process publishes its successor."""
+    global _RUNTIME_JOURNAL_DIR, _RUNTIME_JOURNAL_COMMIT_MARKER
+    _RUNTIME_JOURNAL_DIR = Path(path) if path is not None else None
+    _RUNTIME_JOURNAL_COMMIT_MARKER = (
+        Path(commit_marker) if commit_marker is not None else None
+    )
+
+
 def journal_dir() -> Path:
+    global _RUNTIME_JOURNAL_DIR, _RUNTIME_JOURNAL_COMMIT_MARKER
     default = hermes_home() / "refine"
-    return Path(get_str("journal_dir", str(default)))
+    configured = get_str("journal_dir", "").strip()
+    if configured:
+        return Path(configured)
+    if _RUNTIME_JOURNAL_DIR is not None:
+        marker = _RUNTIME_JOURNAL_COMMIT_MARKER
+        if marker is not None and marker.is_file():
+            # A different process completed the migration after this one fell
+            # back. Switch before the next path is resolved; do not recreate the
+            # renamed legacy directory.
+            _RUNTIME_JOURNAL_DIR = None
+            _RUNTIME_JOURNAL_COMMIT_MARKER = None
+            return marker.parent
+        return _RUNTIME_JOURNAL_DIR
+    return default
 
 
 def legacy_journal_dir() -> Path:
