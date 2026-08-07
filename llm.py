@@ -41,8 +41,18 @@ def _pinned_target() -> Dict[str, str]:
     This function filters the effective target through trust flags so that a
     plugin installation without ``allow_model_override`` silently falls back to
     the host default instead of causing PluginLlmTrustError on every call.
+
+    Never raises. It is evaluated while the call arguments are being assembled,
+    before any failure-tagging path exists, so an exception here would be reported
+    as a generic LLM failure and journaled as an ordinary no_op with success=true.
     """
-    effective = config.effective_llm_target()
+    try:
+        effective = config.effective_llm_target()
+    except Exception as exc:
+        logger.warning(
+            "Cannot resolve the refine model target: %s", scrub_text(str(exc))
+        )
+        return {}
     target: Dict[str, str] = {}
     provider = effective.get("provider", "")
     model = effective.get("model", "")

@@ -406,6 +406,25 @@ def refine_status() -> Dict[str, Any]:
     jdir = config.journal_dir()
     jdir_state = _journal_dir_state(jdir)
 
+    # The effective model belongs in this report. A pinned model that no provider
+    # serves turns every pass into an ordinary no_op, and without it here the
+    # report would answer "blockers: none" while nothing can possibly succeed.
+    try:
+        target = config.effective_llm_target()
+    except Exception:
+        # "unknown", not "host_default": a config key or override file may still
+        # pin something, and this report must not claim a resolution it failed to
+        # perform.
+        target = {
+            "provider": "", "model": "", "source": "unknown",
+            "issues": ["the effective model could not be resolved"],
+        }
+    try:
+        model_allowed = config.llm_allow_model_override()
+        provider_allowed = config.llm_allow_provider_override()
+    except Exception:
+        model_allowed = provider_allowed = False
+
     # Read journal-derived numbers only when a journal actually exists, so a
     # mistyped journal_dir is reported rather than silently created.
     journal_present = False
@@ -500,6 +519,50 @@ def refine_status() -> Dict[str, Any]:
                 "cannot confirm refinement is able to run"
             ),
         })
+    target_issues = [str(item) for item in target.get("issues", []) if item]
+    if target_issues:
+        # A discarded value must not be visible only in a log line: the file or
+        # config key still pins something while this report names another target.
+        warnings.append({
+            "code": "model_target_issue",
+            "message": "; ".join(target_issues),
+        })
+    if target["source"] == "command":
+        warnings.append({
+            "code": "model_override_active",
+            # Deliberately does not say the override pinned each field: when it
+            # sets only one, the other comes from the config and survives
+            # '/refine model auto'. Claiming otherwise would describe a state
+            # this report did not verify.
+            "message": (
+                "A '/refine model' override is in force; the effective target is "
+                f"{target['model'] or '(host default)'}"
+                + (f" on provider {target['provider']}" if target["provider"] else "")
+                + ". '/refine model auto' removes the override; any value also set "
+                  "in plugins.entries.refine.llm stays in effect after that"
+            ),
+        })
+    # A value the host will refuse is dropped before the call, so it can only be
+    # noticed here. Reported per field, because the denied one may be either.
+    if target["source"] in ("command", "config"):
+        if target["model"] and not model_allowed:
+            warnings.append({
+                "code": "model_override_trust_denied",
+                "message": (
+                    f"Model {target['model']} is set but host trust denies model "
+                    "overrides, so it is dropped before the call; set "
+                    "plugins.entries.refine.llm.allow_model_override to apply it"
+                ),
+            })
+        if target["provider"] and not provider_allowed:
+            warnings.append({
+                "code": "provider_override_trust_denied",
+                "message": (
+                    f"Provider {target['provider']} is set but host trust denies "
+                    "provider overrides, so it is dropped before the call; set "
+                    "plugins.entries.refine.llm.allow_provider_override to apply it"
+                ),
+            })
 
     return {
         "config_readable": config_readable,
@@ -520,6 +583,12 @@ def refine_status() -> Dict[str, Any]:
         "journal_dir_state": jdir_state,
         "journal_dir_state_text": _JOURNAL_DIR_STATE_TEXT.get(jdir_state, jdir_state),
         "journal_dir_is_plugin_source": plugin_source_collision,
+        "llm_model": target["model"],
+        "llm_provider": target["provider"],
+        "llm_target_source": target["source"],
+        "llm_target_issues": target_issues,
+        "llm_model_allowed": model_allowed,
+        "llm_provider_allowed": provider_allowed,
         "blockers": blockers,
         "blocker_codes": [b["code"] for b in blockers],
         "warnings": warnings,

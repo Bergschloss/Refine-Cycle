@@ -238,57 +238,89 @@ def _on_post_llm_call(
     _start_auto_refine(session_id, _assistant_turn_count(conversation_history))
 
 
-_MODEL_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9._:\-]{1,120}$")
+_MODEL_SUBCOMMAND = "model"
+
+
+def _is_model_target(remainder: str) -> bool:
+    """Whether text is exactly ``<model>`` or ``<provider>/<model>``.
+
+    Only the first slash separates provider from model; any further ones belong to
+    the model id, which is commonly namespaced (``openrouter/deepseek/deepseek-chat``).
+    Rejecting those made the command start a real refine pass instead — spending a
+    daily edit on a mistyped setting.
+
+    Anything else — prose, an empty half such as ``a/`` or ``/b`` — is a free-form
+    reason and must reach the proposal path untouched. The rule itself lives in
+    ``journal``, which owns the store.
+    """
+    head, separator, tail = remainder.partition("/")
+    if not journal.valid_model_identifier(head):
+        return False
+    if not separator:
+        return True
+    return bool(tail) and journal.valid_model_id(tail)
 
 
 def _handle_model_subcommand(remainder: str) -> str:
     """Handle /refine model [auto | <provider/model> | <model>]."""
+    trust_model = config.llm_allow_model_override()
+    trust_prov = config.llm_allow_provider_override()
+
     if not remainder:
         # Show current effective target
         effective = config.effective_llm_target()
-        model = effective.get("model") or "(host default)"
-        provider = effective.get("provider") or "(host default)"
         source = effective["source"]
-        trust_model = config.llm_allow_model_override()
-        trust_prov = config.llm_allow_provider_override()
+        set_model = effective.get("model", "")
+        set_provider = effective.get("provider", "")
         lines = [
-            f"model: {model}",
-            f"provider: {provider}",
+            f"model: {set_model or '(host default)'}",
+            f"provider: {set_provider or '(host default)'}",
             f"source: {source}",
             f"trust: model={'allowed' if trust_model else 'denied'}, "
             f"provider={'allowed' if trust_prov else 'denied'}",
         ]
-        if not trust_model and source in ("command", "config", "live"):
-            lines.append(
-                "⚠ Model is set but host trust denies overrides. "
-                "Enable plugins.entries.refine.llm.allow_model_override to apply it."
-            )
+        for issue in effective.get("issues", ()):
+            lines.append(f"⚠ {issue}")
+        # Only warn where trust actually changes the outcome. On ``live`` the
+        # user set nothing and the host uses that model regardless, so warning
+        # there would report a problem that does not exist.
+        if source in ("command", "config"):
+            if set_model and not trust_model:
+                lines.append(
+                    "⚠ Model is set but host trust denies overrides. "
+                    "Enable plugins.entries.refine.llm.allow_model_override to apply it."
+                )
+            if set_provider and not trust_prov:
+                lines.append(
+                    "⚠ Provider is set but host trust denies overrides. Enable "
+                    "plugins.entries.refine.llm.allow_provider_override to apply it."
+                )
         return core.scrub_text("\n".join(lines))
 
     if remainder == "auto":
-        journal.clear_model_override()
+        outcome = journal.clear_model_override()
         effective = config.effective_llm_target()
+        prefix = {
+            "removed": "Override removed.",
+            "absent": "No override was set.",
+            # Does not claim the override is "still in force": the file surviving
+            # and the file being usable are different things, and the effective
+            # target printed next is the accurate answer either way.
+            "failed": "⚠ Could not remove the override file.",
+        }[outcome]
         return core.scrub_text(
-            f"Override removed. Effective model: {effective.get('model') or '(host default)'} "
+            f"{prefix} Effective model: {effective.get('model') or '(host default)'} "
             f"(source: {effective['source']})"
         )
 
-    # Parse provider/model or bare model
+    # Parse provider/model or bare model. The store validates and refuses; doing
+    # it again here would put the same rule in two places that could drift.
     provider = ""
     model = remainder
     if "/" in remainder:
-        parts = remainder.split("/", 1)
-        provider = parts[0]
-        model = parts[1]
-
-    if not _MODEL_IDENTIFIER_PATTERN.fullmatch(model):
-        return f"Invalid model identifier: {model!r}"
-    if provider and not _MODEL_IDENTIFIER_PATTERN.fullmatch(provider):
-        return f"Invalid provider identifier: {provider!r}"
+        provider, model = remainder.split("/", 1)
 
     journal.write_model_override(provider, model)
-    trust_model = config.llm_allow_model_override()
-    trust_prov = config.llm_allow_provider_override()
     lines = [f"Override set: model={model}" + (f" provider={provider}" if provider else "")]
     if not trust_model:
         lines.append(
@@ -326,6 +358,9 @@ def _handle_refine_command(raw_args: str) -> Optional[str]:
             f"min messages: {status['auto_min_messages']}",
             f"cooldown: {status['auto_cooldown_minutes']} min",
             f"edits today: {status['edits_today']}/{status['max_edits_per_day']}",
+            f"model: {status['llm_model'] or '(host default)'}"
+            + (f" @ {status['llm_provider']}" if status["llm_provider"] else "")
+            + f" (source: {status['llm_target_source']})",
             f"journal: {status['journal_dir']} ({status['journal_dir_state_text']})",
         ]
         if status["cooldown_remaining_minutes"] > 0:
@@ -342,18 +377,22 @@ def _handle_refine_command(raw_args: str) -> Optional[str]:
             lines.extend(f"  ⚠ {item['message']}" for item in status["warnings"])
         return core.scrub_text("\n".join(lines))
 
-    if args == "model" or args.startswith("model "):
-        remainder = args[5:].strip()
+    if args == _MODEL_SUBCOMMAND or args.startswith(_MODEL_SUBCOMMAND + " "):
+        remainder = args[len(_MODEL_SUBCOMMAND):].strip()
         # Only treat as a subcommand when:
         # - no remainder (show current)
         # - remainder is "auto"
-        # - remainder is a valid model identifier (possibly with one slash)
+        # - remainder is exactly a model or provider/model token
         # Anything else ("model of gmail failures") is a free-form reason.
-        if not remainder or remainder == "auto":
-            return _handle_model_subcommand(remainder)
-        parts = remainder.split("/", 1)
-        if all(_MODEL_IDENTIFIER_PATTERN.fullmatch(p) for p in parts if p):
-            return _handle_model_subcommand(remainder)
+        if not remainder or remainder == "auto" or _is_model_target(remainder):
+            try:
+                return _handle_model_subcommand(remainder)
+            except Exception as exc:
+                # The other subcommands report failures; this one used to escape
+                # as a traceback on exactly the unwritable journal_dir that
+                # /refine status exists to diagnose.
+                logger.exception("refine model command failed")
+                return f"❌ Model command failed: {core.scrub_text(str(exc))}"
         # Fall through to the proposal path below
 
     if args == "rollback":
@@ -493,8 +532,11 @@ def register(ctx) -> None:
     ctx.register_command(
         "refine",
         _handle_refine_command,
-        description="Self-improve skills/memory. Usage: /refine [reason|audit|status|rollback <id>]",
-        args_hint="[reason | audit | status | rollback <id>]",
+        description=(
+            "Self-improve skills/memory. "
+            "Usage: /refine [reason|audit|status|model [target|auto]|rollback <id>]"
+        ),
+        args_hint="[reason | audit | status | model [target|auto] | rollback <id>]",
     )
     ctx.register_tool(
         "refine_run",

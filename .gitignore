@@ -9,6 +9,7 @@ venv/
 refine_journal.jsonl
 skill_stats.json
 prompt_notes.json
+model_override.json
 backups/
 *.bak
 
