@@ -1123,14 +1123,12 @@ class RefineTests(unittest.TestCase):
         path.write_text(original, encoding="utf-8")
         # Corrupt the file so JSON parse fails.
         path.write_text("{bad json", encoding="utf-8")
-        # record_edit must not succeed and must not overwrite.
-        try:
+        # record_edit must surface the unreadable ledger and must not overwrite it.
+        with self.assertRaises(IOError):
             ledger.record_edit(
                 {"name": "new-skill", "kind": "skill", "action": "create"},
                 "j-new",
             )
-        except Exception:
-            pass
         self.assertEqual(path.read_text(encoding="utf-8"), "{bad json")
 
     def test_ledger_absent_file_is_not_an_error(self):
@@ -7729,6 +7727,22 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
         """R7-06: two sessions at session threshold -> signal."""
         two_sessions = [{"count": 1, "sessions_seen": 2}]
         self.assertTrue(patterns.has_signal(two_sessions, [], min_count=2))
+
+    def test_merge_patterns_retains_cross_session_threshold(self):
+        """R9-09: cross-session aggregation must keep the >=2 session signal."""
+        merged = patterns.merge_patterns(
+            [{
+                "fingerprint": "shared", "count": 1, "sessions_seen": 1,
+                "first_ts": 20, "last_ts": 20,
+            }],
+            [{
+                "fingerprint": "shared", "count": 2, "sessions_seen": 2,
+                "first_ts": 10, "last_ts": 30,
+            }],
+        )
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["sessions_seen"], 2)
+        self.assertTrue(patterns.has_signal(merged, [], min_count=3))
 
     def test_signal_correction_with_no_patterns_returns_true(self):
         """R7-06: explicit correction with no patterns -> signal."""
