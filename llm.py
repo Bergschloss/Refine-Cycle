@@ -104,6 +104,14 @@ def _pinned_target() -> Dict[str, str]:
             "Cannot resolve the refine model target: %s", scrub_text(str(exc))
         )
         return {}
+    # A "live" target is the host's own current model read back via a private API.
+    # Sending it back as an explicit kwarg gains nothing (omission resolves to
+    # the same value through the host's auto path) and can fail hard when the
+    # accessor's name disagrees with the provider registry key.  Only targets
+    # the user explicitly chose (command or config) are sent.
+    source = effective.get("source", "host_default")
+    if source not in ("command", "config"):
+        return {}
     target: Dict[str, str] = {}
     provider = effective.get("provider", "")
     model = effective.get("model", "")
@@ -200,8 +208,26 @@ PROMPT_NOTE_ACTION_EXAMPLES = (
     "ask before retrying a third time",
     "check timing assumptions before rerunning",
     "mention which sections were skipped",
+    "include the required parameters",
+    "provide the missing fields",
 )
-_PROMPT_NOTE_ACTION_GUIDANCE = "; ".join(PROMPT_NOTE_ACTION_EXAMPLES)
+# The system prompt shows a SHORT representative subset — one per action class —
+# so the model learns the shape without copying a phrasebook verbatim.  The full
+# PROMPT_NOTE_ACTION_EXAMPLES drives the anti-drift test and must all pass the
+# validator, but the model need not see every accepted form to generalise.
+_PROMPT_NOTE_GUIDANCE_EXAMPLES = (
+    "retry the request",
+    "log the error",
+    "verify the expected endpoint",
+    "ask for clarification",
+    "avoid unsupported claims",
+    "keep the response concise",
+    "mention the limitation plainly",
+    "include the required fields",
+    "summarize the common cause",
+    "redact credentials",
+)
+_PROMPT_NOTE_ACTION_GUIDANCE = "; ".join(_PROMPT_NOTE_GUIDANCE_EXAMPLES)
 
 REFINE_SYSTEM_PROMPT = (
     "You are a self-improvement mechanic for an AI agent named Hermes. Read the "

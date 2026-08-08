@@ -107,7 +107,8 @@ _PROMPT_NOTE_SAFE_ACTION = re.compile(
         | summarize\s+(?:the\s+)?(?:common\s+cause|error|failure|result|outcome)
         | use\s+the\s+(?:supplied|provided|exact)\s+(?:spelling|name|format)
         | wait\s+for\s+(?:clarification|confirmation|approval|input)
-        | (?:always\s+)?(?:include|provide|supply|set|pass)\s+(?:both\s+|all\s+)?(?:the\s+)?(?:required\s+)?[\u2018\u2019](?:path|content)[\u2018\u2019](?:\s*(?:,|and|or)\s*[\u2018\u2019](?:path|content)[\u2018\u2019])*\s+(?:fields?|arguments?|parameters?|values?|keys?)
+        | (?:always\s+)?(?:include|provide|supply|set|pass)\s+(?:both\s+|all\s+)?(?:the\s+)?(?:required\s+)?(?:missing\s+)?(?:fields?|arguments?|parameters?|values?|keys?)
+        | (?:always\s+)?(?:include|provide|supply|set|pass)\s+(?:both\s+|all\s+)?(?:the\s+)?(?:required\s+)?['"\u2018\u2019][a-z_]{{1,30}}['"\u2018\u2019](?:\s*(?:,|and|or)\s*['"\u2018\u2019][a-z_]{{1,30}}['"\u2018\u2019])*\s+(?:fields?|arguments?|parameters?|values?|keys?)
         | (?:always\s+)?include\s+both\s+path\s+and\s+content\s+fields?
         | (?:always\s+)?include\s+both\s+required\s+fields?\s*:\s*path\s+and\s+content
         | ask\s+before\s+retrying(?:\s+(?:a|the)\s+third\s+time)?
@@ -1503,11 +1504,15 @@ def _refine_once(
     try:
         _effective = config.effective_llm_target()
         _run_target: Dict[str, str] = {}
-        if _effective.get("provider") and config.llm_allow_provider_override():
-            _run_target["provider"] = _effective["provider"]
-        if _effective.get("model") and config.llm_allow_model_override():
-            _run_target["model"] = _effective["model"]
         _run_target_source = _effective.get("source", "host_default")
+        # Only targets the user explicitly chose are sent to the host.  A "live"
+        # target is the host's own current model; re-sending it converts an
+        # implicit working resolution into an explicit one that can fail.
+        if _run_target_source in ("command", "config"):
+            if _effective.get("provider") and config.llm_allow_provider_override():
+                _run_target["provider"] = _effective["provider"]
+            if _effective.get("model") and config.llm_allow_model_override():
+                _run_target["model"] = _effective["model"]
         _run_target_issues = [str(i) for i in _effective.get("issues", []) if i]
     except Exception:
         _run_target = {}

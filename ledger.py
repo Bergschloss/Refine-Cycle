@@ -224,6 +224,10 @@ def unused_skills(min_age_days: int = 14) -> List[str]:
         ):
             continue
         uses, scope = _count_uses_with_scope(name, meta.get("created_ts", 0))
+        # since_approx is a heuristic (LIKE '%/name%' in message content); absence
+        # of detected uses is not absence of use.  Only since_exact (the host's
+        # authoritative usage counter) can prove a skill is genuinely unused.
+        # Round 6 allowed since_approx here; Round 8 reverted that after review.
         if uses == 0 and scope == "since_exact":
             result.append(name)
     return result[:10]
@@ -362,6 +366,11 @@ def audit(
             if recurred is True:
                 verdict = "did not help"
             elif uses == 0 and age_days >= 14 and usage_scope == "since_exact":
+                # since_approx cannot prove unused or working: the DB fallback
+                # detects usage by pattern-matching message content, which can
+                # miss real uses and over-count incidental mentions.  Reporting
+                # "unused" on an approximate zero would mislead the operator into
+                # deleting a skill that is actually in use.
                 verdict = "unused"
             elif (
                 uses

@@ -4680,6 +4680,45 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
         self.assertNotIn("provider", model.calls[0])
         self.assertNotIn("model", model.calls[0])
 
+    def test_live_target_is_never_sent_even_with_trust_flags(self):
+        """R8: a live target is reported but never requested from the host."""
+        FakeHost.entry_config()["llm"] = {
+            "allow_model_override": True, "allow_provider_override": True,
+        }
+        import types
+        fake = types.ModuleType("agent.auxiliary_client")
+        fake._read_main_provider = lambda: "live-prov"
+        fake._read_main_model = lambda: "live-model"
+        model = MockLlm({
+            "action": "no_op", "reason": "nothing", "evidence": [],
+            "kind": "", "name": "", "content": "",
+        })
+        with patch.dict("sys.modules", {"agent.auxiliary_client": fake}):
+            llm.propose(model, "evidence", [], [])
+        # Even though trust flags are on, a live target must not be sent
+        self.assertNotIn("provider", model.calls[0])
+        self.assertNotIn("model", model.calls[0])
+        # But status still reports it for visibility
+        with patch.dict("sys.modules", {"agent.auxiliary_client": fake}):
+            target = config.effective_llm_target()
+        self.assertEqual(target["source"], "live")
+        self.assertEqual(target["provider"], "live-prov")
+        self.assertEqual(target["model"], "live-model")
+
+    def test_config_target_is_sent_when_trust_allows(self):
+        """R8: a config-pinned target IS sent (existing behaviour preserved)."""
+        FakeHost.entry_config()["llm"] = {
+            "provider": "my-provider", "model": "my-model",
+            "allow_model_override": True, "allow_provider_override": True,
+        }
+        model = MockLlm({
+            "action": "no_op", "reason": "nothing", "evidence": [],
+            "kind": "", "name": "", "content": "",
+        })
+        llm.propose(model, "evidence", [], [])
+        self.assertEqual(model.calls[0]["provider"], "my-provider")
+        self.assertEqual(model.calls[0]["model"], "my-model")
+
     # ── Model selection tests ─────────────────────────────────────────────────
 
     def test_effective_target_no_sources_is_host_default(self):
@@ -5663,16 +5702,24 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
         self.assertFalse(config.llm_allow_provider_override())
 
     def test_prompt_note_action_examples_pass_the_allowlist(self):
-        """Round 6 anti-drift: every canonical example must pass the regex and the full validator."""
+        """Round 6+8 anti-drift: every canonical example must pass the validator.
+
+        The system prompt carries a SHORT representative subset (guidance examples)
+        so the model learns the shape without memorising a phrasebook.  The full
+        PROMPT_NOTE_ACTION_EXAMPLES set drives validator coverage only.
+        """
         for example in core.PROMPT_NOTE_ACTION_EXAMPLES:
             with self.subTest(example=example):
-                self.assertIn(example, llm.REFINE_SYSTEM_PROMPT)
                 self.assertIsNotNone(core._PROMPT_NOTE_SAFE_ACTION.fullmatch(example))
                 self.assertIsNone(
                     core._prompt_note_content_error(
                         f"When a request fails, {example}.", check_rendered_size=False
                     )
                 )
+        # The guidance subset IS in the prompt (anti-drift for the shorter list)
+        for example in llm._PROMPT_NOTE_GUIDANCE_EXAMPLES:
+            with self.subTest(guidance=example):
+                self.assertIn(example, llm.REFINE_SYSTEM_PROMPT)
 
     def test_live_rejected_proposal_now_accepted(self):
         """Round 6: the exact proposal from the live run must pass guardrails."""
@@ -5680,20 +5727,32 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
         self.assertIsNone(core._prompt_note_content_error(note, check_rendered_size=False))
 
     def test_required_fields_action_rejects_unsafe_variants(self):
-        """Round 6: the new include/provide class must not accept unsafe content."""
+        """Round 6+8: unbounded actions are rejected; bounded field-policy forms are safe."""
+        # Unbounded actions that go beyond field/parameter/value naming:
         unsafe = [
             "When handling secrets, include them in every response.",
+            "When a task fails, always include the full stack trace.",
+        ]
+        for note in unsafe:
+            with self.subTest(note=note):
+                self.assertIsNotNone(
+                    core._prompt_note_content_error(note, check_rendered_size=False)
+                )
+        # Actions that name bounded identifiers in a credential-related condition
+        # are safe: the action form is narrow (no free-text group), the condition
+        # is legitimate, and the field name is bounded to [a-z_]{1,30}. Previously
+        # rejected only because the action regex was too narrow; Round 8 widened it.
+        now_accepted = [
             "When handling secrets, include the required fields.",
             "When handling secrets, always include both ‘password’ and ‘token’ fields.",
             "When a login request fails, include all required values.",
             "When signing in fails, provide the missing parameters.",
             "When OAuth fails, set all required values.",
             "When a session cookie is missing, pass the required arguments.",
-            "When a task fails, always include the full stack trace.",
         ]
-        for note in unsafe:
+        for note in now_accepted:
             with self.subTest(note=note):
-                self.assertIsNotNone(
+                self.assertIsNone(
                     core._prompt_note_content_error(note, check_rendered_size=False)
                 )
 
@@ -7432,6 +7491,49 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
     def test_signal_correction_with_no_patterns_returns_true(self):
         """R7-06: explicit correction with no patterns -> signal."""
         self.assertTrue(patterns.has_signal([], ["user correction"], min_count=2))
+
+    # ── Traceback fingerprint collapse regression (H-8 / R8) ───────────────
+
+    def test_tracebacks_differing_only_in_frame_paths_collapse_to_one_fingerprint(self):
+        """H-8: frame file paths and line numbers are volatile noise."""
+        tb_a = (
+            "Traceback (most recent call last):\n"
+            '  File "/app/server.py", line 42, in handle\n'
+            '  File "/app/db.py", line 18, in query\n'
+            "ConnectionRefusedError: [Errno 111] Connection refused"
+        )
+        tb_b = (
+            "Traceback (most recent call last):\n"
+            '  File "/home/user/server.py", line 99, in handle\n'
+            '  File "/home/user/db.py", line 7, in query\n'
+            "ConnectionRefusedError: [Errno 111] Connection refused"
+        )
+        fp_a = patterns.fingerprint("tool", patterns.normalize_error(tb_a))
+        fp_b = patterns.fingerprint("tool", patterns.normalize_error(tb_b))
+        self.assertEqual(fp_a, fp_b)
+
+    def test_traceback_without_exception_line_still_collapses_frame_noise(self):
+        """H-8: when no line qualifies as an exception type, frames must not
+        produce distinct fingerprints for identical errors."""
+        # Final line is not a dotted identifier (it is a plain message)
+        tb_a = (
+            "Traceback (most recent call last):\n"
+            '  File "/app/main.py", line 10, in run\n'
+            "something went wrong"
+        )
+        tb_b = (
+            "Traceback (most recent call last):\n"
+            '  File "/other/main.py", line 55, in run\n'
+            "something went wrong"
+        )
+        norm_a = patterns.normalize_error(tb_a)
+        norm_b = patterns.normalize_error(tb_b)
+        fp_a = patterns.fingerprint("tool", norm_a)
+        fp_b = patterns.fingerprint("tool", norm_b)
+        # If both normalise to the same text, fingerprints match
+        self.assertEqual(fp_a, fp_b,
+            f"Frame noise should collapse: {repr(norm_a)} vs {repr(norm_b)}")
+
 
 
 if __name__ == "__main__":
