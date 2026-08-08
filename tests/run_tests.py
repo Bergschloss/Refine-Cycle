@@ -4371,6 +4371,44 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
         self.assertGreaterEqual(len(conflict_entries), 1)
         self.assertGreaterEqual(len(rejected_entries), 1)
 
+    def test_transaction_rejects_duplicate_skill_patches_before_mutation(self):
+        """R9-08: overlapping patches reject before host writes or budget use."""
+        FakeHost.entry_config()["max_edits_per_day"] = 1
+        name = "txn-duplicate-patch"
+        original = skill_content(name, "# Original")
+        FakeHost.add_skill(name, original)
+        multi = {
+            "action": "multi", "kind": "", "name": "", "content": "",
+            "summary": "Conflicting changes", "reason": "test", "evidence": [],
+            "edits": [
+                {
+                    "action": "patch", "kind": "skill", "name": name,
+                    "content": skill_content(name, "# First change"),
+                    "reason": "test", "evidence": [],
+                    "refine_baseline": baseline_for(original),
+                },
+                {
+                    "action": "patch", "kind": "skill", "name": name,
+                    "content": skill_content(name, "# Second change"),
+                    "reason": "test", "evidence": [],
+                    "refine_baseline": baseline_for(original),
+                },
+            ],
+        }
+        result = core._apply_transaction(
+            multi, trigger="manual", safe_reason="test",
+            session="session", started=time.time()
+        )
+        self.assertFalse(result["success"])
+        self.assertEqual(result["edits_applied"], 0)
+        self.assertIn("overlapping edits in this transaction", result["message"])
+        self.assertEqual(FakeHost.skills[name], original)
+        self.assertEqual(FakeHost.actions, [])
+        self.assertFalse(journal.daily_limit_reached())
+        entries = journal.entries()
+        self.assertEqual(len(entries), 2)
+        self.assertTrue(all(entry.get("outcome") == "rejected" for entry in entries))
+
     def test_legacy_proposal_without_baseline_is_rejected(self):
         """R7-02: a skill patch without refine_baseline is refused before apply."""
         name = "legacy-no-base"

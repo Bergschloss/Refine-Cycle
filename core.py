@@ -2454,6 +2454,56 @@ def _apply_transaction(
     results: List[Dict[str, Any]] = []
     stop_reason = ""
 
+    # ── Overlap preflight: two patches to the same skill share a mutable
+    # target, so their independent baselines cannot both remain valid. Refuse
+    # the whole transaction before any backup, host mutation, or budget use.
+    patch_targets: Dict[str, List[int]] = {}
+    for index, edit in enumerate(edits):
+        normalized = edit_proposal(edit)
+        if (
+            normalized.get("kind") == "skill"
+            and normalized.get("action") == "patch"
+        ):
+            target = str(normalized.get("name", "")).strip()
+            if target:
+                patch_targets.setdefault(target, []).append(index)
+    overlapping = {
+        target: indexes
+        for target, indexes in patch_targets.items()
+        if len(indexes) > 1
+    }
+    if overlapping:
+        rendered_targets = ", ".join(
+            f"{target!r} at index {indexes}"
+            for target, indexes in sorted(overlapping.items())
+        )
+        conflict_msg = (
+            "Transaction rejected: overlapping edits in this transaction "
+            f"({rendered_targets})"
+        )
+        for index, edit in enumerate(edits):
+            _journal_nonmutation(
+                trigger=trigger,
+                reason=safe_reason,
+                session_id=session,
+                proposal=edit_proposal(edit),
+                outcome="rejected",
+                error=conflict_msg,
+                group=edit_group(index),
+                llm_meta=llm_meta,
+            )
+        return {
+            "success": False,
+            "outcome": "failed",
+            "message": conflict_msg,
+            "proposal": proposal,
+            "results": [],
+            "recoveries": [],
+            "journal_ids": [],
+            "reversible": False,
+            "edits_applied": 0,
+        }
+
     # ── Stale-plan preflight: reject the entire transaction if any skill patch
     # was built from content that no longer matches the live host state. This
     # prevents a partial apply where edit #1 succeeds but edit #2 would conflict.
