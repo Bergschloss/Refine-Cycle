@@ -22,8 +22,19 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 _UNTRUSTED_TOOL_TAG = re.compile(
-    r"<\s*/?\s*untrusted_tool_result\s*>", re.IGNORECASE
+    r"<\s*/?\s*untrusted_tool_result[^>]*>", re.IGNORECASE
 )
+
+
+def _strip_untrusted_tags(text: str) -> str:
+    """Remove forged boundary tags until nested syntax reaches a fixed point."""
+    previous = None
+    while previous != text:
+        previous = text
+        text = _UNTRUSTED_TOOL_TAG.sub("", text)
+    return text
+
+
 _RECORD_SEPARATOR = re.compile(r"[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]+")
 _RESOURCE_REFERENCE = re.compile(
     r"""(?ix)
@@ -414,7 +425,7 @@ def collect_evidence(session_id: Optional[str] = None, limit: int = 60) -> Dict[
                     if len(content) <= 4000
                     else content[:1000] + "\n…\n" + content[-3000:]
                 )
-                pattern_content = _UNTRUSTED_TOOL_TAG.sub("", bounded)
+                pattern_content = _strip_untrusted_tags(bounded)
                 tool_errors.append({"tool": tool_name, "snippet": pattern_content[:300]})
                 error_items.append({
                     "tool": tool_name,
@@ -517,7 +528,7 @@ def collect_cross_session_patterns(
                     "tool": _one_line(
                         scrub_text(str(row["tool_name"] or ""))
                     )[:120],
-                    "content": _UNTRUSTED_TOOL_TAG.sub("", bounded),
+                    "content": _strip_untrusted_tags(bounded),
                     "session_id": sid,
                     "ts": row["timestamp"] or 0,
                 }
@@ -1589,7 +1600,7 @@ def _refine_once(
             # inside one plugin-owned boundary after removing forged variants.
             tool_name = _one_line(message.get("tool_name", ""))[:120]
             record = f"tool={tool_name or '?'} | {content}"
-            safe_record = _UNTRUSTED_TOOL_TAG.sub("", record)
+            safe_record = _strip_untrusted_tags(record)
             lines.append(
                 f"[tool] <untrusted_tool_result>{safe_record}</untrusted_tool_result>"
             )
