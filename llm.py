@@ -459,7 +459,7 @@ def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
             depth -= 1
             if depth == 0:
                 try:
-                    value = json.loads(text[start:index + 1])
+                    value = json.loads(text[start:index + 1], strict=False)
                 except json.JSONDecodeError:
                     start = None
                     continue
@@ -796,6 +796,9 @@ def _finalize_edit(
         if retry is not None:
             if retry.get("failure"):
                 return sanitize(retry)
+            for key in ("reason", "expected_outcome", "evidence", "pattern_fingerprint"):
+                if not retry.get(key) and parsed.get(key):
+                    retry[key] = parsed[key]
             parsed = retry
             action, kind, name, content, category = _normalize_fields(parsed)
 

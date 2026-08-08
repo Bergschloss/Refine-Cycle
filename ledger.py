@@ -224,7 +224,7 @@ def unused_skills(min_age_days: int = 14) -> List[str]:
         ):
             continue
         uses, scope = _count_uses_with_scope(name, meta.get("created_ts", 0))
-        if uses == 0 and scope == "since_exact":
+        if uses == 0 and scope in ("since_exact", "since_approx"):
             result.append(name)
     return result[:10]
 
@@ -299,6 +299,8 @@ def _merge_journal_stats(
         llm_meta = entry.get("llm_meta")
         if isinstance(llm_meta, dict) and llm_meta.get("reported_model"):
             meta["reported_model"] = scrub_text(str(llm_meta["reported_model"]))[:60]
+        elif isinstance(existing, dict) and existing.get("reported_model"):
+            meta["reported_model"] = existing["reported_model"]
         merged[key] = meta
     return merged
 
@@ -351,17 +353,21 @@ def audit(
             uses, usage_scope = _count_uses_with_scope(name, created)
             if fingerprint and patterns_available:
                 hit = by_fingerprint.get(fingerprint)
-                recurred = bool(hit and (hit.get("last_ts") or 0) > created)
+                # Pattern exists but has no last_ts -> still active (recurred)
+                if hit is not None and not (hit.get("last_ts") or 0) > created:
+                    recurred = True if hit.get("last_ts") is None else False
+                else:
+                    recurred = bool(hit and (hit.get("last_ts") or 0) > created)
 
             if recurred is True:
                 verdict = "did not help"
-            elif uses == 0 and age_days >= 14 and usage_scope == "since_exact":
+            elif uses == 0 and age_days >= 14 and usage_scope in ("since_exact", "since_approx"):
                 verdict = "unused"
             elif (
                 uses
                 and uses > 0
                 and recurred is False
-                and usage_scope == "since_exact"
+                and usage_scope in ("since_exact", "since_approx")
             ):
                 verdict = "working"
             else:

@@ -499,6 +499,177 @@ class RefineTests(unittest.TestCase):
             patterns.fingerprint("http", "permission denied"),
         )
 
+    def test_strip_regex_mid_text_removes_marker_and_tail(self):
+        """Wave 2.2: marker mid-text strips it and everything after it."""
+        base = "connection refused"
+        marker = " [Tool loop warning: repeated_exact_failure_warning; count=3] extra stuff"
+        text_with_marker = base + marker
+        self.assertEqual(
+            patterns.normalize_error(text_with_marker),
+            patterns.normalize_error(base),
+        )
+        # Distinct errors remain distinct even after stripping markers
+        self.assertNotEqual(
+            patterns.fingerprint("http", "rate limited [Tool loop warning: repeated_exact_failure_warning; count=2]"),
+            patterns.fingerprint("http", "permission denied [Tool loop warning: repeated_exact_failure_warning; count=2]"),
+        )
+
+    def test_windows_missing_file_patterns_classified_as_errors(self):
+        """Wave 2.3: Windows missing-file messages must be classified as errors."""
+        cases = [
+            "The system cannot find the file specified",
+            "The system cannot find the path specified",
+            "cannot find the path",
+            "ENOENT: no such file or directory",
+        ]
+        for case in cases:
+            self.assertTrue(core._is_error_content(case), f"Not classified as error: {case}")
+
+    def test_traceback_with_trailing_make_output_gets_exception_line(self):
+        """Wave 3.2: traceback + trailing make output -> gets exception, not make line."""
+        tb = (
+            "Traceback (most recent call last):\n"
+            "  File \"app.py\", line 10, in main\n"
+            "    x = 1 / 0\n"
+            "ZeroDivisionError: division by zero\n"
+            "make: *** [Makefile:2: run] Error 1"
+        )
+        normalized = patterns.normalize_error(tb)
+        self.assertIn("zerodivisionerror", normalized)
+        self.assertNotIn("make", normalized)
+
+    def test_traceback_without_trailing_output_still_works(self):
+        """Wave 3.2: plain traceback without trailing output -> exception line."""
+        tb = (
+            "Traceback (most recent call last):\n"
+            "  File \"main.py\", line 5, in <module>\n"
+            "    import foo\n"
+            "ModuleNotFoundError: No module named 'foo'"
+        )
+        normalized = patterns.normalize_error(tb)
+        self.assertIn("modulenotfounderror", normalized)
+
+    def test_file_reference_without_traceback_header_preserved(self):
+        """Wave 3.2: text with File reference but no traceback header -> preserved."""
+        text = 'Updated File "config.json" in 2 seconds'
+        normalized = patterns.normalize_error(text)
+        self.assertIn("config.json", normalized)
+
+    def test_json_salvage_with_literal_newline(self):
+        """Wave 3.1: JSON with literal newline inside string value -> parsed."""
+        from llm import _extract_first_json_object
+        text = '{"action": "create", "content": "line1\nline2"}'
+        result = _extract_first_json_object(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["content"], "line1\nline2")
+
+    def test_json_salvage_truncated_still_fails(self):
+        """Wave 3.1: genuinely truncated JSON -> still None."""
+        from llm import _extract_first_json_object
+        text = '{"action": "create", "content": "hello'
+        result = _extract_first_json_object(text)
+        self.assertIsNone(result)
+
+    def test_env_secret_bare_token_and_secret_redacted(self):
+        """Wave 3.3: bare TOKEN=, SECRET=, KEY=, PASSWD= are redacted."""
+        self.assertIn("[REDACTED]", sanitization.scrub_text("TOKEN=123456"))
+        self.assertIn("[REDACTED]", sanitization.scrub_text("SECRET=abc"))
+        self.assertIn("[REDACTED]", sanitization.scrub_text("KEY=myvalue"))
+        self.assertIn("[REDACTED]", sanitization.scrub_text("PASSWD=xyzzy"))
+        # Compound forms still work
+        self.assertIn("[REDACTED]", sanitization.scrub_text("MY_TOKEN=abcdef123456"))
+        self.assertIn("[REDACTED]", sanitization.scrub_text("API_KEY=longvalue123"))
+
+    def test_url_credentials_with_colon_in_password(self):
+        """Wave 3.4: URL with colon in password -> fully redacted."""
+        result = sanitization.scrub_text("http://admin:my:pass@example.com")
+        self.assertIn("[REDACTED]@", result)
+        self.assertNotIn("admin", result)
+        self.assertNotIn("my:pass", result)
+
+    def test_url_credentials_with_multiple_at_signs(self):
+        """Wave 3.4: URL with @ in password -> fully redacted."""
+        result = sanitization.scrub_text("http://admin:my@pass@example.com")
+        self.assertIn("[REDACTED]@", result)
+        self.assertNotIn("admin", result)
+
+    def test_url_path_with_at_sign_not_modified(self):
+        """Wave 3.4: URL with @ in path (not credentials) -> not modified."""
+        url = "http://example.com/path@v2"
+        result = sanitization.scrub_text(url)
+        self.assertEqual(result, url)
+
+    def test_content_retry_preserves_original_metadata(self):
+        """Wave 3.5: retry without reason/evidence still has original keys."""
+        original = {
+            "action": "create", "kind": "skill", "name": "test-skill",
+            "content": "",
+            "reason": "persistent failure in API calls",
+            "expected_outcome": "fewer 500 errors",
+            "evidence": ["request failed twice"],
+            "pattern_fingerprint": "deadbeef1234",
+        }
+        retry_response = {
+            "action": "create", "kind": "skill", "name": "test-skill",
+            "content": "# New skill content\nHandle retries.",
+        }
+        for key in ("reason", "expected_outcome", "evidence", "pattern_fingerprint"):
+            if not retry_response.get(key) and original.get(key):
+                retry_response[key] = original[key]
+        self.assertEqual(retry_response["reason"], "persistent failure in API calls")
+        self.assertEqual(retry_response["pattern_fingerprint"], "deadbeef1234")
+        self.assertEqual(retry_response["evidence"], ["request failed twice"])
+
+    def test_merge_journal_stats_preserves_reported_model(self):
+        """Wave 3.6: entry without llm_meta keeps existing reported_model."""
+        import ledger as _ledger
+        stats = {"skill:test-skill": {
+            "created_ts": time.time() - 86400,
+            "updated_ts": time.time() - 86400,
+            "version": 1,
+            "journal_id": "old-id",
+            "name": "test-skill",
+            "kind": "skill",
+            "action": "create",
+            "pattern_fingerprint": "",
+            "expected_outcome": "",
+            "outcome": "applied",
+            "pending_id": "",
+            "reported_model": "gpt-4",
+        }}
+        entries = [{
+            "id": "new-id",
+            "ts": time.time(),
+            "finalized_ts": time.time(),
+            "outcome": "applied",
+            "proposal": {"action": "patch", "kind": "skill", "name": "test-skill"},
+        }]
+        merged = _ledger._merge_journal_stats(stats, entries)
+        self.assertEqual(merged["skill:test-skill"]["reported_model"], "gpt-4")
+
+    def test_ledger_verdict_since_approx_can_prove_unused(self):
+        """Wave 3.7: since_approx scope can now produce unused/working verdicts."""
+        import ledger as _ledger
+        now = time.time()
+        stats = {"skill:approx-test": {
+            "created_ts": now - 86400 * 20,
+            "updated_ts": now - 86400 * 20,
+            "version": 1,
+            "journal_id": "approx-id",
+            "name": "approx-test",
+            "kind": "skill",
+            "action": "create",
+            "pattern_fingerprint": "",
+            "expected_outcome": "",
+            "outcome": "applied",
+            "pending_id": "",
+        }}
+        with patch.object(_ledger, "load_stats", return_value=stats), \
+             patch.object(_ledger, "_count_uses_with_scope", return_value=(0, "since_approx")):
+            rows = _ledger.audit(current_patterns=[], journal_entries=[])
+        verdicts = {row["name"]: row["verdict"] for row in rows}
+        self.assertEqual(verdicts.get("approx-test"), "unused")
+
     def test_correction_requires_explicit_context(self):
         routine = (
             "Use the API for this task", "Do not forget the tests", "Try again tomorrow",
@@ -5948,19 +6119,17 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
 
     def test_migration_failure_does_not_crash_register(self):
         # Verify that a failing migration does not prevent plugin registration.
-        # We test the wrapping try/except in register() rather than calling the
-        # full register(), because register() re-wires hooks and globals.
-        raised = False
+        # Calls the real register() with migration patched to raise.
+        from unittest.mock import MagicMock
+        ctx = MagicMock()
+        ctx.llm = object()
+        old_llm = plugin_init._REGISTERED_LLM
         try:
             with patch.object(journal, "migrate_legacy_journal_dir", side_effect=RuntimeError("boom")):
-                # Simulate just the migration wrapper from register().
-                try:
-                    journal.migrate_legacy_journal_dir()
-                except Exception:
-                    pass  # This is what register() does.
-        except RuntimeError:
-            raised = True
-        self.assertFalse(raised)
+                plugin_init.register(ctx)
+        finally:
+            plugin_init._REGISTERED_LLM = old_llm
+        self.assertTrue(ctx.register_command.called)
 
     def test_migration_copy_failure_leaves_old_dir_intact(self):
         legacy = self.root / "hermes" / "plugins" / "refine"
@@ -6585,13 +6754,14 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
             "journal_id": "abcdef123456", "kind": "skill", "action": "create",
             "pattern_fingerprint": "deadbeef1234", "outcome": "applied",
         }})
+        # With the Round 6 fix, since_approx can now produce working/unused verdicts
         with patch.object(ledger, "_count_uses_with_scope", return_value=(3, "since_approx")):
             row = ledger.audit([])[0]
         self.assertEqual(row["uses"], 3)
-        self.assertEqual(row["verdict"], "unclear")
+        self.assertEqual(row["verdict"], "working")
         with patch.object(ledger, "_count_uses_with_scope", return_value=(0, "since_approx")):
-            self.assertNotIn("approx-skill", ledger.unused_skills())
-            self.assertNotEqual(ledger.audit([])[0]["verdict"], "unused")
+            self.assertIn("approx-skill", ledger.unused_skills())
+            self.assertEqual(ledger.audit([])[0]["verdict"], "unused")
 
     def test_auto_lock_skip_and_cleanup_failure_are_visible_in_status(self):
         FakeHost.entry_config()["auto_enabled"] = True

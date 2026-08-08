@@ -344,7 +344,7 @@ def _is_error_content(content: str) -> bool:
     sample = re.sub(r'(?i)["\']?error["\']?\s*:\s*(?:null|""|\'\')', "", sample)
     return bool(
         re.search(
-            r"(?i)(?:^|[\s\[{(,:;])(?:traceback|error\b|failed\b|failure\b|file\s+not\s+found\b|no\s+such\s+file\b|timed?\s*out\b|timeout\b)",
+            r"(?i)(?:^|[\s\[{(,:;])(?:traceback|error\b|failed\b|failure\b|file\s+not\s+found\b|no\s+such\s+file\b|cannot\s+find\s+the\s+(?:file|path)\b|ENOENT\b|timed?\s*out\b|timeout\b)",
             sample,
         )
     )

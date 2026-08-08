@@ -85,14 +85,29 @@ def normalize_error(content: str) -> str:
         flags=re.IGNORECASE | re.DOTALL,
     ).strip()
 
-    # For a traceback,
+    # For a traceback, the only stable part is the final exception line; the
     # frames above it are noise that changes with every refactor.
     # Only the unambiguous header proves this is a real traceback; `File "` and
     # `  at ` alone appear in normal CLI output and must not trigger truncation.
     if re.search(r"(?m)^Traceback \(most recent call last\):\s*$", text):
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        if lines:
-            text = lines[-1]
+        lines = text.splitlines()
+        # The exception line is the first non-indented, non-empty line after the
+        # traceback header. If nothing matches, fall back to the last non-empty line.
+        exception_line = None
+        past_header = False
+        for line in lines:
+            if "Traceback (most recent call last)" in line:
+                past_header = True
+                continue
+            if past_header and line.strip() and not line.startswith((" ", "\t")):
+                exception_line = line.strip()
+                break
+        if exception_line:
+            text = exception_line
+        else:
+            stripped = [line.strip() for line in lines if line.strip()]
+            if stripped:
+                text = stripped[-1]
 
     text = _strip_quotes(text)
 

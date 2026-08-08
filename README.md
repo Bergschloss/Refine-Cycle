@@ -129,7 +129,7 @@ Then check that automatic refinement can actually run:
 # min messages: 15
 # cooldown: 20 min
 # edits today: 0/3
-# model: deepseek-v4-flash @ opencode-go (source: live)
+# model: your-cheap-model @ your-provider (source: live)
 # journal: /home/you/.hermes/refine-data (does not exist yet, will be created on first write)
 # blockers: none — automatic refinement is active
 ```
@@ -157,8 +157,8 @@ toward the budget it reports.
 /refine dry-run
 /refine dry-run focus on Gmail API failures
 /refine model
-/refine model deepseek-v4-flash
-/refine model opencode-go/deepseek-v4
+/refine model your-cheap-model
+/refine model your-provider/your-cheap-model
 /refine model auto
 /refine rollback 1f2a3b4c5d6e
 ```
@@ -380,9 +380,12 @@ plugins:
       llm:
         allow_provider_override: true   # required for `provider` below
         allow_model_override: true      # required for `model` below
-        provider: opencode-go
-        model: deepseek-v4-flash
+        provider: your-provider
+        model: your-cheap-model
 ```
+
+Model availability depends on provider, account, and region; a `403 RegionError`
+is a provider restriction, not a plugin defect.
 
 Both `allow_*` flags are fail-closed in Hermes: with them off, a pinned value is
 refused rather than applied. Leave `provider`/`model` unset to inherit the live
@@ -565,7 +568,7 @@ cd <HERMES_HOME>/plugins/refine
 python -m tests.run_tests
 ```
 
-The stdlib-only suite (301 tests) installs a fake Hermes host before importing the plugin.
+The stdlib-only suite (364 tests) installs a fake Hermes host before importing the plugin.
 Every database, journal, backup, skill, memory file, ledger, and lock lives
 under a fresh `TemporaryDirectory`; running the suite cannot touch live Hermes
 or profile state. It covers proposal completion, host action mapping,
