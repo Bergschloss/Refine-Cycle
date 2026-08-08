@@ -32,7 +32,7 @@ _NORMALIZERS = [
     # URLs before paths (a URL contains slashes)
     (re.compile(r"https?://\S+"), "URL"),
     # Filesystem paths, POSIX and Windows
-    (re.compile(r"(?:[A-Za-z]:)?[\\/](?:[\w.\-]+[\\/]){1,}[\w.\-]*"), "PATH"),
+    (re.compile(r"(?:[A-Za-z]:)?[\\/](?:[\w.\- ]+[\\/])*[\w.\-]+"), "PATH"),
     # UUIDs, then any long hex run (ids, hashes, object addresses)
     (re.compile(r"\b[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}\b"), "X"),
     (re.compile(r"\b(?:0x)?[0-9a-fA-F]{8,}\b"), "X"),

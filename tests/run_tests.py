@@ -517,6 +517,29 @@ class RefineTests(unittest.TestCase):
             patterns.fingerprint("http", "permission denied"),
         )
 
+    def test_path_normalization_handles_spaces_roots_and_preserves_prose(self):
+        windows = patterns.extract_patterns([
+            {"tool": "open", "content": r"failed C:\Program Files\foo.txt", "session_id": "a"},
+            {"tool": "open", "content": r"failed C:\Program Files\bar.txt", "session_id": "a"},
+        ], limit=None)
+        self.assertEqual(len(windows), 1)
+        self.assertEqual(windows[0]["count"], 2)
+        self.assertTrue(patterns.has_signal(windows, [], min_count=2))
+
+        roots = patterns.extract_patterns([
+            {"tool": "open", "content": "failed /foo.txt", "session_id": "a"},
+            {"tool": "open", "content": "failed /bar.txt", "session_id": "a"},
+        ], limit=None)
+        self.assertEqual(len(roots), 1)
+        self.assertEqual(roots[0]["count"], 2)
+        prose = patterns.normalize_error("failed to open /tmp/a.txt and retried")
+        self.assertEqual(prose.count("path"), 1)
+        self.assertIn("and retried", prose)
+        self.assertNotEqual(
+            patterns.fingerprint("http", "rate limited"),
+            patterns.fingerprint("http", "permission denied"),
+        )
+
     def test_repeat_marker_mid_text_preserves_distinguishing_tail(self):
         """A tool-controlled marker cannot hide a later distinguishing detail."""
         base = "connection refused"
