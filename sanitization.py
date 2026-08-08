@@ -40,10 +40,10 @@ _UNQUOTED_SECRET = re.compile(
 )
 _BEARER = re.compile(r"(?i)\bbearer\s+[\"']?[A-Za-z0-9_.+/=-]{8,}[\"']?")
 _URL_CREDENTIALS = re.compile(
-    r"(https?://)[^\s/?#]+@(?=[^\s/?#]+(?:[/?#]|\s|$))"
+    r"([a-zA-Z][a-zA-Z0-9+.-]*://)[^\s/?#]+@(?=[^\s/?#]+(?:[/?#]|\s|$))"
 )
 _ENV_SECRET = re.compile(
-    r"(?m)^(\s*[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*\s*=\s*)\S+$"
+    r"(?m)^(\s*(?:export\s+|set\s+)?[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*\s*=\s*)\S+$"
 )
 _NON_SECRETS = {"true", "false", "null", "none", "enabled", "disabled"}
 
@@ -66,7 +66,11 @@ def _is_number(value: str) -> bool:
 
 def _replace_unquoted(match: re.Match) -> str:
     value = match.group("value")
-    if value.lower() in _NON_SECRETS or _is_number(value):
+    prefix = match.group("prefix").lower()
+    if value.lower() in _NON_SECRETS or (
+        _is_number(value)
+        and not any(word in prefix for word in ("password", "passwd", "secret", "key", "token"))
+    ):
         return match.group(0)
     # Canonical markers are protected by scrub_text splitting and ``[`` is not
     # part of this regex's value class. Do not exempt arbitrary credentials

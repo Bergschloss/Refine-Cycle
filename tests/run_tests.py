@@ -662,6 +662,24 @@ class RefineTests(unittest.TestCase):
         self.assertIn("[REDACTED]", sanitization.scrub_text("MY_TOKEN=abcdef123456"))
         self.assertIn("[REDACTED]", sanitization.scrub_text("API_KEY=longvalue123"))
 
+    def test_sanitization_covers_uri_schemes_shell_exports_and_numeric_secrets(self):
+        sensitive = (
+            "postgres://user:super_secret@localhost:5432/db",
+            "export STRIPE_KEY=sk_test_12345",
+            "set API_TOKEN=token123456",
+            "password=123456",
+            "api_key=987654",
+        )
+        for value in sensitive:
+            with self.subTest(value=value):
+                result = sanitization.scrub_text(value)
+                self.assertIn("[REDACTED]", result)
+                self.assertNotIn(value.split("=", 1)[-1], result)
+
+        for safe in ("max_tokens=2048", "count=5", "timeout=30", "port=5432"):
+            with self.subTest(safe=safe):
+                self.assertEqual(sanitization.scrub_text(safe), safe)
+
     def test_url_credentials_with_colon_in_password(self):
         """Wave 3.4: URL with colon in password -> fully redacted."""
         result = sanitization.scrub_text("http://admin:my:pass@example.com")
@@ -1967,18 +1985,18 @@ class RefineTests(unittest.TestCase):
         # nested list bytes also scrubbed
         self.assertNotIn(b"bytesecret123456", result["nested"][0])
 
-    def test_credential_scrubbing_gaps_url_bearer_float(self):
-        """Wave 2.5: token-only URLs, quoted Bearer, and float numbers."""
+    def test_credential_scrubbing_url_bearer_and_numeric_token(self):
+        """Token-shaped URLs, Bearer credentials, and numeric token values redact."""
         # Token-only URL (no colon in userinfo)
         self.assertIn("[REDACTED]@", sanitization.scrub_text("https://token12345@host/x"))
         self.assertNotIn("token12345", sanitization.scrub_text("https://token12345@host/x"))
         # Quoted Bearer token
         self.assertNotIn("abcdef123456", sanitization.scrub_text('Bearer "abcdef123456"'))
         self.assertIn("[REDACTED]", sanitization.scrub_text('Bearer "abcdef123456"'))
-        # Float numbers must NOT be redacted (same as integers)
-        self.assertEqual(sanitization.scrub_text("token=1700000000.5"), "token=1700000000.5")
-        self.assertEqual(sanitization.scrub_text("token=1700000000"), "token=1700000000")
-        # But actual secrets still are
+        # Numeric values remain secret when the key names a credential.
+        self.assertEqual(sanitization.scrub_text("token=1700000000.5"), "token=[REDACTED]")
+        self.assertEqual(sanitization.scrub_text("token=1700000000"), "token=[REDACTED]")
+        # But actual nonnumeric secrets still are
         self.assertIn("[REDACTED]", sanitization.scrub_text("token=abcSecretValue123"))
 
     def test_scrub_text_does_not_produce_double_bracket_marker(self):
