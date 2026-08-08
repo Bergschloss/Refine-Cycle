@@ -1181,7 +1181,8 @@ def recent_refinements(limit: int) -> List[Dict[str, Any]]:
     if not capped_limit:
         return []
     included_outcomes = {
-        "applied", "pending_approval", "error", "rejected", "rolled_back"
+        "applied", "pending_approval", "error", "rejected", "rolled_back",
+        "rollback_prepared", "pending_rollback",
     }
     refinements: List[Dict[str, Any]] = []
     for entry in entries():

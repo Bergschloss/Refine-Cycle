@@ -1328,17 +1328,19 @@ class RefineTests(unittest.TestCase):
         record("error", "error", action="patch")
         record("rejected", "rejected")
         record("rolled-back", "rolled_back")
+        record("rollback-prepared", "rollback_prepared")
+        record("rollback-pending", "pending_rollback")
         record("ordinary-noop", "no_op", action="no_op")
         record("incomplete", "llm_incomplete")
 
         refinements = journal.recent_refinements(20)
         self.assertEqual(
             [item["proposal"]["name"] for item in refinements],
-            ["applied", "pending", "error", "rejected", "rolled-back"],
+            ["applied", "pending", "error", "rejected", "rolled-back", "rollback-prepared", "rollback-pending"],
         )
         self.assertEqual(
             [item["proposal"]["name"] for item in journal.recent_refinements(2)],
-            ["rejected", "rolled-back"],
+            ["rollback-prepared", "rollback-pending"],
         )
 
     def test_refinement_history_prompt_is_bounded_sanitized_and_keeps_unused_block(self):
