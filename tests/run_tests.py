@@ -3115,6 +3115,10 @@ class RefineTests(unittest.TestCase):
             "When a limitation matters, mention the limitation plainly.",
             "When prerequisites are incomplete, wait for clarification.",
             "When summarizing repeated errors, summarize the common cause.",
+            "When a command fails twice, ask before retrying a third time.",
+            "When calling write_file, always include both path and content fields.",
+            "When a test is flaky, check timing assumptions before rerunning.",
+            "When summarizing a long file, mention which sections were skipped.",
         )
         for policy in valid_policies:
             with self.subTest(policy=policy):
