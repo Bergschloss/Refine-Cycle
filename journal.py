@@ -1518,6 +1518,70 @@ def skill_baseline(name: str) -> Optional[Dict[str, Any]]:
     return {"exists": True, "sha256": _content_digest(content)}
 
 
+_BACKUP_RETENTION_SECONDS = 30 * 86400
+_ROLLBACK_BACKUP_OUTCOMES = {
+    "prepared", "pending_approval", "applied", "rollback_prepared", "pending_rollback",
+}
+
+
+def prune_expired_backups() -> List[Path]:
+    """Remove aged orphan ``.bak`` files without rewriting journal history.
+
+    A backup remains protected while an active journal state could still lead to
+    rollback. Comparing basenames preserves migration's legacy-path fallback,
+    where append-only entries retain their former absolute path while the backup
+    itself is copied into the active backup directory. Any unreadable journal or
+    filesystem failure fails closed by retaining the candidate.
+    """
+    cutoff = time.time() - _BACKUP_RETENTION_SECONDS
+    with mutation_lock():
+        try:
+            active_entries = _load_entries()
+        except Exception as exc:
+            logger.warning(
+                "Cannot prune refine backups because the journal is unreadable: %s",
+                scrub_text(str(exc)),
+            )
+            return []
+        referenced_names = set()
+        for entry in active_entries:
+            proposal = entry.get("proposal")
+            if (
+                entry.get("outcome") not in _ROLLBACK_BACKUP_OUTCOMES
+                or not isinstance(proposal, dict)
+                or proposal.get("kind") != "skill"
+                or proposal.get("action") != "patch"
+            ):
+                continue
+            backup_path = Path(str(entry.get("backup_path", "")))
+            if backup_path.name:
+                referenced_names.add(backup_path.name)
+        try:
+            candidates = list(backups_dir().iterdir())
+        except OSError as exc:
+            logger.warning("Cannot inspect refine backups for retention: %s", scrub_text(str(exc)))
+            return []
+        removed: List[Path] = []
+        for candidate in candidates:
+            try:
+                if (
+                    candidate.suffix != ".bak"
+                    or not candidate.is_file()
+                    or candidate.name in referenced_names
+                    or candidate.stat().st_mtime >= cutoff
+                ):
+                    continue
+                candidate.unlink()
+                removed.append(candidate)
+            except OSError as exc:
+                logger.warning(
+                    "Cannot prune expired refine backup %s: %s",
+                    candidate.name,
+                    scrub_text(str(exc)),
+                )
+        return removed
+
+
 def prepare_skill_recovery(name: str) -> Optional[Dict[str, Any]]:
     """Capture a skill's pre-edit state as a journal snapshot and a backup file.
 
@@ -1540,6 +1604,12 @@ def prepare_skill_recovery(name: str) -> Optional[Dict[str, Any]]:
     except Exception as exc:
         logger.warning("Cannot back up skill '%s': %s", name, scrub_text(str(exc)))
         return None
+    # Retention is opportunistic: a cleanup failure must not invalidate the
+    # newly created durable recovery copy that this edit still needs.
+    try:
+        prune_expired_backups()
+    except Exception as exc:
+        logger.warning("Cannot prune expired refine backups: %s", scrub_text(str(exc)))
     return {
         "backup_path": str(backup),
         "snapshot": {

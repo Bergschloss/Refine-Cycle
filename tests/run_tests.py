@@ -1742,6 +1742,57 @@ class RefineTests(unittest.TestCase):
         self.assertTrue(core.refine_rollback(entry_id)["success"])
         self.assertEqual(FakeHost.skills[name], old)
 
+    def test_backup_retention_removes_only_old_unreferenced_bak_files(self):
+        """R9-11a: retain rollback sources; remove only aged orphan .bak files."""
+        backup_dir = journal.backups_dir()
+        old_orphan = backup_dir / "old-orphan.bak"
+        fresh_orphan = backup_dir / "fresh-orphan.bak"
+        old_other = backup_dir / "old-other.txt"
+        referenced = backup_dir / "legacy-referenced.bak"
+        for path in (old_orphan, fresh_orphan, old_other, referenced):
+            path.write_text("synthetic", encoding="utf-8")
+        old_time = time.time() - journal._BACKUP_RETENTION_SECONDS - 1
+        for path in (old_orphan, old_other, referenced):
+            os.utime(path, (old_time, old_time))
+        journal.log(
+            trigger="manual", reason="legacy", session_id="session",
+            proposal={"action": "patch", "kind": "skill", "name": "legacy"},
+            outcome="applied", backup_path=str(referenced),
+            recovery={"type": "skill_patch", "name": "legacy"},
+        )
+        with patch.object(journal, "mutation_lock", wraps=journal.mutation_lock) as locked:
+            removed = journal.prune_expired_backups()
+        self.assertEqual(removed, [old_orphan])
+        locked.assert_called_once_with()
+        self.assertFalse(old_orphan.exists())
+        self.assertTrue(referenced.is_file())
+        self.assertTrue(fresh_orphan.is_file())
+        self.assertTrue(old_other.is_file())
+
+    def test_backup_retention_preserves_legacy_snapshotless_rollback(self):
+        """R9-11a: cleanup must not break a legacy entry without a snapshot."""
+        name = "retained-legacy-rollback"
+        old = skill_content(name, "# Old")
+        new = skill_content(name, "# New")
+        FakeHost.add_skill(name, new)
+        backup = journal.backups_dir() / "retained-legacy.bak"
+        backup.write_text(old, encoding="utf-8")
+        old_time = time.time() - journal._BACKUP_RETENTION_SECONDS - 1
+        os.utime(backup, (old_time, old_time))
+        entry_id = journal.log(
+            trigger="manual", reason="legacy", session_id="session",
+            proposal={
+                "action": "patch", "kind": "skill", "name": name,
+                "content": new, "reason": "legacy", "evidence": [],
+            },
+            outcome="applied", backup_path=str(backup),
+            recovery={"type": "skill_patch", "name": name},
+        )
+        self.assertEqual(journal.prune_expired_backups(), [])
+        self.assertTrue(backup.is_file())
+        self.assertTrue(core.refine_rollback(entry_id)["success"])
+        self.assertEqual(FakeHost.skills[name], old)
+
     def test_the_snapshot_digest_is_taken_from_raw_host_content(self):
         # The journal scrubs credentials out of everything it writes, so the
         # digest must come from the real skill content. Digesting the scrubbed
