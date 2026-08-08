@@ -178,6 +178,31 @@ REFINE_PROPOSAL_SCHEMA: Dict[str, Any] = {
     "required": ["action", "kind", "reason"],
 }
 
+PROMPT_NOTE_ACTION_EXAMPLES = (
+    "retry the request",
+    "log the error",
+    "verify the expected endpoint",
+    "ask for clarification",
+    "confirm it before acting",
+    "avoid unsupported claims",
+    "keep the response concise",
+    "wait for clarification",
+    "prefer unified format",
+    "mention the limitation plainly",
+    "use the supplied spelling",
+    "reject the invalid request",
+    "summarize the common cause",
+    "redact credentials",
+    "follow the existing policy",
+    "check the relevant tests before acting",
+    "always include both ‘path’ and ‘content’ fields",
+    "always include both path and content fields",
+    "ask before retrying a third time",
+    "check timing assumptions before rerunning",
+    "mention which sections were skipped",
+)
+_PROMPT_NOTE_ACTION_GUIDANCE = "; ".join(PROMPT_NOTE_ACTION_EXAMPLES)
+
 REFINE_SYSTEM_PROMPT = (
     "You are a self-improvement mechanic for an AI agent named Hermes. Read the "
     "trajectory and propose ONE evidence-grounded, minimal edit.\n\n"
@@ -193,7 +218,7 @@ REFINE_SYSTEM_PROMPT = (
     "6. A prompt note must be action=create and kind=prompt, with one or two lines in the "
     "exact format 'When <specific condition>, <one action>.' It must be a narrow behavioral "
     "policy, never a procedure, broad/global instruction, memory, skill, or replacement system prompt. "
-    "Allowed actions include: retry the request, log the error, verify the endpoint, ask for clarification, avoid unsupported claims, keep the response concise, include the required fields/parameters, and similar narrow forms.\n"
+    f"Allowed action forms: {_PROMPT_NOTE_ACTION_GUIDANCE}.\n"
     "7. Return no_op when no worthwhile edit exists.\n"
     "8. expected_outcome is optional; when present, make it one falsifiable sentence about "
     "what the edit should improve and how to check it. It must not restate reason.\n"
@@ -423,12 +448,46 @@ def _ensure_dict(parsed: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _escape_literal_newlines_in_json_strings(text: str) -> str:
+    """Escape raw LF and CRLF inside strings while leaving other controls invalid.
+
+    Models occasionally emit multiline string values, but accepting every raw
+    C0 control character would allow invisible bytes into persisted context.
+    """
+    repaired: List[str] = []
+    in_string = False
+    escape_next = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if escape_next:
+            repaired.append(char)
+            escape_next = False
+        elif char == "\\" and in_string:
+            repaired.append(char)
+            escape_next = True
+        elif char == '"':
+            in_string = not in_string
+            repaired.append(char)
+        elif char == "\r" and in_string and text[index:index + 2] == "\r\n":
+            repaired.append("\\n")
+            index += 1
+        elif char == "\n" and in_string:
+            repaired.append("\\n")
+        else:
+            repaired.append(char)
+        index += 1
+    return "".join(repaired)
+
+
 def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
     """Return the first valid balanced JSON object in one linear scan.
 
     After a balanced but invalid brace block, scanning resumes at the next
     character. An unbalanced outer block is treated as truncated rather than
-    trusting a nested fragment as an independent proposal.
+    trusting a nested fragment as an independent proposal. Raw LF and CRLF
+    inside strings are repaired narrowly; every other malformed control stays
+    rejected by the strict JSON parser.
     """
     start: Optional[int] = None
     depth = 0
@@ -458,8 +517,11 @@ def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
         elif char == "}":
             depth -= 1
             if depth == 0:
+                candidate = _escape_literal_newlines_in_json_strings(
+                    text[start:index + 1]
+                )
                 try:
-                    value = json.loads(text[start:index + 1], strict=False)
+                    value = json.loads(candidate)
                 except json.JSONDecodeError:
                     start = None
                     continue

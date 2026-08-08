@@ -224,7 +224,7 @@ def unused_skills(min_age_days: int = 14) -> List[str]:
         ):
             continue
         uses, scope = _count_uses_with_scope(name, meta.get("created_ts", 0))
-        if uses == 0 and scope in ("since_exact", "since_approx"):
+        if uses == 0 and scope == "since_exact":
             result.append(name)
     return result[:10]
 
@@ -361,13 +361,13 @@ def audit(
 
             if recurred is True:
                 verdict = "did not help"
-            elif uses == 0 and age_days >= 14 and usage_scope in ("since_exact", "since_approx"):
+            elif uses == 0 and age_days >= 14 and usage_scope == "since_exact":
                 verdict = "unused"
             elif (
                 uses
                 and uses > 0
                 and recurred is False
-                and usage_scope in ("since_exact", "since_approx")
+                and usage_scope == "since_exact"
             ):
                 verdict = "working"
             else:

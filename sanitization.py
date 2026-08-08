@@ -39,7 +39,9 @@ _UNQUOTED_SECRET = re.compile(
     r"(?P<value>[^\s,;\}\]\[]{6,})"
 )
 _BEARER = re.compile(r"(?i)\bbearer\s+[\"']?[A-Za-z0-9_.+/=-]{8,}[\"']?")
-_URL_CREDENTIALS = re.compile(r"(https?://)[^\s/]+@(?=[^\s/@]*[./])")
+_URL_CREDENTIALS = re.compile(
+    r"(https?://)[^\s/?#]+@(?=[^\s/?#]+(?:[/?#]|\s|$))"
+)
 _ENV_SECRET = re.compile(
     r"(?m)^(\s*[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*\s*=\s*)\S+$"
 )

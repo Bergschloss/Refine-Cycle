@@ -43,6 +43,19 @@ _NORMALIZERS = [
 ]
 
 _TRACEBACK_MARKERS = ("Traceback (most recent call last)", 'File "', "  at ")
+_TRACEBACK_WRAPPER_LINE = re.compile(r"(?i)^(?:g?make|ninja):")
+
+
+def _is_python_exception_line(line: str) -> bool:
+    """Recognize a printed exception type without assuming capitalization."""
+    stripped = line.strip()
+    if not stripped or _TRACEBACK_WRAPPER_LINE.match(stripped):
+        return False
+    type_name = stripped.partition(":")[0]
+    return bool(type_name) and all(
+        component.isidentifier() for component in type_name.split(".")
+    )
+
 
 # A complete double-quoted token, honouring backslash escapes.
 _DOUBLE_QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"')
@@ -76,38 +89,50 @@ def normalize_error(content: str) -> str:
     text = content.strip()
 
     # Hermes appends this diagnostic to repeated tool failures. It is host
-    # instrumentation, not part of the tool's error shape, so remove only this
-    # narrowly defined suffix before fingerprinting.
+    # instrumentation, not part of the tool's error shape, so remove only a
+    # true terminal suffix; tool-controlled text before a later error detail
+    # must not be able to hide that distinguishing detail.
     text = re.sub(
-        r"\s*\[Tool loop warning:\s*repeated_exact_failure_warning;\s*count=\d+\].*$",
+        r"\s*\[Tool loop warning:\s*repeated_exact_failure_warning;\s*count=\d+\]\s*$",
         "",
         text,
-        flags=re.IGNORECASE | re.DOTALL,
+        flags=re.IGNORECASE,
     ).strip()
 
-    # For a traceback, the only stable part is the final exception line; the
-    # frames above it are noise that changes with every refactor.
-    # Only the unambiguous header proves this is a real traceback; `File "` and
-    # `  at ` alone appear in normal CLI output and must not trigger truncation.
-    if re.search(r"(?m)^Traceback \(most recent call last\):\s*$", text):
-        lines = text.splitlines()
-        # The exception line is the first non-indented, non-empty line after the
-        # traceback header. If nothing matches, fall back to the last non-empty line.
+    # For a traceback, the only stable part is the terminal exception line; the
+    # frames above it are noise that changes with every refactor. Chained Python
+    # exceptions contain more than one traceback, so inspect only the last one.
+    # The unambiguous header is required because `File "` and `  at ` also occur
+    # in normal CLI output.
+    lines = text.splitlines()
+    traceback_headers = [
+        index
+        for index, line in enumerate(lines)
+        if re.fullmatch(r"Traceback \(most recent call last\):\s*", line)
+    ]
+    if traceback_headers:
         exception_line = None
-        past_header = False
-        for line in lines:
-            if "Traceback (most recent call last)" in line:
-                past_header = True
-                continue
-            if past_header and line.strip() and not line.startswith((" ", "\t")):
-                exception_line = line.strip()
+        for position in range(len(traceback_headers) - 1, -1, -1):
+            start = traceback_headers[position] + 1
+            end = (
+                traceback_headers[position + 1]
+                if position + 1 < len(traceback_headers)
+                else len(lines)
+            )
+            exception_line = next(
+                (
+                    line.strip()
+                    for line in lines[start:end]
+                    if line.strip()
+                    and not line.startswith((" ", "\t"))
+                    and _is_python_exception_line(line)
+                ),
+                None,
+            )
+            if exception_line:
                 break
         if exception_line:
             text = exception_line
-        else:
-            stripped = [line.strip() for line in lines if line.strip()]
-            if stripped:
-                text = stripped[-1]
 
     text = _strip_quotes(text)
 

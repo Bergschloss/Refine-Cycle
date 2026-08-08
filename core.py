@@ -107,7 +107,7 @@ _PROMPT_NOTE_SAFE_ACTION = re.compile(
         | summarize\s+(?:the\s+)?(?:common\s+cause|error|failure|result|outcome)
         | use\s+the\s+(?:supplied|provided|exact)\s+(?:spelling|name|format)
         | wait\s+for\s+(?:clarification|confirmation|approval|input)
-        | (?:always\s+)?(?:include|provide|supply|set|pass)\s+(?:both\s+|all\s+)?(?:the\s+)?(?:required\s+)?(?:[\u2018\u2019][^\u2018\u2019]+[\u2018\u2019](?:\s*(?:,|and|or)\s*[\u2018\u2019][^\u2018\u2019]+[\u2018\u2019])*\s+)?(?:missing\s+)?(?:fields?|arguments?|parameters?|values?|keys?)
+        | (?:always\s+)?(?:include|provide|supply|set|pass)\s+(?:both\s+|all\s+)?(?:the\s+)?(?:required\s+)?[\u2018\u2019](?:path|content)[\u2018\u2019](?:\s*(?:,|and|or)\s*[\u2018\u2019](?:path|content)[\u2018\u2019])*\s+(?:fields?|arguments?|parameters?|values?|keys?)
         | always\s+include\s+both\s+path\s+and\s+content\s+fields?
         | ask\s+before\s+retrying\s+(?:a|the)\s+third\s+time
         | check\s+timing\s+assumptions\s+before\s+rerunning
@@ -116,30 +116,8 @@ _PROMPT_NOTE_SAFE_ACTION = re.compile(
     """
 )
 
-# Canonical examples — one per allowed action class. The model sees these in the
-# proposal prompt so it knows what forms are accepted; the anti-drift test asserts
-# every one passes the regex above.
-PROMPT_NOTE_ACTION_EXAMPLES = (
-    "retry the request",
-    "log the error",
-    "verify the expected endpoint",
-    "ask for clarification",
-    "confirm it before acting",
-    "avoid unsupported claims",
-    "keep the response concise",
-    "wait for clarification",
-    "prefer unified format",
-    "mention the limitation plainly",
-    "use the supplied spelling",
-    "reject the invalid request",
-    "summarize the common cause",
-    "redact credentials",
-    "follow the existing policy",
-    "check the relevant tests before acting",
-    "always include both \u2018path\u2019 and \u2018content\u2019 fields",
-    "include the required parameters",
-    "provide the missing fields",
-)
+# One canonical action list drives both model guidance and validator anti-drift tests.
+PROMPT_NOTE_ACTION_EXAMPLES = _llm.PROMPT_NOTE_ACTION_EXAMPLES
 
 
 
@@ -2589,10 +2567,10 @@ def _apply_transaction(
     if results and not results[-1].get("success"):
         message += f" | stopped: {scrub_text(str(results[-1].get('message', '')))[:160]}"
     elif skipped:
-        message += (
-            f" | stopped: daily edit limit reached ({config.max_edits_per_day()}); "
-            f"{skipped} edit(s) not attempted"
-        )
+        rendered_stop = scrub_text(stop_reason)[:160] or "edits were not attempted"
+        if rendered_stop.startswith("Daily "):
+            rendered_stop = "daily " + rendered_stop[6:]
+        message += f" | stopped: {rendered_stop}; {skipped} edit(s) not attempted"
     if dropped:
         message += f" | {dropped} proposed edit(s) discarded before apply"
     if summary:
