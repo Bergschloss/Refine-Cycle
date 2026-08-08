@@ -270,9 +270,14 @@ def _has_incomplete_json_structure(text: str) -> bool:
 def _salvage_parsed(result: Any, *, requested_max_tokens: int) -> _Reply:
     """Parse one reply and name incomplete output instead of returning a false no_op."""
     parsed = getattr(result, "parsed", None)
-    parsed_dict = _ensure_dict(parsed)
-    if parsed_dict is not None:
-        return _Reply(parsed_dict)
+    if isinstance(parsed, str):
+        parsed_dict = _ensure_dict(parsed)
+        if parsed_dict is not None:
+            return _Reply(parsed_dict, salvaged=True)
+    else:
+        parsed_dict = _ensure_dict(parsed)
+        if parsed_dict is not None:
+            return _Reply(parsed_dict)
     text = getattr(result, "text", "") or ""
     if isinstance(parsed, str) and not text:
         text = parsed
@@ -326,6 +331,14 @@ def _propose_structured(
     target: Optional[Dict[str, str]] = None,
 ) -> Any:
     """Invoke the model only with recursively sanitized text inputs."""
+    # A semantic create/patch retry is a new final structured sub-call. Keep
+    # cumulative latency/token attribution, but never let its predecessor's
+    # successful mode describe a failed final reply.
+    previous_meta = getattr(_call_meta, "value", {})
+    if isinstance(previous_meta, dict) and "output_mode" in previous_meta:
+        current_meta = dict(previous_meta)
+        current_meta.pop("output_mode", None)
+        _call_meta.value = current_meta
     safe_blocks: List[PluginLlmInput] = []
     for block in input_blocks:
         text = getattr(block, "text", None)
@@ -352,9 +365,10 @@ def _propose_structured(
         )
         _record_call_meta(result, call_started)
         reply = _salvage_parsed(result, requested_max_tokens=max_tokens)
-        _call_meta.value["output_mode"] = (
-            "json_schema_salvage" if reply.salvaged else "json_schema"
-        )
+        if not reply.failure:
+            _call_meta.value["output_mode"] = (
+                "json_schema_salvage" if reply.salvaged else "json_schema"
+            )
         return reply.parsed or _incomplete_proposal(reply)
     except PluginLlmTrustError:
         _record_call_meta(None, call_started)
@@ -381,9 +395,10 @@ def _propose_structured(
             raise
         _record_call_meta(result, call_started)
         reply = _salvage_parsed(result, requested_max_tokens=max_tokens)
-        _call_meta.value["output_mode"] = (
-            "json_mode_salvage" if reply.salvaged else "json_mode"
-        )
+        if not reply.failure:
+            _call_meta.value["output_mode"] = (
+                "json_mode_salvage" if reply.salvaged else "json_mode"
+            )
         return reply.parsed or _incomplete_proposal(reply)
 
 
@@ -508,14 +523,15 @@ def review_fallback(llm: PluginLlm, evidence_text: str, *, target: Optional[Dict
                 raise
         _record_call_meta(result, call_started)
         reply = _salvage_parsed(result, requested_max_tokens=REVIEWER_MAX_TOKENS)
-        if _reviewer_used_json_mode:
-            _call_meta.value["output_mode"] = (
-                "json_mode_salvage" if reply.salvaged else "json_mode"
-            )
-        else:
-            _call_meta.value["output_mode"] = (
-                "json_schema_salvage" if reply.salvaged else "json_schema"
-            )
+        if not reply.failure:
+            if _reviewer_used_json_mode:
+                _call_meta.value["output_mode"] = (
+                    "json_mode_salvage" if reply.salvaged else "json_mode"
+                )
+            else:
+                _call_meta.value["output_mode"] = (
+                    "json_schema_salvage" if reply.salvaged else "json_schema"
+                )
         if reply.failure:
             rationale = (
                 "Reviewer returned no final answer."
@@ -799,7 +815,9 @@ def _finalize_edit(
                 parsed.get("expected_outcome")
             ),
             "evidence": _ensure_list(parsed.get("evidence")),
-            "pattern_fingerprint": "",
+            "pattern_fingerprint": _valid_fingerprint(
+                parsed.get("pattern_fingerprint")
+            ),
         })
     if kind not in ("skill", "memory", "prompt"):
         return _semantic_failure(f"Invalid kind: {kind}")

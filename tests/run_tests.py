@@ -5318,10 +5318,8 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
             model="test-model",
         ))
         core.refine_run(model, session_id="session")
-        entries = journal.entries()
-        latest = entries[-1] if entries else {}
-        meta = latest.get("llm_meta", {})
-        self.assertEqual(meta.get("output_mode"), "json_schema")
+        latest = journal.entries()[-1]
+        self.assertEqual(latest["llm_meta"].get("output_mode"), "json_schema")
 
     def test_output_mode_records_json_mode_on_schema_failure(self):
         model = MockLlm(
@@ -5333,10 +5331,23 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
             ),
         )
         core.refine_run(model, session_id="session")
-        entries = journal.entries()
-        latest = entries[-1] if entries else {}
-        meta = latest.get("llm_meta", {})
-        self.assertEqual(meta.get("output_mode"), "json_mode")
+        latest = journal.entries()[-1]
+        self.assertEqual(latest["llm_meta"].get("output_mode"), "json_mode")
+
+    def test_output_mode_records_json_mode_salvage_after_schema_failure(self):
+        model = MockLlm(
+            RuntimeError("schema unsupported"),
+            MockResult(
+                None,
+                text='{"action":"no_op","reason":"from text","evidence":[],"kind":"","name":"","content":""}',
+                model="test-model",
+            ),
+        )
+        core.refine_run(model, session_id="session")
+        latest = journal.entries()[-1]
+        self.assertEqual(
+            latest["llm_meta"].get("output_mode"), "json_mode_salvage"
+        )
 
     def test_output_mode_records_salvage_when_parsed_is_none_but_text_has_json(self):
         model = MockLlm(MockResult(
@@ -5345,40 +5356,249 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
             model="test-model",
         ))
         core.refine_run(model, session_id="session")
-        entries = journal.entries()
-        latest = entries[-1] if entries else {}
-        meta = latest.get("llm_meta", {})
-        self.assertEqual(meta.get("output_mode"), "json_schema_salvage")
+        latest = journal.entries()[-1]
+        self.assertEqual(
+            latest["llm_meta"].get("output_mode"), "json_schema_salvage"
+        )
 
-    def test_signal_path_gate_opened_when_signal_present(self):
+    def test_output_mode_records_salvage_for_string_valued_parsed_result(self):
+        payload = '{"action":"no_op","reason":"string parsed","evidence":[],"kind":"","name":"","content":""}'
+        core.refine_run(
+            MockLlm(MockResult(payload, model="test-model")),
+            session_id="session",
+        )
+        latest = journal.entries()[-1]
+        self.assertEqual(
+            latest["llm_meta"].get("output_mode"), "json_schema_salvage"
+        )
+
+    def test_output_mode_records_json_mode_salvage_for_string_parsed_result(self):
+        payload = '{"action":"no_op","reason":"string parsed","evidence":[],"kind":"","name":"","content":""}'
+        core.refine_run(MockLlm(
+            RuntimeError("schema unsupported"),
+            MockResult(payload, model="test-model"),
+        ), session_id="session")
+        latest = journal.entries()[-1]
+        self.assertEqual(
+            latest["llm_meta"].get("output_mode"), "json_mode_salvage"
+        )
+
+    def test_output_mode_is_omitted_when_structured_parsing_fails(self):
+        result = core.refine_run(
+            MockLlm(MockResult(None, text="not json", model="test-model")),
+            session_id="session",
+        )
+        self.assertFalse(result["success"])
+        latest = journal.get_entry(result["journal_id"])
+        self.assertNotIn("output_mode", latest["llm_meta"])
+
+    def test_failed_create_retry_clears_previous_output_mode(self):
+        initial = skill_proposal("missing-create-content")
+        initial["content"] = ""
+        result = core.refine_run(MockLlm(
+            initial,
+            MockResult(None, text="not json", model="test-model"),
+        ), session_id="session")
+        self.assertFalse(result["success"])
+        latest = journal.get_entry(result["journal_id"])
+        self.assertNotIn("output_mode", latest["llm_meta"])
+
+    def test_failed_patch_retry_clears_previous_output_mode(self):
+        name = "failed-patch-retry"
+        FakeHost.add_skill(name, skill_content(name, "original"))
+        initial = {
+            "action": "patch", "kind": "skill", "name": name,
+            "content": "stub", "reason": "repeated failure", "evidence": [],
+        }
+        result = core.refine_run(MockLlm(
+            initial,
+            MockResult(None, text="not json", model="test-model"),
+        ), session_id="session")
+        self.assertFalse(result["success"])
+        latest = journal.get_entry(result["journal_id"])
+        self.assertNotIn("output_mode", latest["llm_meta"])
+
+    def test_successful_final_retry_replaces_initial_output_mode(self):
+        initial = skill_proposal("successful-create-retry")
+        initial["content"] = ""
+        result = core.refine_run(MockLlm(
+            initial,
+            RuntimeError("schema unsupported"),
+            skill_proposal("successful-create-retry"),
+        ), session_id="session")
+        self.assertTrue(result["success"])
+        latest = journal.get_entry(result["journal_id"])
+        self.assertEqual(latest["llm_meta"].get("output_mode"), "json_mode")
+
+    def test_reviewer_output_mode_and_approved_signal_path_are_journaled(self):
+        now = time.time()
+        FakeHost.make_db([
+            ("session", "user", f"Routine context {index}", "", now - index, 1)
+            for index in range(20)
+        ])
+        FakeHost.entry_config().update({
+            "min_signal_required": True,
+            "reviewer_fallback_enabled": True,
+            "reviewer_min_messages": 20,
+        })
+        model = MockLlm(
+            RuntimeError("schema unsupported"),
+            MockResult(
+                None,
+                text='{"shouldRefine":true,"rationale":"durable","instructions":"persist retry lesson"}',
+            ),
+            skill_proposal("reviewer-telemetry"),
+        )
+        result = core.refine_run(model, session_id="session")
+        self.assertTrue(result["success"])
+        reviewer_entry = next(
+            entry for entry in journal.entries() if entry["trigger"] == "reviewer"
+        )
+        self.assertEqual(
+            reviewer_entry["llm_meta"].get("output_mode"), "json_mode_salvage"
+        )
+        proposal_entry = journal.get_entry(result["journal_id"])
+        self.assertEqual(
+            proposal_entry["llm_meta"].get("signal_path"), "reviewer_approved"
+        )
+
+    def test_reviewer_decline_does_not_claim_gate_opened(self):
+        now = time.time()
+        FakeHost.make_db([
+            ("session", "user", f"Routine context {index}", "", now - index, 1)
+            for index in range(20)
+        ])
+        FakeHost.entry_config().update({
+            "min_signal_required": True,
+            "reviewer_fallback_enabled": True,
+            "reviewer_min_messages": 20,
+        })
+        result = core.refine_run(MockLlm({
+            "shouldRefine": False,
+            "rationale": "No durable lesson.",
+            "instructions": "",
+        }), session_id="session")
+        self.assertTrue(result["success"])
+        meta = journal.get_entry(result["journal_id"])["llm_meta"]
+        self.assertEqual(meta.get("output_mode"), "json_schema")
+        self.assertNotIn("signal_path", meta)
+
+    def test_signal_path_gate_opened_when_repeated_error_signal_present(self):
+        now = time.time()
+        FakeHost.make_db([
+            ("session", "tool", "ERROR: request failed for /item/100", "http", now - 3, 1),
+            ("session", "assistant", "Retrying", "", now - 2, 1),
+            ("session", "tool", "ERROR: request failed for /item/200", "http", now - 1, 1),
+        ])
         FakeHost.entry_config()["min_signal_required"] = True
         model = MockLlm({"action": "no_op", "reason": "nothing"})
-        core.refine_run(model, session_id="session")
-        entries = journal.entries()
-        latest = entries[-1] if entries else {}
-        meta = latest.get("llm_meta", {})
+        with patch.object(
+            core._llm, "review_fallback", side_effect=AssertionError("reviewer called")
+        ):
+            core.refine_run(model, session_id="session")
+        latest = journal.entries()[-1]
+        self.assertEqual(latest["llm_meta"].get("signal_path"), "gate_opened")
+
+    def test_signal_path_uses_one_per_pass_gate_config_snapshot(self):
+        now = time.time()
+        FakeHost.make_db([
+            ("session", "tool", "ERROR: request failed for /item/100", "http", now - 3, 1),
+            ("session", "assistant", "Retrying", "", now - 2, 1),
+            ("session", "tool", "ERROR: request failed for /item/200", "http", now - 1, 1),
+        ])
+        values = iter((True, False, False))
+        with patch.object(
+            config, "min_signal_required", side_effect=lambda: next(values)
+        ) as setting:
+            result = core.refine_run(
+                MockLlm({"action": "no_op", "reason": "nothing"}),
+                session_id="session",
+            )
+        meta = journal.get_entry(result["journal_id"])["llm_meta"]
+        self.assertEqual(setting.call_count, 1)
         self.assertEqual(meta.get("signal_path"), "gate_opened")
 
     def test_signal_path_gate_disabled_when_min_signal_not_required(self):
         FakeHost.entry_config()["min_signal_required"] = False
         model = MockLlm({"action": "no_op", "reason": "nothing"})
         core.refine_run(model, session_id="session")
-        entries = journal.entries()
-        latest = entries[-1] if entries else {}
-        meta = latest.get("llm_meta", {})
-        self.assertEqual(meta.get("signal_path"), "gate_disabled")
+        latest = journal.entries()[-1]
+        self.assertEqual(latest["llm_meta"].get("signal_path"), "gate_disabled")
 
-    def test_grounded_and_fingerprint_offered_in_evidence_summary(self):
-        model = MockLlm({
+    def test_grounding_is_journaled_for_matching_noop_fingerprint(self):
+        offered_fp = core.collect_evidence()["error_patterns"][0]["fingerprint"]
+        result = core.refine_run(MockLlm({
             "action": "no_op", "reason": "nothing",
-            "pattern_fingerprint": "",
-        })
-        result = core.refine_run(model, session_id="session")
-        evidence = result.get("evidence", {})
-        self.assertIn("fingerprint_offered", evidence)
-        self.assertIsInstance(evidence["fingerprint_offered"], int)
-        self.assertIn("grounded", evidence)
-        self.assertIs(evidence["grounded"], False)
+            "pattern_fingerprint": offered_fp,
+        }), session_id="session")
+        meta = journal.get_entry(result["journal_id"])["llm_meta"]
+        self.assertGreaterEqual(meta["fingerprint_offered"], 1)
+        self.assertIs(meta["grounded"], True)
+        self.assertEqual(result["evidence"]["grounded"], meta["grounded"])
+
+    def test_grounding_is_false_when_model_omits_an_offered_fingerprint(self):
+        result = core.refine_run(MockLlm({
+            "action": "no_op", "reason": "nothing", "pattern_fingerprint": "",
+        }), session_id="session")
+        meta = journal.get_entry(result["journal_id"])["llm_meta"]
+        self.assertGreaterEqual(meta["fingerprint_offered"], 1)
+        self.assertIs(meta["grounded"], False)
+
+    def test_grounding_is_false_for_unoffered_fingerprint(self):
+        proposal = skill_proposal("grounded-miss")
+        proposal["pattern_fingerprint"] = "ffffffffffff"
+        result = core.refine_run(MockLlm(proposal), session_id="session")
+        meta = journal.get_entry(result["journal_id"])["llm_meta"]
+        self.assertGreaterEqual(meta["fingerprint_offered"], 1)
+        self.assertIs(meta["grounded"], False)
+
+    def test_grounding_records_zero_when_no_fingerprint_was_offered(self):
+        now = time.time()
+        FakeHost.make_db([
+            ("session", "user", "Routine context", "", now - 3, 1),
+            ("session", "assistant", "Acknowledged", "", now - 2, 1),
+            ("session", "user", "Continue", "", now - 1, 1),
+        ])
+        result = core.refine_run(MockLlm({
+            "action": "no_op", "reason": "nothing", "pattern_fingerprint": "",
+        }), session_id="session")
+        meta = journal.get_entry(result["journal_id"])["llm_meta"]
+        self.assertEqual(meta["fingerprint_offered"], 0)
+        self.assertIs(meta["grounded"], False)
+
+    def test_grounding_excludes_fingerprints_beyond_rendered_prompt_limit(self):
+        synthetic_patterns = [
+            {
+                "fingerprint": f"{index:012x}",
+                "tool": "http",
+                "sample": f"failure {index}",
+                "count": 2,
+                "sessions_seen": 1,
+            }
+            for index in range(patterns.FORMAT_PATTERNS_LIMIT + 1)
+        ]
+        synthetic_evidence = {
+            "messages": [
+                {"role": "user", "content": "one", "tool_name": ""},
+                {"role": "assistant", "content": "two", "tool_name": ""},
+                {"role": "tool", "content": "three", "tool_name": "http"},
+            ],
+            "error_count": len(synthetic_patterns),
+            "error_patterns": synthetic_patterns,
+            "user_corrections": [],
+            "collection_status": "ok",
+        }
+        hidden_fp = synthetic_patterns[-1]["fingerprint"]
+        proposal = skill_proposal("hidden-fingerprint")
+        proposal["pattern_fingerprint"] = hidden_fp
+        with patch.object(core, "collect_evidence", return_value=synthetic_evidence), \
+             patch.object(core, "collect_cross_session_patterns", return_value=[]):
+            result = core.refine_run(MockLlm(proposal), session_id="session")
+        meta = journal.get_entry(result["journal_id"])["llm_meta"]
+        self.assertEqual(
+            meta["fingerprint_offered"], patterns.FORMAT_PATTERNS_LIMIT
+        )
+        self.assertIs(meta["grounded"], False)
 
     # ── Dry-run (Part E) ──────────────────────────────────────────────────────
 

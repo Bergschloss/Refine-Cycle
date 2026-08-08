@@ -468,6 +468,22 @@ llm:
   notice, so the import is guarded and simply yields no live value on failure —
   `/refine model` then reports `source: host_default` rather than claiming a
   target it does not have.
+- **Text-only trust boundary:** `PluginLlmTextInput` accepts text but no typed
+  trust level. Refine wraps and scrubs untrusted trajectory content, which is a
+  mitigation rather than hard separation; a guarantee requires a typed
+  trust-level input from Hermes.
+- **Approval terminal states are not exported:** the plugin can observe pending
+  writes and reconcile the target, but Hermes does not expose distinct
+  `accepted`, `rejected`, and `cancelled` terminal states.
+- **Exact timestamped usage is unavailable:** existing SQL and host counters are
+  approximate. Reliable `working` / `unused` conclusions require timestamped
+  usage events from Hermes.
+- **PrimeIntellect comparison was not completed during the audit:** access to
+  the required network/source material was blocked, so no equivalence claim is
+  made.
+- **Production frequency and storage growth are unmeasured:** the audit did not
+  read the real `state.db`; it therefore makes no claim about production event
+  frequency or long-term storage growth.
 - **No host approval for the prompt-note store:** it is a plugin-owned atomic
   file, not a host memory or skill write. Host-managed skill and memory changes
   still respect staged approvals and reconciliation.

@@ -200,7 +200,12 @@ def has_signal(
     return False
 
 
-def format_patterns(patterns: List[Dict[str, Any]], limit: int = 8) -> str:
+FORMAT_PATTERNS_LIMIT = 8
+
+
+def format_patterns(
+    patterns: List[Dict[str, Any]], limit: int = FORMAT_PATTERNS_LIMIT
+) -> str:
     """Render patterns as a compact block for the proposal prompt."""
     if not patterns:
         return "  (none)"

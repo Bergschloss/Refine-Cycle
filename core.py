@@ -1503,8 +1503,10 @@ def _refine_once(
         and _run_target_source in ("unknown", "host_default")
     )
 
+    _min_signal_required = config.min_signal_required()
+    _min_pattern_count = config.min_pattern_count()
     evidence_limit = 60
-    if config.min_signal_required() and config.reviewer_fallback_enabled():
+    if _min_signal_required and config.reviewer_fallback_enabled():
         evidence_limit = max(evidence_limit, config.reviewer_min_messages())
     evidence = collect_evidence(session_id=resolved_session, limit=evidence_limit)
     evidence["session_id_source"] = resolved_source
@@ -1576,8 +1578,8 @@ def _refine_once(
     proposal_context = safe_reason
     reviewer_context = ""
     _signal_path = "gate_disabled"
-    if config.min_signal_required() and not patterns.has_signal(
-        error_patterns, corrections, min_count=config.min_pattern_count()
+    if _min_signal_required and not patterns.has_signal(
+        error_patterns, corrections, min_count=_min_pattern_count
     ):
         _signal_path = "no_signal"
         should_review = (
@@ -1704,7 +1706,7 @@ def _refine_once(
         else:
             proposal = {
                 "action": "no_op",
-                "reason": f"No repeated failure (min {config.min_pattern_count()}x) and no explicit correction.",
+                "reason": f"No repeated failure (min {_min_pattern_count}x) and no explicit correction.",
                 "expected_outcome": "",
             }
             entry_id = _journal_nonmutation(
@@ -1729,7 +1731,7 @@ def _refine_once(
                 "reversible": False,
             }
 
-    if _signal_path == "gate_disabled" and config.min_signal_required():
+    if _signal_path == "gate_disabled" and _min_signal_required:
         _signal_path = "gate_opened"
 
     proposal = _llm.propose(
@@ -1766,6 +1768,16 @@ def _refine_once(
         expected_outcome=_llm.normalize_expected_outcome(
             proposal.get("expected_outcome")
         ),
+    )
+    _offered_fps = {
+        str(pattern.get("fingerprint", ""))
+        for pattern in error_patterns[:patterns.FORMAT_PATTERNS_LIMIT]
+        if pattern.get("fingerprint")
+    }
+    _proposal_fp = str(proposal.get("pattern_fingerprint", "") or "")
+    _run_llm_meta["fingerprint_offered"] = len(_offered_fps)
+    _run_llm_meta["grounded"] = bool(
+        _proposal_fp and _proposal_fp in _offered_fps
     )
     failure = scrub_text(str(proposal.get("failure", "")).strip())
     if failure:
@@ -1818,13 +1830,9 @@ def _refine_once(
         "source_lookup_status": source_lookup_status,
         "messages": len(evidence.get("messages", [])),
         "errors": evidence.get("error_count", 0),
+        "fingerprint_offered": _run_llm_meta["fingerprint_offered"],
+        "grounded": _run_llm_meta["grounded"],
     }
-    _offered_fps = {
-        p.get("fingerprint", "") for p in error_patterns if p.get("fingerprint")
-    }
-    _proposal_fp = str(proposal.get("pattern_fingerprint", "") or "")
-    evidence_summary["fingerprint_offered"] = len(_offered_fps)
-    evidence_summary["grounded"] = bool(_proposal_fp and _proposal_fp in _offered_fps)
 
     if _run_target_unusable and proposal.get("action") == "no_op":
         failure_message = "The configured refine model target is unusable."
