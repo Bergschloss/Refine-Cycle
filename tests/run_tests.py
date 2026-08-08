@@ -7214,6 +7214,30 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
         finally:
             usage.get_usage_count = original
 
+    def test_ledger_backfills_model_and_marks_exact_fingerprintless_usage_working(self):
+        proposal = {"name": "backfill", "kind": "skill", "action": "create"}
+        merged = ledger._merge_journal_stats({"backfill": {
+            "journal_id": "same-id", "name": "backfill", "kind": "skill",
+            "action": "create", "outcome": "applied",
+        }}, [{
+            "id": "same-id", "ts": time.time(), "outcome": "applied",
+            "proposal": proposal, "llm_meta": {"reported_model": "GPT-4"},
+        }])
+        self.assertEqual(merged["backfill"]["reported_model"], "GPT-4")
+
+        created = time.time() - 30 * 86400
+        ledger._save_stats({"no-fingerprint": {
+            "created_ts": created, "updated_ts": created, "journal_id": "no-fp",
+            "name": "no-fingerprint", "kind": "skill", "action": "create",
+            "pattern_fingerprint": "", "outcome": "applied",
+        }})
+        with patch.object(ledger, "_count_uses_with_scope", return_value=(5, "since_exact")):
+            row = ledger.audit([])[0]
+        self.assertEqual(row["verdict"], "working")
+        self.assertIsNone(row["pattern_recurred"])
+        with patch.object(ledger, "_count_uses_with_scope", return_value=(0, "since_exact")):
+            self.assertNotEqual(ledger.audit([])[0]["verdict"], "working")
+
     def test_reported_model_survives_record_without_metadata(self):
         proposal = {"name": "kept-model", "kind": "skill", "action": "create"}
         ledger.record_edit(

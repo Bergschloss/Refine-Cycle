@@ -266,9 +266,17 @@ def _merge_journal_stats(
         entry_id = str(entry.get("id", ""))
         timestamp = float(entry.get("ts", 0) or 0)
         existing = merged.get(key)
+        llm_meta = entry.get("llm_meta")
+        reported_model = (
+            scrub_text(str(llm_meta["reported_model"]))[:60]
+            if isinstance(llm_meta, dict) and llm_meta.get("reported_model")
+            else ""
+        )
         if isinstance(existing, dict) and existing.get("journal_id") == entry_id:
             existing["outcome"] = entry.get("outcome", existing.get("outcome", ""))
             existing["pending_id"] = entry.get("pending_id", existing.get("pending_id", ""))
+            if reported_model and not existing.get("reported_model"):
+                existing["reported_model"] = reported_model
             continue
         if isinstance(existing, dict):
             try:
@@ -300,9 +308,8 @@ def _merge_journal_stats(
             "outcome": entry.get("outcome", ""),
             "pending_id": entry.get("pending_id", ""),
         }
-        llm_meta = entry.get("llm_meta")
-        if isinstance(llm_meta, dict) and llm_meta.get("reported_model"):
-            meta["reported_model"] = scrub_text(str(llm_meta["reported_model"]))[:60]
+        if reported_model:
+            meta["reported_model"] = reported_model
         elif isinstance(existing, dict) and existing.get("reported_model"):
             meta["reported_model"] = existing["reported_model"]
         merged[key] = meta
@@ -375,8 +382,8 @@ def audit(
             elif (
                 uses
                 and uses > 0
-                and recurred is False
                 and usage_scope == "since_exact"
+                and (recurred is False or not fingerprint)
             ):
                 verdict = "working"
             else:
