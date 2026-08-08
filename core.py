@@ -38,15 +38,41 @@ _RESOURCE_NETWORK_OR_SHELL = re.compile(r"(?ix)(?:[a-z]+://|[`|;&><$])")
 _HOST_REFERENCE = re.compile(
     r"""(?ix)
     (?:
-        (?<![\w.-])(?:[a-z0-9-]+\.)+[a-z]{2,63}(?![\w.-]) # dotted hostname
-        | \b(?:localhost|intranet)\b                         # common bare hostnames
+        (?<![\w.-])(?:[a-z0-9-]+\.)+[a-z]{2,63}\.?(?![\w.-]) # dotted hostname
+        | \b(?:localhost|intranet)\b                            # common bare hostnames
         | \b(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}\b # IPv4
-        | \b127(?:\.\d{1,3}){1,3}\b                       # abbreviated IPv4 loopback
-        | \b(?:2130706433|0x7f000001|017700000001)\b         # numeric IPv4 loopback
         | \[(?:[0-9a-f]{0,4}:){2,7}[0-9a-f:]*\]              # bracketed IPv6
         | (?<![0-9a-f])(?:[0-9a-f]{0,4}:){2,7}[0-9a-f:]*(?![0-9a-f:]) # bare IPv6
     )
     """
+)
+_LEGACY_IPV4_COMPONENT = r"(?:0x[0-9a-f]{1,8}|0[0-7]{0,11}|[1-9]\d{0,9})"
+_LEGACY_IPV4_LITERAL = re.compile(
+    rf"""(?ix)
+    (?<![\w.])
+    (?:
+        (?:{_LEGACY_IPV4_COMPONENT})(?:\.(?:{_LEGACY_IPV4_COMPONENT})){{1,3}}
+        | 0x[0-9a-f]{{1,8}}
+        | 0[0-7]{{1,11}}
+        | [1-9]\d{{6,9}}
+    )
+    \.?(?![\w.])
+    """
+)
+_LEGACY_IPV4_OVERFLOW = re.compile(
+    r"""(?ix)
+    (?<![\w.])
+    (?:
+        0x[0-9a-f]{9,}(?![0-9a-f])
+        | 0[0-7]{12,}(?![0-7])
+        | [1-9]\d{10,}(?!\d)
+    )
+    (?=\.|[^\w.]|$)
+    """
+)
+_SHORT_DECIMAL_IPV4_LITERAL = re.compile(r"(?<![\w.])(?:0|[1-9]\d{0,5})(?![\w.])")
+_HTTP_STATUS_REFERENCE = re.compile(
+    r"(?i)\b(?:the\s+)?(?:request|response)\s+returns?\s+([1-5]\d{2})\b"
 )
 _OVERRIDE_INTENT = re.compile(
     r"(?i)\b(?:ignore|disregard|override|bypass|skip|forget|regardless of|instead of)\b"
@@ -89,6 +115,21 @@ _PROMPT_NOTE_SAFE_ACTION = re.compile(
 def _one_line(value: Any) -> str:
     """Normalize every Unicode line boundary before rendering one record."""
     return _RECORD_SEPARATOR.sub(" ", str(value)).strip()
+
+
+def _has_host_reference(text: str) -> bool:
+    """Reject names plus conventional and legacy numeric IP address literals."""
+    if (
+        _HOST_REFERENCE.search(text)
+        or _LEGACY_IPV4_LITERAL.search(text)
+        or _LEGACY_IPV4_OVERFLOW.search(text)
+    ):
+        return True
+    status_spans = [match.span(1) for match in _HTTP_STATUS_REFERENCE.finditer(text)]
+    return any(
+        match.span() not in status_spans
+        for match in _SHORT_DECIMAL_IPV4_LITERAL.finditer(text)
+    )
 
 
 # ── session identity ───────────────────────────────────────────────────────
@@ -1101,12 +1142,12 @@ def _prompt_note_content_error(
     if len(lines) > 1 and not _PROMPT_NOTE_FORMAT.match(lines[1]):
         return "Every line of a prompt note must use 'When <specific condition>, <one action>.'"
     if any(
-        _RESOURCE_REFERENCE.search(line) or _HOST_REFERENCE.search(line)
+        _RESOURCE_REFERENCE.search(line) or _has_host_reference(line)
         for line in lines
     ):
         if any(_RESOURCE_NETWORK_OR_SHELL.search(line) for line in lines):
             return "Prompt note cannot reference URLs, commands, or shell syntax"
-        if any(_HOST_REFERENCE.search(line) for line in lines):
+        if any(_has_host_reference(line) for line in lines):
             return "Prompt note cannot reference hosts"
         return "Prompt note cannot reference file paths or environment variables"
     if any(_OVERRIDE_INTENT.search(line) for line in lines):
