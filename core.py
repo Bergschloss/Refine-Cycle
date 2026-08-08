@@ -107,9 +107,36 @@ _PROMPT_NOTE_SAFE_ACTION = re.compile(
         | summarize\s+(?:the\s+)?(?:common\s+cause|error|failure|result|outcome)
         | use\s+the\s+(?:supplied|provided|exact)\s+(?:spelling|name|format)
         | wait\s+for\s+(?:clarification|confirmation|approval|input)
+        | (?:always\s+)?(?:include|provide|supply|set|pass)\s+(?:both\s+|all\s+)?(?:the\s+)?(?:required\s+)?(?:[\u2018\u2019][^\u2018\u2019]+[\u2018\u2019](?:\s*(?:,|and|or)\s*[\u2018\u2019][^\u2018\u2019]+[\u2018\u2019])*\s+)?(?:missing\s+)?(?:fields?|arguments?|parameters?|values?|keys?)
     )\.?
     """
 )
+
+# Canonical examples — one per allowed action class. The model sees these in the
+# proposal prompt so it knows what forms are accepted; the anti-drift test asserts
+# every one passes the regex above.
+PROMPT_NOTE_ACTION_EXAMPLES = (
+    "retry the request",
+    "log the error",
+    "verify the expected endpoint",
+    "ask for clarification",
+    "confirm it before acting",
+    "avoid unsupported claims",
+    "keep the response concise",
+    "wait for clarification",
+    "prefer unified format",
+    "mention the limitation plainly",
+    "use the supplied spelling",
+    "reject the invalid request",
+    "summarize the common cause",
+    "redact credentials",
+    "follow the existing policy",
+    "check the relevant tests before acting",
+    "always include both \u2018path\u2019 and \u2018content\u2019 fields",
+    "include the required parameters",
+    "provide the missing fields",
+)
+
 
 
 def _one_line(value: Any) -> str:

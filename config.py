@@ -66,20 +66,35 @@ def _get_refine_entry() -> Dict[str, Any]:
     return entry
 
 
-def get_bool(key: str, default: bool) -> bool:
-    """Read a boolean config key with a default. Accepts string representations."""
-    entry = _get_refine_entry()
-    val = entry.get(key)
-    if isinstance(val, bool):
-        return val
-    if isinstance(val, str):
-        normalized = val.strip().lower()
+def _parse_bool(value, default: bool, key_for_log: str) -> bool:
+    """Unified boolean parser for config keys including trust flags.
+
+    A bare ``bool(value)`` is wrong for exactly the values people write: unquoted
+    ``0`` arrives as ``int`` and quoted ``"false"`` as a non-empty ``str``, and
+    both are truthy. That failure is silent and it fails *open* — the operator
+    believes a switch is off while the plugin acts as if it is on.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if value in (0, 1):
+            return bool(value)
+    elif isinstance(value, str):
+        normalized = value.strip().lower()
         if normalized in ("true", "yes", "1"):
             return True
         if normalized in ("false", "no", "0"):
             return False
-        logger.warning("Config key '%s' has unrecognized boolean value; using default", key)
+    if value is not None:
+        logger.warning(
+            "Config key '%s' has unrecognized boolean value; using default", key_for_log
+        )
     return default
+
+
+def get_bool(key: str, default: bool) -> bool:
+    """Read a boolean config key with a default. Accepts 0/1 and string forms."""
+    return _parse_bool(_get_refine_entry().get(key), default, key)
 
 
 def get_int(key: str, default: int, min_val: int = 1) -> int:
@@ -92,7 +107,9 @@ def get_int(key: str, default: int, min_val: int = 1) -> int:
         try:
             return max(int(val.strip()), min_val)
         except ValueError:
-            logger.warning("Config key '%s' has unrecognized integer value; using default", key)
+            pass
+    if val is not None:
+        logger.warning("Config key '%s' has unrecognized integer value; using default", key)
     return default
 
 
@@ -265,12 +282,16 @@ def llm_model() -> str:
 
 def llm_allow_model_override() -> bool:
     """Whether the trust policy allows refine to request a specific model."""
-    return bool(_llm_entry().get("allow_model_override", False))
+    return _parse_bool(
+        _llm_entry().get("allow_model_override"), False, "llm.allow_model_override"
+    )
 
 
 def llm_allow_provider_override() -> bool:
     """Whether the trust policy allows refine to request a specific provider."""
-    return bool(_llm_entry().get("allow_provider_override", False))
+    return _parse_bool(
+        _llm_entry().get("allow_provider_override"), False, "llm.allow_provider_override"
+    )
 
 
 def live_main_target() -> Dict[str, str]:
