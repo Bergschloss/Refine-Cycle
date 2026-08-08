@@ -233,6 +233,7 @@ class _Reply(NamedTuple):
     parsed: Optional[Dict[str, Any]]
     failure: str = ""
     detail: str = ""
+    salvaged: bool = False
 
 
 def _output_tokens(result: Any) -> int:
@@ -278,7 +279,7 @@ def _salvage_parsed(result: Any, *, requested_max_tokens: int) -> _Reply:
     if text:
         value = _extract_first_json_object(text)
         if value is not None:
-            return _Reply(sanitize(value))
+            return _Reply(sanitize(value), salvaged=True)
     output_tokens = _output_tokens(result)
     if not text:
         if output_tokens:
@@ -351,6 +352,9 @@ def _propose_structured(
         )
         _record_call_meta(result, call_started)
         reply = _salvage_parsed(result, requested_max_tokens=max_tokens)
+        _call_meta.value["output_mode"] = (
+            "json_schema_salvage" if reply.salvaged else "json_schema"
+        )
         return reply.parsed or _incomplete_proposal(reply)
     except PluginLlmTrustError:
         _record_call_meta(None, call_started)
@@ -377,6 +381,9 @@ def _propose_structured(
             raise
         _record_call_meta(result, call_started)
         reply = _salvage_parsed(result, requested_max_tokens=max_tokens)
+        _call_meta.value["output_mode"] = (
+            "json_mode_salvage" if reply.salvaged else "json_mode"
+        )
         return reply.parsed or _incomplete_proposal(reply)
 
 
@@ -458,6 +465,7 @@ def review_fallback(llm: PluginLlm, evidence_text: str, *, target: Optional[Dict
     )
     try:
         call_started = time.time()
+        _reviewer_used_json_mode = False
         try:
             result = llm.complete_structured(
                 system_prompt=scrub_text(REVIEWER_FALLBACK_SYSTEM_PROMPT),
@@ -478,6 +486,7 @@ def review_fallback(llm: PluginLlm, evidence_text: str, *, target: Optional[Dict
                 "Reviewer json_schema failed (%s); falling back to json_mode",
                 scrub_text(str(schema_exc)),
             )
+            _reviewer_used_json_mode = True
             call_started = time.time()
             try:
                 result = llm.complete_structured(
@@ -499,6 +508,14 @@ def review_fallback(llm: PluginLlm, evidence_text: str, *, target: Optional[Dict
                 raise
         _record_call_meta(result, call_started)
         reply = _salvage_parsed(result, requested_max_tokens=REVIEWER_MAX_TOKENS)
+        if _reviewer_used_json_mode:
+            _call_meta.value["output_mode"] = (
+                "json_mode_salvage" if reply.salvaged else "json_mode"
+            )
+        else:
+            _call_meta.value["output_mode"] = (
+                "json_schema_salvage" if reply.salvaged else "json_schema"
+            )
         if reply.failure:
             rationale = (
                 "Reviewer returned no final answer."

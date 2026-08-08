@@ -5309,6 +5309,77 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
         self.assertNotEqual(result.get("outcome"), "target_issue")
         self.assertTrue(result["llm_meta"].get("target_issues"))
 
+    # ── Telemetry observability (Round 5) ────────────────────────────────────
+
+    def test_output_mode_records_json_schema_on_direct_parsed(self):
+        model = MockLlm(MockResult(
+            {"action": "no_op", "reason": "nothing", "evidence": [],
+             "kind": "", "name": "", "content": ""},
+            model="test-model",
+        ))
+        core.refine_run(model, session_id="session")
+        entries = journal.entries()
+        latest = entries[-1] if entries else {}
+        meta = latest.get("llm_meta", {})
+        self.assertEqual(meta.get("output_mode"), "json_schema")
+
+    def test_output_mode_records_json_mode_on_schema_failure(self):
+        model = MockLlm(
+            RuntimeError("schema unsupported"),
+            MockResult(
+                {"action": "no_op", "reason": "nothing", "evidence": [],
+                 "kind": "", "name": "", "content": ""},
+                model="test-model",
+            ),
+        )
+        core.refine_run(model, session_id="session")
+        entries = journal.entries()
+        latest = entries[-1] if entries else {}
+        meta = latest.get("llm_meta", {})
+        self.assertEqual(meta.get("output_mode"), "json_mode")
+
+    def test_output_mode_records_salvage_when_parsed_is_none_but_text_has_json(self):
+        model = MockLlm(MockResult(
+            None,
+            text='{"action":"no_op","reason":"from text","evidence":[],"kind":"","name":"","content":""}',
+            model="test-model",
+        ))
+        core.refine_run(model, session_id="session")
+        entries = journal.entries()
+        latest = entries[-1] if entries else {}
+        meta = latest.get("llm_meta", {})
+        self.assertEqual(meta.get("output_mode"), "json_schema_salvage")
+
+    def test_signal_path_gate_opened_when_signal_present(self):
+        FakeHost.entry_config()["min_signal_required"] = True
+        model = MockLlm({"action": "no_op", "reason": "nothing"})
+        core.refine_run(model, session_id="session")
+        entries = journal.entries()
+        latest = entries[-1] if entries else {}
+        meta = latest.get("llm_meta", {})
+        self.assertEqual(meta.get("signal_path"), "gate_opened")
+
+    def test_signal_path_gate_disabled_when_min_signal_not_required(self):
+        FakeHost.entry_config()["min_signal_required"] = False
+        model = MockLlm({"action": "no_op", "reason": "nothing"})
+        core.refine_run(model, session_id="session")
+        entries = journal.entries()
+        latest = entries[-1] if entries else {}
+        meta = latest.get("llm_meta", {})
+        self.assertEqual(meta.get("signal_path"), "gate_disabled")
+
+    def test_grounded_and_fingerprint_offered_in_evidence_summary(self):
+        model = MockLlm({
+            "action": "no_op", "reason": "nothing",
+            "pattern_fingerprint": "",
+        })
+        result = core.refine_run(model, session_id="session")
+        evidence = result.get("evidence", {})
+        self.assertIn("fingerprint_offered", evidence)
+        self.assertIsInstance(evidence["fingerprint_offered"], int)
+        self.assertIn("grounded", evidence)
+        self.assertIs(evidence["grounded"], False)
+
     # ── Dry-run (Part E) ──────────────────────────────────────────────────────
 
     def test_dry_run_does_not_mutate_host(self):

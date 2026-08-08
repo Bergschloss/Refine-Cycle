@@ -1575,9 +1575,11 @@ def _refine_once(
     evidence_text = "\n".join(lines)
     proposal_context = safe_reason
     reviewer_context = ""
+    _signal_path = "gate_disabled"
     if config.min_signal_required() and not patterns.has_signal(
         error_patterns, corrections, min_count=config.min_pattern_count()
     ):
+        _signal_path = "no_signal"
         should_review = (
             config.reviewer_fallback_enabled()
             and len(evidence.get("messages", [])) >= config.reviewer_min_messages()
@@ -1591,7 +1593,7 @@ def _refine_once(
                 "requested_model": _run_target.get("model", ""),
                 "target_source": _run_target_source,
                 **{k: v for k, v in reviewer_call_meta.items() if k in (
-                    "reported_model", "latency_ms", "output_tokens"
+                    "reported_model", "latency_ms", "output_tokens", "output_mode"
                 )},
             }
             if _run_target_issues:
@@ -1698,6 +1700,7 @@ def _refine_once(
                 }
             reviewer_instructions = scrub_text(str(reviewer.get("instructions", "")))
             reviewer_context = reviewer_instructions
+            _signal_path = "reviewer_approved"
         else:
             proposal = {
                 "action": "no_op",
@@ -1726,6 +1729,9 @@ def _refine_once(
                 "reversible": False,
             }
 
+    if _signal_path == "gate_disabled" and config.min_signal_required():
+        _signal_path = "gate_opened"
+
     proposal = _llm.propose(
         llm=llm,
         evidence_text=evidence_text,
@@ -1747,8 +1753,9 @@ def _refine_once(
         "requested_provider": _run_target.get("provider", ""),
         "requested_model": _run_target.get("model", ""),
         "target_source": _run_target_source,
+        "signal_path": _signal_path,
         **{k: v for k, v in llm_meta.items() if k in (
-            "reported_model", "latency_ms", "output_tokens"
+            "reported_model", "latency_ms", "output_tokens", "output_mode"
         )},
     }
     if _run_target_issues:
@@ -1812,6 +1819,12 @@ def _refine_once(
         "messages": len(evidence.get("messages", [])),
         "errors": evidence.get("error_count", 0),
     }
+    _offered_fps = {
+        p.get("fingerprint", "") for p in error_patterns if p.get("fingerprint")
+    }
+    _proposal_fp = str(proposal.get("pattern_fingerprint", "") or "")
+    evidence_summary["fingerprint_offered"] = len(_offered_fps)
+    evidence_summary["grounded"] = bool(_proposal_fp and _proposal_fp in _offered_fps)
 
     if _run_target_unusable and proposal.get("action") == "no_op":
         failure_message = "The configured refine model target is unusable."
@@ -1967,7 +1980,7 @@ def _refine_once(
             "message": f"No actionable improvement found. {proposal.get('reason', '')}",
             "journal_id": entry_id,
             "proposal": proposal,
-            "evidence": evidence,
+            "evidence": evidence_summary,
             "reversible": False,
             "llm_meta": _run_llm_meta,
         }
