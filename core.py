@@ -108,8 +108,9 @@ _PROMPT_NOTE_SAFE_ACTION = re.compile(
         | use\s+the\s+(?:supplied|provided|exact)\s+(?:spelling|name|format)
         | wait\s+for\s+(?:clarification|confirmation|approval|input)
         | (?:always\s+)?(?:include|provide|supply|set|pass)\s+(?:both\s+|all\s+)?(?:the\s+)?(?:required\s+)?[\u2018\u2019](?:path|content)[\u2018\u2019](?:\s*(?:,|and|or)\s*[\u2018\u2019](?:path|content)[\u2018\u2019])*\s+(?:fields?|arguments?|parameters?|values?|keys?)
-        | always\s+include\s+both\s+path\s+and\s+content\s+fields?
-        | ask\s+before\s+retrying\s+(?:a|the)\s+third\s+time
+        | (?:always\s+)?include\s+both\s+path\s+and\s+content\s+fields?
+        | (?:always\s+)?include\s+both\s+required\s+fields?\s*:\s*path\s+and\s+content
+        | ask\s+before\s+retrying(?:\s+(?:a|the)\s+third\s+time)?
         | check\s+timing\s+assumptions\s+before\s+rerunning
         | mention\s+which\s+sections\s+were\s+skipped
     )\.?

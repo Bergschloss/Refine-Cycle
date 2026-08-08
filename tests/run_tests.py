@@ -3232,6 +3232,7 @@ class RefineTests(unittest.TestCase):
             "When summarizing repeated errors, summarize the common cause.",
             "When a command fails twice, ask before retrying a third time.",
             "When calling write_file, always include both path and content fields.",
+            "When calling write_file, include both required fields: path and content.",
             "When a test is flaky, check timing assumptions before rerunning.",
             "When summarizing a long file, mention which sections were skipped.",
         )
