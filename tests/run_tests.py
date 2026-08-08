@@ -348,6 +348,24 @@ def skill_proposal(name, body="# Guidance\n\nNew guidance."):
     }
 
 
+def baseline_for(content):
+    """Build a valid refine_baseline dict from skill content text."""
+    return {"exists": True, "sha256": journal.content_digest(content)}
+
+
+def patch_proposal(name, new_content, *, current_content=None, reason="Repeated failure"):
+    """Build a skill patch proposal with a proper locally grounded baseline."""
+    if current_content is None:
+        current_content = FakeHost.skills.get(name, "")
+    return {
+        "action": "patch", "kind": "skill", "name": name,
+        "content": new_content, "reason": reason,
+        "evidence": ["request failed"], "pattern_fingerprint": "deadbeef1234",
+        "expected_outcome": "The failure stops.",
+        "refine_baseline": baseline_for(current_content),
+    }
+
+
 def multi_proposal(*edits, summary="Add the skill and the memory that points at it"):
     return {
         "action": "multi", "kind": "", "name": "", "content": "", "category": "",
@@ -600,25 +618,60 @@ class RefineTests(unittest.TestCase):
         self.assertEqual(result, url)
 
     def test_content_retry_preserves_original_metadata(self):
-        """Wave 3.5: retry without reason/evidence still has original keys."""
-        original = {
-            "action": "create", "kind": "skill", "name": "test-skill",
+        """R7-04: production _finalize_edit retry preserves original metadata."""
+        original_parsed = {
+            "action": "create", "kind": "skill", "name": "retry-meta",
             "content": "",
             "reason": "persistent failure in API calls",
             "expected_outcome": "fewer 500 errors",
             "evidence": ["request failed twice"],
             "pattern_fingerprint": "deadbeef1234",
         }
-        retry_response = {
-            "action": "create", "kind": "skill", "name": "test-skill",
-            "content": "# New skill content\nHandle retries.",
+        # The retry model returns content but omits metadata
+        retry_content = skill_content("retry-meta", "# Guidance\n\nHandle retries.")
+        retry_model_response = {
+            "action": "create", "kind": "skill", "name": "retry-meta",
+            "content": retry_content,
         }
-        for key in ("reason", "expected_outcome", "evidence", "pattern_fingerprint"):
-            if not retry_response.get(key) and original.get(key):
-                retry_response[key] = original[key]
-        self.assertEqual(retry_response["reason"], "persistent failure in API calls")
-        self.assertEqual(retry_response["pattern_fingerprint"], "deadbeef1234")
-        self.assertEqual(retry_response["evidence"], ["request failed twice"])
+        model = MockLlm(retry_model_response)
+        result = llm._finalize_edit(
+            model, "short", "instructions", original_parsed,
+            allow_content_retry=True,
+        )
+        # Production preserved the original metadata
+        self.assertEqual(result["reason"], "persistent failure in API calls")
+        self.assertEqual(result["pattern_fingerprint"], "deadbeef1234")
+        self.assertEqual(result["evidence"], ["request failed twice"])
+        self.assertEqual(result["expected_outcome"], "fewer 500 errors")
+        self.assertEqual(result["content"], retry_content)
+
+    def test_content_retry_explicit_metadata_takes_precedence(self):
+        """R7-04: when retry explicitly provides metadata, it wins."""
+        original_parsed = {
+            "action": "create", "kind": "skill", "name": "retry-override",
+            "content": "",
+            "reason": "original reason",
+            "expected_outcome": "original outcome",
+            "evidence": ["original evidence"],
+            "pattern_fingerprint": "deadbeef1234",
+        }
+        retry_content = skill_content("retry-override", "# Guidance\n\nNew.")
+        retry_model_response = {
+            "action": "create", "kind": "skill", "name": "retry-override",
+            "content": retry_content,
+            "reason": "updated reason",
+            "evidence": ["updated evidence"],
+        }
+        model = MockLlm(retry_model_response)
+        result = llm._finalize_edit(
+            model, "short", "instructions", original_parsed,
+            allow_content_retry=True,
+        )
+        # Explicit retry metadata takes precedence
+        self.assertEqual(result["reason"], "updated reason")
+        self.assertEqual(result["evidence"], ["updated evidence"])
+        # Fields NOT in retry fall back to original
+        self.assertEqual(result["pattern_fingerprint"], "deadbeef1234")
 
     def test_merge_journal_stats_preserves_reported_model(self):
         """Wave 3.6: entry without llm_meta keeps existing reported_model."""
@@ -952,6 +1005,7 @@ class RefineTests(unittest.TestCase):
             "content": skill_content(name, "# Guidance\n\nUpdated guidance."),
             "reason": "A repeated failure needs a narrower instruction.",
             "evidence": [],
+            "refine_baseline": baseline_for(FakeHost.skills[name]),
         })
         patched_stats = ledger.load_stats()[name]
         self.assertEqual(patched_stats["version"], 2)
@@ -1533,6 +1587,7 @@ class RefineTests(unittest.TestCase):
         proposal = {
             "action": "patch", "kind": "skill", "name": name,
             "content": new, "reason": "failure", "evidence": [],
+            "refine_baseline": baseline_for(old),
         }
         FakeHost.add_skill(name, old)
         result = self.run_proposal(proposal)
@@ -1556,6 +1611,7 @@ class RefineTests(unittest.TestCase):
         result = self.run_proposal({
             "action": "patch", "kind": "skill", "name": name,
             "content": new, "reason": "failure", "evidence": [],
+            "refine_baseline": baseline_for(old),
         })
         entry = journal.get_entry(result["journal_id"])
         self.assertEqual(entry["snapshot"]["before"], old)
@@ -1672,6 +1728,7 @@ class RefineTests(unittest.TestCase):
         result = self.run_proposal({
             "action": "patch", "kind": "skill", "name": name,
             "content": new, "reason": "failure", "evidence": [],
+            "refine_baseline": baseline_for(old),
         })
         self.assertEqual(FakeHost.skills[name], new)
 
@@ -1904,6 +1961,7 @@ class RefineTests(unittest.TestCase):
             "action": "patch", "kind": "skill", "name": name,
             "content": skill_content(name, '# Guidance\n\ntoken="patch-secret-123!"'),
             "reason": "why", "evidence": [],
+            "refine_baseline": baseline_for(original),
         })
         patched_entry = journal.get_entry(patched["journal_id"])
         self.assertEqual(patched_entry["proposal"]["content"], FakeHost.skills[name])
@@ -2003,6 +2061,7 @@ class RefineTests(unittest.TestCase):
         pending = self.run_proposal({
             "action": "patch", "kind": "skill", "name": name,
             "content": content, "reason": "verify approval ordering", "evidence": [],
+            "refine_baseline": baseline_for(content),
         })
         entry = journal.get_entry(pending["journal_id"])
         core.refine_audit()
@@ -4135,12 +4194,13 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
         self.assertGreaterEqual(len(conflict_entries), 1)
         self.assertGreaterEqual(len(rejected_entries), 1)
 
-    def test_legacy_proposal_without_baseline_applies_normally(self):
+    def test_legacy_proposal_without_baseline_is_rejected(self):
+        """R7-02: a skill patch without refine_baseline is refused before apply."""
         name = "legacy-no-base"
         original = skill_content(name, "# Legacy content")
         replacement = skill_content(name, "# Legacy content\n\nFix.")
         FakeHost.add_skill(name, original)
-        # Manually assembled proposal without refine_baseline (as existing tests do)
+        # Manually assembled proposal without refine_baseline
         proposal = {
             "action": "patch", "kind": "skill", "name": name,
             "content": replacement, "reason": "Repeated failure",
@@ -4151,8 +4211,245 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
             proposal, trigger="manual", safe_reason="test",
             session="session", started=time.time()
         )
+        self.assertFalse(result["success"])
+        self.assertIn("refine_baseline", result["message"])
+        # Original skill was never modified
+        self.assertEqual(FakeHost.skills[name], original)
+
+    def test_non_dict_baseline_is_rejected(self):
+        """R7-02: refine_baseline that is not a dict is refused."""
+        name = "non-dict-base"
+        original = skill_content(name, "# Content")
+        FakeHost.add_skill(name, original)
+        for bad in (None, "string", 42, [1, 2], True):
+            proposal = {
+                "action": "patch", "kind": "skill", "name": name,
+                "content": skill_content(name, "# Fixed"),
+                "reason": "test", "evidence": [],
+                "refine_baseline": bad,
+            }
+            result = core._apply_edit(
+                proposal, trigger="manual", safe_reason="test",
+                session="session", started=time.time()
+            )
+            self.assertFalse(result["success"], f"baseline={bad!r} should be rejected")
+            self.assertEqual(FakeHost.skills[name], original)
+
+    def test_malformed_baseline_fields_are_rejected(self):
+        """R7-02: exists=False, uppercase sha, short sha, non-hex sha all rejected."""
+        name = "malformed-base"
+        original = skill_content(name, "# Content")
+        FakeHost.add_skill(name, original)
+        bad_baselines = [
+            {"exists": False, "sha256": "a" * 64},
+            {"exists": True, "sha256": "A" * 64},  # uppercase
+            {"exists": True, "sha256": "a" * 32},  # too short
+            {"exists": True, "sha256": "z" * 64},  # non-hex
+            {"exists": True},  # missing sha256
+            {"sha256": "a" * 64},  # missing exists
+        ]
+        for bad in bad_baselines:
+            proposal = {
+                "action": "patch", "kind": "skill", "name": name,
+                "content": skill_content(name, "# Fixed"),
+                "reason": "test", "evidence": [],
+                "refine_baseline": bad,
+            }
+            result = core._apply_edit(
+                proposal, trigger="manual", safe_reason="test",
+                session="session", started=time.time()
+            )
+            self.assertFalse(result["success"], f"baseline={bad!r} should be rejected")
+        self.assertEqual(FakeHost.skills[name], original)
+
+    def test_valid_baseline_with_matching_target_still_applies(self):
+        """R7-02: correct local baseline + unchanged target succeeds."""
+        name = "valid-base"
+        original = skill_content(name, "# Original content")
+        replacement = skill_content(name, "# Original content\n\nFixed.")
+        FakeHost.add_skill(name, original)
+        proposal = {
+            "action": "patch", "kind": "skill", "name": name,
+            "content": replacement, "reason": "test", "evidence": [],
+            "refine_baseline": baseline_for(original),
+        }
+        result = core._apply_edit(
+            proposal, trigger="manual", safe_reason="test",
+            session="session", started=time.time()
+        )
         self.assertTrue(result["success"])
         self.assertEqual(FakeHost.skills[name], replacement)
+
+    def test_transaction_rejects_all_when_later_patch_lacks_baseline(self):
+        """R7-02: a transaction with one no-baseline skill patch applies zero edits."""
+        FakeHost.entry_config()["max_edits_per_day"] = 5
+        name_a = "txn-base-ok"
+        name_b = "txn-base-missing"
+        body_a = skill_content(name_a, "# A")
+        body_b = skill_content(name_b, "# B")
+        FakeHost.add_skill(name_a, body_a)
+        FakeHost.add_skill(name_b, body_b)
+        replacement_a = skill_content(name_a, "# A\n\nFixed.")
+        replacement_b = skill_content(name_b, "# B\n\nFixed.")
+        edits = [
+            {
+                "action": "patch", "kind": "skill", "name": name_a,
+                "content": replacement_a, "reason": "test", "evidence": [],
+                "refine_baseline": baseline_for(body_a),
+            },
+            {
+                "action": "patch", "kind": "skill", "name": name_b,
+                "content": replacement_b, "reason": "test", "evidence": [],
+                # No refine_baseline — this should trigger rejection
+            },
+        ]
+        multi = {
+            "action": "multi", "kind": "", "name": "", "content": "",
+            "summary": "Fix both", "reason": "test", "evidence": [],
+            "edits": edits,
+        }
+        result = core._apply_transaction(
+            multi, trigger="manual", safe_reason="test",
+            session="session", started=time.time()
+        )
+        self.assertFalse(result["success"])
+        self.assertEqual(result["edits_applied"], 0)
+        # Neither skill was modified
+        self.assertEqual(FakeHost.skills[name_a], body_a)
+        self.assertEqual(FakeHost.skills[name_b], body_b)
+        # No daily budget consumed
+        self.assertFalse(journal.daily_limit_reached())
+
+    def test_no_budget_consumed_for_rejected_baseline(self):
+        """R7-02: a rejected missing baseline edit costs zero daily edits."""
+        FakeHost.entry_config()["max_edits_per_day"] = 1
+        name = "budget-base"
+        original = skill_content(name, "# Content")
+        FakeHost.add_skill(name, original)
+        proposal = {
+            "action": "patch", "kind": "skill", "name": name,
+            "content": skill_content(name, "# Fixed"),
+            "reason": "test", "evidence": [],
+            # No refine_baseline
+        }
+        core._apply_edit(
+            proposal, trigger="manual", safe_reason="test",
+            session="session", started=time.time()
+        )
+        # Budget was not consumed — we can still apply a valid edit
+        self.assertFalse(journal.daily_limit_reached())
+
+    # ── pending_approval transaction stop tests (R7-01) ───────────────────────
+
+    def test_transaction_stops_at_pending_approval_and_does_not_call_second_edit(self):
+        """R7-01: first edit staged -> second edit never invoked."""
+        FakeHost.entry_config()["max_edits_per_day"] = 5
+        apply_calls = []
+        original_apply = core._apply_edit
+
+        def tracking_apply(proposal, **kwargs):
+            apply_calls.append(proposal)
+            if len(apply_calls) == 1:
+                # Simulate a staged approval on the first edit
+                entry_id = journal.prepare(
+                    trigger=kwargs["trigger"],
+                    reason=kwargs["safe_reason"],
+                    session_id=kwargs["session"],
+                    proposal=proposal,
+                    backup_path="",
+                    recovery={"type": "skill_create", "name": proposal.get("name", "")},
+                    group=kwargs.get("group"),
+                    llm_meta=kwargs.get("llm_meta"),
+                )
+                journal.finalize(entry_id, "pending_approval", pending_id="pending-abc")
+                return {
+                    "success": True,
+                    "outcome": "pending_approval",
+                    "message": "staged",
+                    "proposal": proposal,
+                    "result": {"success": True, "staged": True, "pending_id": "pending-abc"},
+                    "backup_path": "",
+                    "reversible": False,
+                    "edits_applied": 1,
+                    "journal_id": entry_id,
+                }
+            return original_apply(proposal, **kwargs)
+
+        edits = [
+            {"action": "create", "kind": "skill", "name": "pend-a", "content": "# A"},
+            {"action": "create", "kind": "skill", "name": "pend-b", "content": "# B"},
+        ]
+        multi = {
+            "action": "multi", "kind": "", "name": "", "content": "",
+            "summary": "Two edits", "reason": "test", "evidence": [],
+            "edits": edits,
+        }
+        with patch.object(core, "_apply_edit", side_effect=tracking_apply):
+            result = core._apply_transaction(
+                multi, trigger="manual", safe_reason="test",
+                session="session", started=time.time()
+            )
+        # Second edit was never called
+        self.assertEqual(len(apply_calls), 1)
+        # Result reports partial_success, not completed
+        self.assertFalse(result["success"])
+        self.assertEqual(result["outcome"], "partial_success")
+        self.assertEqual(result["edits_applied"], 1)
+        self.assertFalse(result["reversible"])
+        # The journal has durable traces for both: first pending, second rejected
+        entries = journal.entries()
+        pending_entries = [e for e in entries if e.get("outcome") == "pending_approval"]
+        rejected_entries = [e for e in entries if e.get("outcome") == "rejected"]
+        self.assertEqual(len(pending_entries), 1)
+        self.assertGreaterEqual(len(rejected_entries), 1)
+        # Rejected entry explains why it was not attempted
+        self.assertIn("pending", rejected_entries[-1].get("error", "").lower())
+
+    def test_transaction_pending_approval_does_not_consume_extra_budget(self):
+        """R7-01: only the staged edit consumes one daily slot."""
+        FakeHost.entry_config()["max_edits_per_day"] = 3
+
+        def staged_apply(proposal, **kwargs):
+            entry_id = journal.prepare(
+                trigger=kwargs["trigger"],
+                reason=kwargs["safe_reason"],
+                session_id=kwargs["session"],
+                proposal=proposal,
+                backup_path="",
+                recovery={"type": "skill_create", "name": proposal.get("name", "")},
+                group=kwargs.get("group"),
+                llm_meta=kwargs.get("llm_meta"),
+            )
+            journal.finalize(entry_id, "pending_approval", pending_id="pend-1")
+            return {
+                "success": True,
+                "outcome": "pending_approval",
+                "message": "staged",
+                "proposal": proposal,
+                "result": {"success": True, "staged": True, "pending_id": "pend-1"},
+                "backup_path": "",
+                "reversible": False,
+                "edits_applied": 1,
+                "journal_id": entry_id,
+            }
+
+        edits = [
+            {"action": "create", "kind": "skill", "name": "budget-a", "content": "# A"},
+            {"action": "create", "kind": "skill", "name": "budget-b", "content": "# B"},
+            {"action": "create", "kind": "skill", "name": "budget-c", "content": "# C"},
+        ]
+        multi = {
+            "action": "multi", "kind": "", "name": "", "content": "",
+            "summary": "Three edits", "reason": "test", "evidence": [],
+            "edits": edits,
+        }
+        with patch.object(core, "_apply_edit", side_effect=staged_apply):
+            core._apply_transaction(
+                multi, trigger="manual", safe_reason="test",
+                session="session", started=time.time()
+            )
+        # Only one daily edit consumed, not three
+        self.assertFalse(journal.daily_limit_reached())
 
     def test_full_path_conflict_through_refine_run(self):
         name = "full-path"
@@ -5982,6 +6279,35 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
 
     # ── Journal directory migration (Part C) ──────────────────────────────────
 
+    def test_sqlite_uri_reads_correct_db_with_special_characters(self):
+        """R7-03: _open_db reads the correct file when path contains spaces and #."""
+        import shutil
+        base = Path(tempfile.mkdtemp(prefix="refine-uri-r7-"))
+        try:
+            special_dir = base / "space # hash"
+            special_dir.mkdir()
+            db_path = special_dir / "state.db"
+            # Create a real SQLite file with a known table and value
+            setup_conn = sqlite3.connect(db_path)
+            setup_conn.execute("CREATE TABLE probe (value TEXT)")
+            setup_conn.execute("INSERT INTO probe VALUES ('correct-db')")
+            setup_conn.commit()
+            setup_conn.close()
+            # Call production _open_db via patched config
+            with patch.object(config, "state_db_path", return_value=db_path):
+                conn = core._open_db()
+            self.assertIsNotNone(conn, "Connection must open on special-char path")
+            # Verify it reads from the intended database
+            row = conn.execute("SELECT value FROM probe").fetchone()
+            self.assertEqual(row[0], "correct-db")
+            # Verify writes are blocked (mode=ro)
+            with self.assertRaises(sqlite3.OperationalError) as ctx:
+                conn.execute("INSERT INTO probe VALUES ('should-fail')")
+            self.assertIn("readonly", str(ctx.exception).lower())
+            conn.close()
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
     def test_migration_copies_files_and_renames_legacy(self):
         legacy = self.root / "hermes" / "plugins" / "refine"
         legacy.mkdir(parents=True)
@@ -6950,6 +7276,97 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
             trajectory.count("</untrusted_tool_result>"),
         )
         self.assertIn("Trajectory truncated", "\n".join(logs.output))
+
+    # ── Journal dedup boundary tests (R7-05) ──────────────────────────────────
+
+    def test_dedup_identical_recent_applied_returns_true(self):
+        """R7-05: identical recent applied proposal is a duplicate."""
+        proposal = {"action": "create", "kind": "skill", "name": "dedup-a", "content": "x"}
+        entries = [{
+            "id": "e1", "ts": time.time() - 100,
+            "outcome": "applied",
+            "proposal": proposal,
+        }]
+        with patch.object(journal, "_load_entries", return_value=entries):
+            self.assertTrue(journal.was_applied_recently(proposal, 7))
+
+    def test_dedup_different_proposal_returns_false(self):
+        """R7-05: a different proposal is not a duplicate."""
+        original = {"action": "create", "kind": "skill", "name": "dedup-a", "content": "x"}
+        different = {"action": "create", "kind": "skill", "name": "dedup-b", "content": "y"}
+        entries = [{
+            "id": "e1", "ts": time.time() - 100,
+            "outcome": "applied",
+            "proposal": original,
+        }]
+        with patch.object(journal, "_load_entries", return_value=entries):
+            self.assertFalse(journal.was_applied_recently(different, 7))
+
+    def test_dedup_older_than_window_returns_false(self):
+        """R7-05: identical but older than within_days returns False."""
+        proposal = {"action": "create", "kind": "skill", "name": "dedup-old", "content": "x"}
+        entries = [{
+            "id": "e1", "ts": time.time() - (8 * 86400),  # 8 days ago
+            "outcome": "applied",
+            "proposal": proposal,
+        }]
+        with patch.object(journal, "_load_entries", return_value=entries):
+            self.assertFalse(journal.was_applied_recently(proposal, 7))
+
+    def test_dedup_pending_approval_counts_as_consumed(self):
+        """R7-05: pending_approval is a consumed outcome for dedup."""
+        proposal = {"action": "create", "kind": "skill", "name": "dedup-pend", "content": "x"}
+        for outcome in ("pending_approval", "prepared", "rollback_prepared", "pending_rollback"):
+            entries = [{
+                "id": "e1", "ts": time.time() - 100,
+                "outcome": outcome,
+                "proposal": proposal,
+            }]
+            with patch.object(journal, "_load_entries", return_value=entries):
+                self.assertTrue(
+                    journal.was_applied_recently(proposal, 7),
+                    f"outcome={outcome} should be consumed",
+                )
+
+    def test_dedup_rejected_and_error_are_not_consumed(self):
+        """R7-05: rejected and error outcomes are not duplicates."""
+        proposal = {"action": "create", "kind": "skill", "name": "dedup-rej", "content": "x"}
+        for outcome in ("rejected", "error", "rolled_back", "conflict"):
+            entries = [{
+                "id": "e1", "ts": time.time() - 100,
+                "outcome": outcome,
+                "proposal": proposal,
+            }]
+            with patch.object(journal, "_load_entries", return_value=entries):
+                self.assertFalse(
+                    journal.was_applied_recently(proposal, 7),
+                    f"outcome={outcome} should not be consumed",
+                )
+
+    # ── Signal gate boundary tests (R7-06) ────────────────────────────────────
+
+    def test_signal_no_patterns_no_corrections_returns_false(self):
+        """R7-06: empty inputs -> no signal."""
+        self.assertFalse(patterns.has_signal([], [], min_count=2))
+
+    def test_signal_below_threshold_returns_false(self):
+        """R7-06: one occurrence below min_count=2 -> no signal."""
+        below = [{"count": 1, "sessions_seen": 1}]
+        self.assertFalse(patterns.has_signal(below, [], min_count=2))
+
+    def test_signal_at_threshold_returns_true(self):
+        """R7-06: count exactly at min_count -> signal."""
+        at_threshold = [{"count": 2, "sessions_seen": 1}]
+        self.assertTrue(patterns.has_signal(at_threshold, [], min_count=2))
+
+    def test_signal_two_sessions_at_threshold_returns_true(self):
+        """R7-06: two sessions at session threshold -> signal."""
+        two_sessions = [{"count": 1, "sessions_seen": 2}]
+        self.assertTrue(patterns.has_signal(two_sessions, [], min_count=2))
+
+    def test_signal_correction_with_no_patterns_returns_true(self):
+        """R7-06: explicit correction with no patterns -> signal."""
+        self.assertTrue(patterns.has_signal([], ["user correction"], min_count=2))
 
 
 if __name__ == "__main__":

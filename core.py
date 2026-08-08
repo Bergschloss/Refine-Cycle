@@ -261,7 +261,8 @@ def _open_db() -> Optional[sqlite3.Connection]:
     if not path.is_file():
         return None
     try:
-        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        uri = path.resolve().as_uri() + "?mode=ro"
+        connection = sqlite3.connect(uri, uri=True)
         connection.row_factory = sqlite3.Row
         return connection
     except Exception as exc:
@@ -1316,26 +1317,31 @@ def _skill_baseline_conflict(
 ) -> Optional[str]:
     """Return a conflict message when the patch target no longer matches planning.
 
-    Returns None (no conflict) when:
-      - baseline is absent or not a dict (legacy proposal without baseline);
-      - baseline has invalid structure (logged but not treated as conflict).
+    Returns None (no conflict) only when baseline is a well-formed dict with
+    exists=True and a valid 64-hex-char sha256 that matches the current state.
 
-    Returns an error string when the current state diverges from the planning
-    baseline, meaning the model's replacement was built from stale content.
+    Returns an error string when:
+      - baseline is absent or not a dict (unsafe: patch was built without
+        verifying the target content);
+      - baseline has invalid structure (exists != True, or sha256 malformed);
+      - the current state diverges from the planning baseline.
     """
     import re as _re
 
     baseline = proposal.get("refine_baseline")
+    name = str(proposal.get("name", ""))
     if not isinstance(baseline, dict):
-        return None  # Legacy proposal without baseline — today's behaviour unchanged.
+        return (
+            f"Skill '{name}': patch requires a locally grounded refine_baseline "
+            "(absent or not a dict)"
+        )
     exists = baseline.get("exists")
     sha = str(baseline.get("sha256", ""))
     if exists is not True or not _re.fullmatch(r"[0-9a-f]{64}", sha):
-        logger.warning(
-            "Ignoring malformed refine_baseline in proposal for '%s'",
-            proposal.get("name", ""),
+        return (
+            f"Skill '{name}': patch has malformed refine_baseline "
+            f"(exists={exists!r}, sha256 valid={bool(_re.fullmatch(r'[0-9a-f]{{64}}', sha))})"
         )
-        return None
     name = str(proposal.get("name", ""))
     if observed_sha:
         # Check B: compare against the sha from prepare_skill_recovery snapshot.
@@ -2456,13 +2462,13 @@ def _apply_transaction(
     # ── Stale-plan preflight: reject the entire transaction if any skill patch
     # was built from content that no longer matches the live host state. This
     # prevents a partial apply where edit #1 succeeds but edit #2 would conflict.
+    # Also rejects patches with missing or malformed baselines (fail closed).
     stale_edits: List[int] = []
     for index, edit in enumerate(edits):
         normalized = edit_proposal(edit)
         if (
             normalized.get("kind") == "skill"
             and normalized.get("action") == "patch"
-            and isinstance(normalized.get("refine_baseline"), dict)
         ):
             conflict = _skill_baseline_conflict(normalized)
             if conflict:
@@ -2532,6 +2538,12 @@ def _apply_transaction(
                 f"An earlier edit of transaction {group_id} did not complete"
             )
             break
+        if item.get("outcome") == "pending_approval":
+            stop_reason = (
+                "An earlier edit is pending host approval; remaining edits "
+                "cannot proceed until the approval is resolved"
+            )
+            break
 
     # Every edit of a transaction leaves a durable trace, so a partial
     # application is readable from the journal alone rather than only from a
@@ -2557,7 +2569,8 @@ def _apply_transaction(
     skipped = len(edits) - len(results)
     elapsed = time.time() - started
 
-    if len(succeeded) == len(edits) and not dropped:
+    has_pending = any(item.get("outcome") == "pending_approval" for item in results)
+    if len(succeeded) == len(edits) and not dropped and not has_pending:
         success, outcome = True, "completed"
         message = (
             f"transaction {group_id}: {len(succeeded)} edit(s) applied or reserved "
