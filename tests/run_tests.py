@@ -7349,6 +7349,30 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
                 self.assertFalse(result["should_refine"])
                 self.assertEqual(result["failure"], "malformed")
 
+    def test_missing_kind_is_journaled_malformed_while_fused_create_skill_is_valid(self):
+        """R9-10: do not infer kind from content; keep fused action compatibility."""
+        missing_kind = core.refine_run(MockLlm({
+            "action": "create", "name": "missing-kind",
+            "content": skill_content("missing-kind", "# Guidance"),
+            "reason": "test",
+        }))
+        self.assertFalse(missing_kind["success"])
+        self.assertEqual(missing_kind["failure"], "malformed")
+        self.assertEqual(
+            journal.get_entry(missing_kind["journal_id"])["outcome"],
+            "llm_incomplete",
+        )
+        self.assertFalse(FakeHost.actions)
+
+        fused = llm.propose(MockLlm({
+            "action": "create_skill", "name": "fused-create",
+            "content": skill_content("fused-create", "# Guidance"),
+            "reason": "test",
+        }), "evidence", [], [])
+        self.assertEqual(fused["action"], "create")
+        self.assertEqual(fused["kind"], "skill")
+        self.assertFalse(fused.get("failure"))
+
     def test_semantically_invalid_proposals_are_not_successful_noops(self):
         for payload in (
             {"action": "delete", "kind": "skill", "name": "x"},

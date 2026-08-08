@@ -705,12 +705,6 @@ def _normalize_fields(parsed: Dict[str, Any]) -> Tuple[str, str, str, str, str]:
     name = str(parsed.get("name", "")).strip()
     content = str(parsed.get("content", ""))
     category = str(parsed.get("category", "")).strip()
-    if kind not in ("skill", "memory", "prompt") and action == "create":
-        kind = (
-            "skill"
-            if re.search(r"^---\s*$", content[:300], re.M) and "name:" in content[:300]
-            else "memory"
-        )
     if kind == "skill":
         name = _normalize_skill_name(name)
     return action, kind, name, content, category
