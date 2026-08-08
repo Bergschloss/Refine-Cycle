@@ -7,7 +7,7 @@ All values have sensible defaults — config.yaml only provides overrides.
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 _RUNTIME_JOURNAL_DIR: Optional[Path] = None
@@ -113,13 +113,24 @@ def get_int(key: str, default: int, min_val: int = 1) -> int:
     return default
 
 
+def _coerce_string_config_value(value: Any, key: str) -> Tuple[str, str]:
+    """Return safe string config text plus a user-visible conversion issue."""
+    if isinstance(value, str):
+        return value, ""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        logger.warning("Config key '%s' uses a numeric value; coercing it to text", key)
+        return str(value), f"config {key} was coerced from a numeric value"
+    if value is not None:
+        logger.warning("Config key '%s' has an unrecognized string value; ignoring it", key)
+        return "", f"config {key} was ignored because it must be text or a number"
+    return "", ""
+
+
 def get_str(key: str, default: str = "") -> str:
-    """Read a string config key."""
+    """Read a string config key, accepting non-boolean numeric YAML scalars."""
     entry = _get_refine_entry()
-    val = entry.get(key)
-    if isinstance(val, str):
-        return val
-    return default
+    value, _issue = _coerce_string_config_value(entry.get(key), key)
+    return value if value else default
 
 
 def config_available() -> bool:
@@ -218,8 +229,17 @@ def skip_session_sources() -> List[str]:
     """
     entry = _get_refine_entry()
     val = entry.get("skip_session_sources")
-    if isinstance(val, list) and all(isinstance(item, str) for item in val):
-        return [item.strip().lower() for item in val if item.strip()]
+    if isinstance(val, list):
+        sources: List[str] = []
+        for index, item in enumerate(val):
+            text, _issue = _coerce_string_config_value(
+                item, f"skip_session_sources[{index}]"
+            )
+            if text.strip():
+                sources.append(text.strip().lower())
+        return sources
+    if val is not None:
+        logger.warning("Config key 'skip_session_sources' must be a list; using default")
     return ["cron"]
 
 
@@ -261,10 +281,14 @@ def _llm_entry() -> Dict[str, Any]:
     return block if isinstance(block, dict) else {}
 
 
+def _llm_string(key: str) -> Tuple[str, str]:
+    value, issue = _coerce_string_config_value(_llm_entry().get(key), f"llm.{key}")
+    return value.strip(), issue
+
+
 def llm_provider() -> str:
     """Provider to request for refine's own calls; empty means host default."""
-    value = _llm_entry().get("provider")
-    return value.strip() if isinstance(value, str) else ""
+    return _llm_string("provider")[0]
 
 
 def llm_model() -> str:
@@ -276,8 +300,7 @@ def llm_model() -> str:
     host still gates it: without ``allow_model_override`` (and
     ``allow_provider_override``) the request is refused rather than applied.
     """
-    value = _llm_entry().get("model")
-    return value.strip() if isinstance(value, str) else ""
+    return _llm_string("model")[0]
 
 
 def llm_allow_model_override() -> bool:
@@ -354,8 +377,9 @@ def effective_llm_target() -> Dict[str, Any]:
         import journal  # type: ignore
 
     issues: list = []
-    cfg_provider = llm_provider()
-    cfg_model = llm_model()
+    cfg_provider, provider_type_issue = _llm_string("provider")
+    cfg_model, model_type_issue = _llm_string("model")
+    issues.extend(issue for issue in (provider_type_issue, model_type_issue) if issue)
     # The override store refuses unusable values. The config writes the same
     # field, so it meets the same rule here — otherwise the check would hold on
     # one path and not the other, and a value refused from /refine model would be

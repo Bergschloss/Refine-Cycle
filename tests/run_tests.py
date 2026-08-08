@@ -5804,6 +5804,23 @@ print(json.dumps(core.refine_run(ProcessLlm(), session_id="session")))
         FakeHost.entry_config()["reviewer_cooldown_minutes"] = 0
         self.assertEqual(config.reviewer_cooldown_minutes(), 0)
 
+    def test_config_numeric_coercion_and_type_issues_are_visible(self):
+        FakeHost.entry_config()["llm"] = {"provider": 7, "model": 4}
+        FakeHost.entry_config()["skip_session_sources"] = ["cron", "batch", 123]
+        target = config.effective_llm_target()
+        self.assertEqual(target["provider"], "7")
+        self.assertEqual(target["model"], "4")
+        self.assertTrue(any("coerced" in issue for issue in target["issues"]))
+        self.assertEqual(config.skip_session_sources(), ["cron", "batch", "123"])
+        status = core.refine_status()
+        self.assertIn("model_target_issue", status["warning_codes"])
+        self.assertIn("coerced", plugin_init._handle_refine_command("status"))
+
+        FakeHost.entry_config()["llm"] = {"model": True}
+        rejected = config.effective_llm_target()
+        self.assertEqual(rejected["model"], "")
+        self.assertTrue(any("ignored" in issue for issue in rejected["issues"]))
+
     def test_config_integer_booleans_and_trust_gate_string(self):
         """Round 6: int 0/1 and string 'false'/'true' must work for trust flags."""
         FakeHost.entry_config()["auto_enabled"] = 0
