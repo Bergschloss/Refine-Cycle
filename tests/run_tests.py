@@ -445,9 +445,25 @@ class RefineTests(unittest.TestCase):
     def test_error_status_head_and_tail_classification(self):
         self.assertFalse(core._is_error_content('{"success":true,"exit_code":0,"error":null}'))
         self.assertTrue(core._is_error_content('{"success":false,"exit_code":2,"error":"boom"}'))
+        self.assertTrue(core._is_error_content("File not found: /tmp/x/identical.txt"))
+        self.assertTrue(core._is_error_content("No such file or directory: /tmp/x/identical.txt"))
         self.assertTrue(core._is_error_content("ERROR: failed" + "x" * 10000))
         self.assertTrue(core._is_error_content("x" * 10000 + " timeout"))
         self.assertFalse(core._is_error_content("exit_code: 0\ncompleted normally"))
+
+    def test_host_repeat_marker_collapses_and_distinct_errors_remain_distinct(self):
+        repeated = patterns.extract_patterns([
+            {"tool": "test", "content": "request failed: connection refused", "session_id": "s"},
+            {"tool": "test", "content": "request failed: connection refused [Tool loop warning: repeated_exact_failure_warning; count=2]", "session_id": "s"},
+        ], limit=None)
+        self.assertEqual(len(repeated), 1)
+        self.assertEqual(repeated[0]["count"], 2)
+        self.assertTrue(patterns.has_signal(repeated, [], min_count=2))
+        different = patterns.extract_patterns([
+            {"tool": "test", "content": "request failed: connection refused", "session_id": "s"},
+            {"tool": "test", "content": "request failed: permission denied [Tool loop warning: repeated_exact_failure_warning; count=2]", "session_id": "s"},
+        ], limit=None)
+        self.assertEqual(len(different), 2)
 
     def test_fingerprint_distinguishes_errors_with_shared_long_prefix(self):
         """Wave 2.4: different tails beyond 200 chars must produce different fps."""

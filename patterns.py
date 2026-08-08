@@ -75,7 +75,17 @@ def normalize_error(content: str) -> str:
 
     text = content.strip()
 
-    # For a traceback, the only stable part is the final exception line; the
+    # Hermes appends this diagnostic to repeated tool failures. It is host
+    # instrumentation, not part of the tool's error shape, so remove only this
+    # narrowly defined suffix before fingerprinting.
+    text = re.sub(
+        r"\s*\[Tool loop warning:\s*repeated_exact_failure_warning;\s*count=\d+\].*$",
+        "",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    ).strip()
+
+    # For a traceback,
     # frames above it are noise that changes with every refactor.
     # Only the unambiguous header proves this is a real traceback; `File "` and
     # `  at ` alone appear in normal CLI output and must not trigger truncation.
