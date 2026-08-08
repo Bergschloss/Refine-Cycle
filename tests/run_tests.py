@@ -1882,6 +1882,44 @@ class RefineTests(unittest.TestCase):
             self.assertIn("Invalid rollback format", invalid_result)
             self.assertEqual(run.call_count, 1)  # only the "audit logging failures" call
 
+    def test_session_subcommand_routes_an_explicit_historical_session(self):
+        """The command contract has no session id, so /refine session must supply it."""
+        # 'session' exists in the synthetic fixture DB built by setUp.
+        with patch.object(plugin_init.core, "refine_run", return_value={
+            "success": True, "message": "OK", "journal_id": "abcdef123456",
+            "reversible": False,
+            "evidence": {"session_id": "session", "session_id_source": "explicit"},
+        }) as run:
+            output = plugin_init._handle_refine_command("session session")
+        run.assert_called_once()
+        self.assertEqual(run.call_args.kwargs["session_id"], "session")
+        self.assertIn("session", output)
+
+    def test_bare_session_subcommand_explains_itself_without_spending_budget(self):
+        with patch.object(plugin_init.core, "refine_run") as run:
+            output = plugin_init._handle_refine_command("session")
+        run.assert_not_called()
+        self.assertIn("/refine session <session_id>", output)
+
+    def test_unknown_session_id_is_reported_instead_of_analysed(self):
+        with patch.object(plugin_init.core, "refine_run") as run:
+            output = plugin_init._handle_refine_command("session no-such-session")
+        run.assert_not_called()
+        self.assertIn("No session", output)
+
+    def test_session_prose_remains_a_refine_reason(self):
+        # "session handling keeps failing" is a reason, not a selector, and must
+        # not silently analyse a session named "handling".
+        with patch.object(plugin_init.core, "refine_run", return_value={
+            "success": True, "message": "done", "outcome": "no_op",
+        }) as run:
+            plugin_init._handle_refine_command("session handling keeps failing")
+        run.assert_called_once()
+        self.assertEqual(
+            run.call_args.kwargs["reason"], "session handling keeps failing"
+        )
+        self.assertIsNone(run.call_args.kwargs.get("session_id"))
+
     def test_ledger_uses_only_supported_post_edit_evidence(self):
         created = time.time() - 30 * 86400
         base = {

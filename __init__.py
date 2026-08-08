@@ -5,7 +5,7 @@ import logging
 import re
 import threading
 import time
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from agent.plugin_llm import PluginLlm
 
@@ -267,6 +267,7 @@ def _on_post_llm_call(
 
 
 _MODEL_SUBCOMMAND = "model"
+_SESSION_SUBCOMMAND = "session"
 
 
 def _is_model_target(remainder: str) -> bool:
@@ -501,6 +502,45 @@ def _handle_refine_command(raw_args: str) -> Optional[str]:
             )
         # Prose such as "model of gmail failures" remains a refine reason.
 
+    if args == _SESSION_SUBCOMMAND or args.startswith(_SESSION_SUBCOMMAND + " "):
+        remainder = args[len(_SESSION_SUBCOMMAND):].strip()
+        if not remainder:
+            return (
+                "Usage: /refine session <session_id>\n"
+                "Analyses that exact session instead of the current one.\n"
+                f"Find ids in the sessions table of {config.state_db_path()}"
+            )
+        # Only a single token is a selector; prose such as "session handling keeps
+        # failing" stays a free-form reason. A single token is still confirmed
+        # against the sessions table, so a one-word reason reports "not found"
+        # instead of silently analysing the wrong session or spending a pass.
+        explicit_session = journal.normalize_prompt_note_session_id(remainder)
+        if explicit_session and " " not in remainder:
+            _, lookup_status = core._get_session_source_status(explicit_session)
+            if lookup_status == "error":
+                return (
+                    "❌ Cannot read the sessions table to confirm that session.\n"
+                    f"Checked: {config.state_db_path()}"
+                )
+            if lookup_status != "ok":
+                return (
+                    f"❌ No session '{core.scrub_text(explicit_session)}' exists.\n"
+                    "Usage: /refine session <session_id>\n"
+                    f"Find ids in the sessions table of {config.state_db_path()}"
+                )
+            try:
+                result = core.refine_run(
+                    llm=_session_llm(),
+                    reason="",
+                    session_id=explicit_session,
+                    auto=False,
+                )
+            except Exception as exc:
+                logger.exception("refine session command failed")
+                return f"❌ Refine failed: {core.scrub_text(str(exc))}"
+            return _format_run_result(result)
+        # Anything else is prose and reaches the proposal path untouched.
+
     if args == "rollback":
         return (
             "Usage: /refine rollback <12-character journal_id>\n"
@@ -526,6 +566,11 @@ def _handle_refine_command(raw_args: str) -> Optional[str]:
         logger.exception("refine command failed")
         return f"❌ Refine failed: {core.scrub_text(str(exc))}"
 
+    return _format_run_result(result)
+
+
+def _format_run_result(result: Dict[str, Any]) -> str:
+    """Render one refine run for the command, shared by every run entry point."""
     if not result.get("success") and result.get("outcome") != "partial_success":
         return f"❌ {result.get('message', 'Unknown error')}"
 
@@ -687,9 +732,13 @@ def register(ctx) -> None:
         _handle_refine_command,
         description=(
             "Self-improve skills/memory. "
-            "Usage: /refine [reason|audit|status|dry-run|model [target|auto]|rollback <id>]"
+            "Usage: /refine [reason|audit|status|dry-run|model [target|auto]|"
+            "session <session_id> [reason]|rollback <id>]"
         ),
-        args_hint="[reason | audit | status | dry-run | model [target|auto] | rollback <id>]",
+        args_hint=(
+            "[reason | audit | status | dry-run | model [target|auto] | "
+            "session <session_id> [reason] | rollback <id>]"
+        ),
     )
     ctx.register_tool(
         "refine_run",
