@@ -2953,6 +2953,45 @@ class RefineTests(unittest.TestCase):
         refine.assert_not_called()
         self.assertFalse(FakeHost.actions)
         self.assertFalse(plugin_init._AUTO_THREAD_GUARD.locked())
+
+    def test_zero_timeout_auto_cleanup_does_not_strand_worker(self):
+        FakeHost.entry_config()["auto_enabled"] = True
+        held = threading.Event()
+        release = threading.Event()
+
+        def hold_lock():
+            with journal.mutation_lock():
+                held.set()
+                release.wait(5)
+
+        holder = threading.Thread(target=hold_lock, daemon=True)
+        holder.start()
+        worker = None
+        try:
+            self.assertTrue(held.wait(2))
+            self.assertTrue(plugin_init._AUTO_THREAD_GUARD.acquire(blocking=False))
+            worker = threading.Thread(
+                target=plugin_init._run_auto_refine,
+                args=("session",),
+                kwargs={"cleanup_session_notes": True},
+                daemon=True,
+            )
+            worker.start()
+            worker.join(1)
+            self.assertFalse(worker.is_alive())
+            self.assertFalse(plugin_init._AUTO_THREAD_GUARD.locked())
+            self.assertEqual(
+                core.refine_status()["last_auto_event"]["code"],
+                "prompt_note_cleanup_failed",
+            )
+        finally:
+            release.set()
+            holder.join(5)
+            if worker is not None:
+                worker.join(5)
+            if plugin_init._AUTO_THREAD_GUARD.locked():
+                plugin_init._AUTO_THREAD_GUARD.release()
+
     def test_reviewer_approval_reaches_proposal_with_instructions(self):
         now = time.time()
         FakeHost.make_db([

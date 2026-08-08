@@ -897,7 +897,11 @@ def _acquire_mutation_lock(*, wait: bool, timeout: float = 0.0) -> Iterator[bool
     """
     deadline = time.monotonic() + timeout
     if wait:
-        acquired_thread = _THREAD_LOCK.acquire(timeout=timeout if timeout > 0 else -1)
+        acquired_thread = (
+            _THREAD_LOCK.acquire(blocking=False)
+            if timeout <= 0
+            else _THREAD_LOCK.acquire(timeout=timeout)
+        )
     else:
         acquired_thread = _THREAD_LOCK.acquire(blocking=False)
     if not acquired_thread:
